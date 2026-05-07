@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import heapq
 from dataclasses import dataclass, field
 from itertools import count

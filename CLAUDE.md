@@ -2,11 +2,9 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status
+## Important User Preferences
 
-v0 is implemented: traversal loop, OpenAI provider, CLI, frontier dedup, hishel cache, PDF support via markitdown. The README's "Usage" / "Configuration" sections describe the actual public API. Roadmap items checked off in README are done; unchecked items (async, more providers) are not.
-
-Make sure README is up to date every time you finish a feature.
+- Make sure README is up to date every time you finish a feature.
 
 ## Commands
 

@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.scripts]
-agentic-web-extraction = "agentic_web_extraction:main"
+awe = "agentic_web_extraction:main"
 
 [build-system]
 requires = ["uv_build>=0.11.0,<0.12.0"]

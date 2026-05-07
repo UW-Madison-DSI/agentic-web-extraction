@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import io
 from html.parser import HTMLParser
 from urllib.parse import urldefrag, urljoin

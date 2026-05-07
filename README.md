@@ -157,6 +157,36 @@ agentic-web-extraction extract \
 
 The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunity`) or a path to a Python file (`./schemas.py:Opportunity`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
 
+### Runnable example
+
+`examples/grants.py` doubles as the reference `Opportunity` schema and a runnable end-to-end demo. It seeds against a real Grants.gov opportunity page, so a single fetch is enough for the agent to match and extract.
+
+```bash
+uv run python examples/grants.py
+```
+
+Seed: `https://simpler.grants.gov/opportunity/24a2e68b-9105-4fc8-8432-7ddff3e3afb8`. Sample output (truncated):
+
+```json
+{
+  "data": {
+    "title": "Development and Application of PET and SPECT Imaging Ligands ...",
+    "deadline": "May 7, 2026",
+    "sponsor": "National Institutes of Health",
+    "link": "https://grants.nih.gov/grants/guide/pa-files/PAR-25-036.html"
+  },
+  "stopped_reason": "match",
+  "pages_fetched": 1,
+  "path": ["https://simpler.grants.gov/opportunity/24a2e68b-9105-4fc8-8432-7ddff3e3afb8"],
+  "verdict": {"match": true, "reason": "..."},
+  "provider": "openai",
+  "model": "gpt-5.5",
+  "usage": {"input_tokens": 3276, "output_tokens": 412, "calls": 2}
+}
+```
+
+Requires `OPENAI_API_KEY` (or your provider's equivalent) — see Configuration.
+
 ## Configuration
 
 | Setting              | Env var               | Default                |
