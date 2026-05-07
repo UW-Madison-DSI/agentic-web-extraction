@@ -112,15 +112,16 @@ from agentic_web_extraction import Extractor
 
 class Opportunity(BaseModel):
     title: str
-    deadline: str | None
-    eligibility: str | None
+    deadline: str | None = None
+    eligibility: str | None = None
+    sponsor: str | None = None
     link: str
 
 extractor = Extractor(
     schema=Opportunity,
     criteria="Page describes a grant or funding opportunity an academic PI could apply for.",
-    provider="openai",         # default
-    normalize_html=True,       # default
+    # provider/model defaults come from AWE_* env vars (see Configuration).
+    # Pass `provider=MyProvider(...)` to inject a custom Provider instance.
 )
 
 result = extractor.extract(
@@ -131,32 +132,45 @@ result = extractor.extract(
 # result.stopped_reason: "match" | "budget_exhausted"
 # result.pages_fetched:  int
 # result.path:           list[str]
-# result.usage:          token + cost metadata
+# result.verdict:        ScreenVerdict | None  (last screen; the matching one on success)
+# result.usage:          Usage(input_tokens, output_tokens, calls)
+```
+
+Need to traverse several seed URLs and share the HTTP cache across them?
+
+```python
+results = extractor.extract_batch(
+    seed_urls=["https://a.example/", "https://b.example/"],
+    max_fetches=10,
+)
 ```
 
 ### CLI
 
 ```bash
 agentic-web-extraction extract \
-  --schema ./schemas.py:Opportunity \
+  --schema examples/grants.py:Opportunity \
   --criteria "Page describes a grant a PI could apply for." \
   --seed-url https://example.gov/grants \
   --max-fetches 10
 ```
 
-The `--schema` flag takes an `import.path:ClassName` reference to a Pydantic model. Criteria can be a quoted string or `@path/to/criteria.txt`.
+The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunity`) or a path to a Python file (`./schemas.py:Opportunity`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
 
 ## Configuration
 
 | Setting              | Env var               | Default                |
 |----------------------|-----------------------|------------------------|
 | OpenAI API key       | `OPENAI_API_KEY`      | required for default   |
+| OpenAI base URL      | `OPENAI_BASE_URL`     | OpenAI's default       |
 | Provider             | `AWE_PROVIDER`        | `openai`               |
 | Extraction model     | `AWE_MODEL_EXTRACT`   | `gpt-5.5`              |
 | Pre-screen model     | `AWE_MODEL_SCREEN`    | `gpt-5.4-mini`         |
 | HTML→MD normalize    | `AWE_NORMALIZE`       | `true`                 |
 | Follow linked PDFs   | `AWE_FOLLOW_PDF`      | `true`                 |
 | Max page fetches     | `AWE_MAX_FETCHES`     | `10`                   |
+
+Settings are loaded from `.env` if present (see `.env.example`).
 
 `AWE_MAX_FETCHES` is the only traversal knob in v0. Depth limits, per-domain scope, and link-relevance thresholds are intentionally **not** user-configurable — the budget is the single lever, and the LLM's link scoring is the navigation policy.
 
@@ -184,10 +198,13 @@ pyproject.toml           # uv project, Python ≥3.13
 
 ```bash
 uv sync
-uv run agentic-web-extraction
+uv run agentic-web-extraction --help    # CLI help
+uv run ruff check                       # lint
+uv run ruff format                      # format
+uv run ty check                         # type-check
 ```
 
-Python ≥3.13. Build backend: `uv_build`.
+Python ≥3.13. Build backend: `uv_build`. The package lives at the repo root (`agentic_web_extraction/`), not under `src/` — `[tool.uv.build-backend].module-root = ""` enforces this.
 
 ## Roadmap
 
@@ -207,5 +224,3 @@ v0 done:
 Next:
 
 - [ ] Async traversal (currently synchronous)
-- [ ] Additional providers (Anthropic, local)
-- [ ] Pluggable URL canonicalization / domain scoping (still off by default — budget remains the single lever)
