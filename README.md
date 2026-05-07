@@ -2,7 +2,7 @@
 
 An agent that **traverses** the web to find and extract structured data. Given a seed URL, a target schema, and a relevance criterion, the agent reads each page, ranks outgoing links by how likely they lead to a match, and follows the best one — until it satisfies the schema or hits its fetch budget.
 
-> **Status: early / WIP.** No release yet — the public API described below is the design contract, not the current behavior. Expect breaking changes.
+> **Status: v0.** Public API below is implemented end-to-end. Expect breaking changes between minor versions.
 
 ## What it is
 
@@ -102,7 +102,7 @@ These are *illustrative* — the schemas and criteria belong to the caller.
 
 **University–industry engagement.** Caller defines a `Company` model (name, contact, engagement type), with criterion *"does this page describe company–university engagement"*, and seeds the agent at a company's homepage. The agent traverses partnership / news / about pages until it finds a matching engagement page.
 
-## Usage (intended API — not yet implemented)
+## Usage
 
 ### Python
 
@@ -152,8 +152,8 @@ The `--schema` flag takes an `import.path:ClassName` reference to a Pydantic mod
 |----------------------|-----------------------|------------------------|
 | OpenAI API key       | `OPENAI_API_KEY`      | required for default   |
 | Provider             | `AWE_PROVIDER`        | `openai`               |
-| Extraction model     | `AWE_MODEL_EXTRACT`   | TBD                    |
-| Pre-screen model     | `AWE_MODEL_SCREEN`    | TBD (cheaper)          |
+| Extraction model     | `AWE_MODEL_EXTRACT`   | `gpt-5.5`              |
+| Pre-screen model     | `AWE_MODEL_SCREEN`    | `gpt-5.4-mini`         |
 | HTML→MD normalize    | `AWE_NORMALIZE`       | `true`                 |
 | Follow linked PDFs   | `AWE_FOLLOW_PDF`      | `true`                 |
 | Max page fetches     | `AWE_MAX_FETCHES`     | `10`                   |
@@ -163,8 +163,20 @@ The `--schema` flag takes an `import.path:ClassName` reference to a Pydantic mod
 ## Project layout
 
 ```
-src/agentic_web_extraction/
-    __init__.py          # main() entry point — placeholder
+agentic_web_extraction/
+    __init__.py          # re-exports + main() entry point
+    cli.py               # Typer CLI: `extract` subcommand
+    config.py            # AWE_* settings (pydantic-settings)
+    extractor.py         # Extractor: frontier loop
+    fetch.py             # httpx + hishel cache + tenacity retry
+    frontier.py          # best-first heap + visited set
+    normalize.py         # HTML→Markdown + raw-HTML link extraction
+    result.py            # ExtractionResult, Usage, ScreenVerdict
+    providers/
+        __init__.py      # Provider protocol + factory
+        openai_provider.py
+examples/
+    grants.py            # reference Opportunity model
 pyproject.toml           # uv project, Python ≥3.13
 ```
 
@@ -179,13 +191,21 @@ Python ≥3.13. Build backend: `uv_build`.
 
 ## Roadmap
 
-- [ ] Pick HTML→MD converter
-- [ ] Wire structured-output extractor
-- [ ] Provider abstraction (swap LLM provider)
-- [ ] PDF fetcher and text extraction
-- [ ] LLM link-scorer + frontier data structure
-- [ ] Visited-set / dedupe (don't re-fetch within a traversal)
-- [ ] Budget accounting + `stopped_reason` plumbing
-- [ ] Path recording in result metadata
-- [ ] Batch mode with caching (multiple seed URLs, each its own traversal)
-- [ ] `examples/` directory with reference schemas (kept out of the package itself)
+v0 done:
+
+- [x] HTML→MD converter (`markitdown`)
+- [x] Structured-output extractor (OpenAI Responses API + Pydantic `text_format`)
+- [x] Provider abstraction (`Provider` protocol + factory; OpenAI is the v0 impl)
+- [x] PDF fetcher and text extraction (markitdown handles PDF; toggle via `AWE_FOLLOW_PDF`)
+- [x] LLM link-scorer + frontier data structure (best-first heap)
+- [x] Visited-set / dedupe (URL canonicalization; dedup on push and pop)
+- [x] Budget accounting + `stopped_reason` plumbing
+- [x] Path recording in result metadata
+- [x] Batch mode with caching (`Extractor.extract_batch`; in-memory hishel cache spans seeds)
+- [x] `examples/` directory with reference schemas (`examples/grants.py`, kept out of the package)
+
+Next:
+
+- [ ] Async traversal (currently synchronous)
+- [ ] Additional providers (Anthropic, local)
+- [ ] Pluggable URL canonicalization / domain scoping (still off by default — budget remains the single lever)
