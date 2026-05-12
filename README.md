@@ -250,7 +250,3 @@ v0 done:
 - [x] Path recording in result metadata
 - [x] Batch mode with caching (`Extractor.extract_batch`; in-memory hishel cache spans seeds)
 - [x] `examples/` directory with reference schemas (`examples/grants.py`, kept out of the package)
-
-Next:
-
-- [ ] Async traversal (currently synchronous)
