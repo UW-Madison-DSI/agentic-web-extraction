@@ -8,12 +8,23 @@ from ..result import ScreenVerdict, Usage
 
 @runtime_checkable
 class Provider(Protocol):
-    name: str
-    model_screen: str
-    model_extract: str
+    # Declared as read-only properties (not bare attributes) so implementations
+    # backing them with @property — as OpenAIProvider does — satisfy the protocol.
+    @property
+    def name(self) -> str: ...
 
     @property
-    def usage(self) -> Usage: ...
+    def model_screen(self) -> str: ...
+
+    @property
+    def model_extract(self) -> str: ...
+
+    # Token usage bucketed by call-purpose tag, and the model each tag ran on.
+    @property
+    def usage_by_function(self) -> dict[str, Usage]: ...
+
+    @property
+    def function_model(self) -> dict[str, str]: ...
 
     def screen(self, page_md: str, criterion: str) -> ScreenVerdict: ...
 
@@ -24,7 +35,9 @@ class Provider(Protocol):
         criterion: str,
     ) -> list[tuple[str, float]]: ...
 
-    def extract(self, page_md: str, schema: type[BaseModel]) -> BaseModel: ...
+    def extract(
+        self, page_md: str, schema: type[BaseModel], *, usage_tag: str = "extract"
+    ) -> BaseModel: ...
 
 
 def get_provider(settings: Settings) -> Provider:

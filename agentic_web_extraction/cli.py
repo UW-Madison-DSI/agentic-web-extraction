@@ -19,7 +19,7 @@ app = typer.Typer(
 
 @app.callback()
 def _main() -> None:
-    """Force subcommand mode so `agentic-web-extraction extract ...` is the contract."""
+    """Force subcommand mode so `awe extract ...` is the contract."""
 
 
 def load_schema(spec: str) -> type[BaseModel]:
@@ -78,10 +78,25 @@ def extract(
             help="Fetch budget. Defaults to AWE_MAX_FETCHES (10).",
         ),
     ] = None,
+    stop_on_first_match: Annotated[
+        bool | None,
+        typer.Option(
+            "--stop-on-first-match/--gather-all-matches",
+            help=(
+                "Stop as soon as one page matches, or spend the whole budget "
+                "gathering every match and merging them. Defaults to "
+                "AWE_STOP_ON_FIRST_MATCH (gather-all)."
+            ),
+        ),
+    ] = None,
 ) -> None:
     model = load_schema(schema)
     criterion = load_criteria(criteria)
     extractor = Extractor(schema=model, criteria=criterion)
-    result = extractor.extract(seed_url=seed_url, max_fetches=max_fetches)
+    result = extractor.extract(
+        seed_url=seed_url,
+        max_fetches=max_fetches,
+        stop_on_first_match=stop_on_first_match,
+    )
     typer.echo(json.dumps(result.to_dict(), indent=2))
     sys.exit(0 if result.stopped_reason == "match" else 2)

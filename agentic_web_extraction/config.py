@@ -13,13 +13,40 @@ class Settings(BaseSettings):
         protected_namespaces=(),
     )
 
+    # Which provider backend to use (env: AWE_PROVIDER). Resolved by
+    # providers.get_provider; "openai" is the only v0 implementation.
     provider: str = "openai"
+    # Model for the structured-extraction call (env: AWE_MODEL_EXTRACT). The
+    # stronger/more expensive model, since it must fill the caller's schema.
     model_extract: str = "gpt-5.5"
+    # Model shared by the pre-screen and link-scorer calls (env: AWE_MODEL_SCREEN).
+    # Both are cheap comparison calls, so they default to a smaller/faster model.
     model_screen: str = "gpt-5.4-mini"
+    # Whether to convert fetched HTML to Markdown before the LLM sees it
+    # (env: AWE_NORMALIZE). On by default to cut token cost; PDFs are always
+    # converted regardless.
     normalize: bool = True
+    # Whether to fetch and read linked PDFs as page content (env: AWE_FOLLOW_PDF).
+    # When False, PDF responses are treated as skipped (no LLM work, no budget cost).
     follow_pdf: bool = True
+    # Fetch budget: the max number of readable pages the traversal will spend LLM
+    # calls on (env: AWE_MAX_FETCHES). The only traversal knob in v0. Errored and
+    # skipped (non-HTML/PDF) fetches don't count against it.
     max_fetches: int = 10
+    # When True, the traversal returns as soon as one page matches and is
+    # extracted, instead of spending the whole budget gathering every match and
+    # merging them (env: AWE_STOP_ON_FIRST_MATCH). Default False preserves the
+    # gather-all-then-merge behavior.
+    stop_on_first_match: bool = False
+    # On-disk HTTP response cache (hishel), env: AWE_HTTP_CACHE. Persisted across
+    # runs so weekly re-crawls can issue conditional GETs; empty string uses an
+    # in-memory cache.
+    http_cache: str = "data/http_cache.sqlite"
 
+    # Provider credentials, read from the un-prefixed OPENAI_* env vars (not AWE_*)
+    # so a standard OpenAI environment works as-is. API key is a SecretStr so it
+    # doesn't leak into logs/reprs; base URL lets you point at any OpenAI-compatible
+    # endpoint. Both optional here; the OpenAI SDK errors at call time if unset.
     openai_api_key: SecretStr | None = Field(
         default=None,
         validation_alias="OPENAI_API_KEY",
