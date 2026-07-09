@@ -1,3 +1,5 @@
+import sys
+import time
 from dataclasses import dataclass
 
 from openai import OpenAI
@@ -59,7 +61,12 @@ class OpenAIProvider:
             api_key=api_key,
             base_url=self.settings.openai_base_url,
         )
-        self._usage = Usage()
+        # Token usage bucketed by an opaque call-purpose tag ("screen",
+        # "score_links", "extract", or whatever a caller passes to extract()).
+        # _function_model remembers which model each tag ran on, so cost can be
+        # reconstructed without baking a tag->model map anywhere downstream.
+        self._usage_by_function: dict[str, Usage] = {}
+        self._function_model: dict[str, str] = {}
 
     @property
     def name(self) -> str:
@@ -74,28 +81,69 @@ class OpenAIProvider:
         return self.settings.model_extract
 
     @property
-    def usage(self) -> Usage:
-        return self._usage
+    def usage_by_function(self) -> dict[str, Usage]:
+        return dict(self._usage_by_function)
 
-    def _accumulate(self, response: object) -> None:
+    @property
+    def function_model(self) -> dict[str, str]:
+        return dict(self._function_model)
+
+    def _accumulate(self, response: object, model: str, function: str) -> Usage:
+        """Add this response's tokens to the per-function running total and return the delta."""
         u = getattr(response, "usage", None)
         if u is None:
-            return
-        self._usage = self._usage + Usage(
-            input_tokens=int(getattr(u, "input_tokens", 0) or 0),
-            output_tokens=int(getattr(u, "output_tokens", 0) or 0),
-            calls=1,
+            delta = Usage(calls=1)
+        else:
+            details = getattr(u, "input_tokens_details", None)
+            cached = int(getattr(details, "cached_tokens", 0) or 0) if details else 0
+            delta = Usage(
+                input_tokens=int(getattr(u, "input_tokens", 0) or 0),
+                output_tokens=int(getattr(u, "output_tokens", 0) or 0),
+                calls=1,
+                cached_input_tokens=cached,
+            )
+        self._usage_by_function[function] = self._usage_by_function.get(function, Usage()) + delta
+        self._function_model[function] = model
+        return delta
+
+    def _log_call(
+        self,
+        step: str,
+        model: str,
+        in_chars: int,
+        elapsed: float,
+        delta: Usage | None,
+        error: BaseException | None = None,
+    ) -> None:
+        if delta is None:
+            tok = "tok=?"
+        else:
+            cached = f"(cached {delta.cached_input_tokens})" if delta.cached_input_tokens else ""
+            tok = f"tok_in={delta.input_tokens}{cached} tok_out={delta.output_tokens}"
+        status = f"FAIL:{type(error).__name__}" if error is not None else "ok"
+        print(
+            f"    [llm {step}] model={model} in_chars={in_chars} "
+            f"elapsed={elapsed:.2f}s {tok} {status}",
+            file=sys.stderr,
+            flush=True,
         )
 
     def screen(self, page_md: str, criterion: str) -> ScreenVerdict:
         truncated = page_md[:PAGE_TRUNC_CHARS]
-        response = self._client.responses.parse(
-            model=self.model_screen,
-            instructions=self.screen_prompt,
-            input=f"CRITERION:\n{criterion}\n\nPAGE:\n{truncated}",
-            text_format=_ScreenSchema,
-        )
-        self._accumulate(response)
+        payload = f"CRITERION:\n{criterion}\n\nPAGE:\n{truncated}"
+        t0 = time.monotonic()
+        try:
+            response = self._client.responses.parse(
+                model=self.model_screen,
+                instructions=self.screen_prompt,
+                input=payload,
+                text_format=_ScreenSchema,
+            )
+        except BaseException as e:
+            self._log_call("screen", self.model_screen, len(payload), time.monotonic() - t0, None, e)
+            raise
+        delta = self._accumulate(response, self.model_screen, "screen")
+        self._log_call("screen", self.model_screen, len(payload), time.monotonic() - t0, delta)
         parsed = response.output_parsed
         assert parsed is not None
         return ScreenVerdict(match=parsed.match, reason=parsed.reason)
@@ -112,17 +160,24 @@ class OpenAIProvider:
         link_block = "\n".join(
             f"- {url}  (anchor: {anchor!r})" for anchor, url in links
         )
-        response = self._client.responses.parse(
-            model=self.model_screen,
-            instructions=self.score_prompt,
-            input=(
-                f"CRITERION:\n{criterion}\n\n"
-                f"SOURCE PAGE EXCERPT:\n{page_excerpt}\n\n"
-                f"LINKS TO SCORE (one per line):\n{link_block}"
-            ),
-            text_format=_LinkScores,
+        payload = (
+            f"CRITERION:\n{criterion}\n\n"
+            f"SOURCE PAGE EXCERPT:\n{page_excerpt}\n\n"
+            f"LINKS TO SCORE (one per line):\n{link_block}"
         )
-        self._accumulate(response)
+        t0 = time.monotonic()
+        try:
+            response = self._client.responses.parse(
+                model=self.model_screen,
+                instructions=self.score_prompt,
+                input=payload,
+                text_format=_LinkScores,
+            )
+        except BaseException as e:
+            self._log_call(f"score_links[{len(links)}]", self.model_screen, len(payload), time.monotonic() - t0, None, e)
+            raise
+        delta = self._accumulate(response, self.model_screen, "score_links")
+        self._log_call(f"score_links[{len(links)}]", self.model_screen, len(payload), time.monotonic() - t0, delta)
         parsed = response.output_parsed
         assert parsed is not None
         url_set = {url for _, url in links}
@@ -132,14 +187,24 @@ class OpenAIProvider:
                 scored[entry.url] = max(0.0, min(1.0, entry.score))
         return [(url, scored.get(url, 0.0)) for _, url in links]
 
-    def extract(self, page_md: str, schema: type[BaseModel]) -> BaseModel:
-        response = self._client.responses.parse(
-            model=self.model_extract,
-            instructions=self.extract_prompt,
-            input=f"PAGE:\n{page_md}",
-            text_format=schema,
-        )
-        self._accumulate(response)
+    def extract(
+        self, page_md: str, schema: type[BaseModel], *, usage_tag: str = "extract"
+    ) -> BaseModel:
+        payload = f"PAGE:\n{page_md}"
+        step = f"{usage_tag}[{schema.__name__}]"
+        t0 = time.monotonic()
+        try:
+            response = self._client.responses.parse(
+                model=self.model_extract,
+                instructions=self.extract_prompt,
+                input=payload,
+                text_format=schema,
+            )
+        except BaseException as e:
+            self._log_call(step, self.model_extract, len(payload), time.monotonic() - t0, None, e)
+            raise
+        delta = self._accumulate(response, self.model_extract, usage_tag)
+        self._log_call(step, self.model_extract, len(payload), time.monotonic() - t0, delta)
         parsed = response.output_parsed
         assert parsed is not None
         return parsed
