@@ -25,7 +25,7 @@ The agent maintains a **frontier** — every unvisited link it has seen so far, 
 - The loop keeps going until the **fetch budget** is exhausted (or the frontier empties), collecting every matching page along the way.
 - At the end, all matches are combined via the schema's optional `merge_extractions` classmethod (falling back to the first match). `stopped_reason` is `"match"` if at least one page matched, else `"budget_exhausted"`.
 
-This is best-first search, not breadth-first or depth-first. The LLM's relevance scoring is the only navigation policy; depth, domain scope, and per-link thresholds are deliberately **not** tunable in v0 — the budget is the single lever.
+This is best-first search, not breadth-first or depth-first. The LLM's relevance scoring is the primary navigation policy; depth and per-link thresholds are deliberately **not** tunable in v0 — the budget is the main lever. The one opt-in exception is a *soft* same-domain preference (off by default; see below), which only re-weights scores and never excludes a link.
 
 ## What you provide
 
@@ -37,6 +37,8 @@ Optional:
 
 - **Fetch budget** — `max_fetches` (default `10`). The agent stops when it has fetched this many pages.
 - **Match mode** — `stop_on_first_match` (default `False`). `False` spends the budget gathering every matching page and merges them; `True` returns as soon as the first page matches.
+- **Same-domain preference** — `off_domain_weight` (default `1.0`). Links off the seed's registrable domain get their score multiplied by this weight: `1.0` = full weight / no preference (the default), `< 1.0` = a soft nudge toward same-domain, `0.0` = strongest. It's a nudge, not a filter — off-domain links are never excluded. Comparison is at the registrable-domain (eTLD+1) level, so all of `*.wisc.edu` count as one domain.
+- **Text filters** — `text_filters`, a list of `str -> str` transforms applied to the normalized markdown. This is where *you* strip volatile per-response tokens (rotating anti-bot tokens, per-render timestamps, shuffled recommendation strips) so a page's content hash stays stable and the page cache can hit. The library ships none — it's site-agnostic; ready-made examples live in [examples/strippers.py](examples/strippers.py).
 - **Provider / model** — defaults to OpenAI; swappable.
 - **Normalization toggle** — HTML→Markdown is on by default for cost reduction.
 - **Custom prompts** — override the default link-scoring, pre-screen, and extraction prompts.
@@ -93,7 +95,7 @@ Each stage is independently swappable.
 | Stage          | Notes                                                                                       |
 |----------------|---------------------------------------------------------------------------------------------|
 | Fetch          | Handles HTML; optionally follows linked PDFs that are part of the page                      |
-| Normalize      | HTML → Markdown for token reduction; pluggable converter                                    |
+| Normalize      | HTML → Markdown for token reduction; pluggable converter; caller-supplied `text_filters` run here |
 | Pre-screen     | Cheap LLM call returning a binary yes/no against user-supplied criterion                    |
 | Score links    | LLM scores every outgoing link's promise against the criterion; output feeds the frontier   |
 | Extract        | Structured-output LLM call; provider-swappable; produces JSON conforming to user schema     |
@@ -128,6 +130,12 @@ extractor = Extractor(
     criteria="Page describes a grant or funding opportunity an academic PI could apply for.",
     # provider/model defaults come from AWE_* env vars (see Configuration).
     # Pass `provider=MyProvider(...)` to inject a custom Provider instance.
+    off_domain_weight=1.0,     # optional; falls back to AWE_OFF_DOMAIN_WEIGHT.
+                               # 1.0 = full weight / no preference; < 1.0 softly favors
+                               # the seed's registrable domain; 0.0 = strongest (never excludes).
+    text_filters=None,         # optional; list of str->str transforms applied to
+                               # the normalized markdown (cache-stability strippers,
+                               # etc.). The library ships none — see examples/strippers.py.
 )
 
 result = extractor.extract(
@@ -164,6 +172,30 @@ results = extractor.extract_batch(
 )
 ```
 
+#### Text filters (cache-stability hacks live in *your* code)
+
+The library is site-agnostic and does no site-specific text munging. But real
+pages embed *volatile per-response fragments* — Cloudflare's rotating
+email-obfuscation tokens, per-render timestamps, randomized form honeypot
+labels, shuffled "related content" carousels — that change the normalized
+markdown on every fetch and so defeat the content-addressed page cache (the hash
+never repeats). `Extractor(..., text_filters=[...])` takes a list of pure
+`str -> str` transforms applied in order to the normalized markdown, which is
+where you strip those fragments so the hash stabilizes:
+
+```python
+from examples.strippers import CACHE_STABILITY_FILTERS
+from agentic_web_extraction import Extractor
+
+extractor = Extractor(schema=..., criteria=..., text_filters=CACHE_STABILITY_FILTERS)
+```
+
+[examples/strippers.py](examples/strippers.py) ships a ready-made set keyed to
+specific real-world sites (Cloudflare, Foundant, Gravity Forms, EREF,
+CyberGrants) — copy the ones you need or write your own. They live in `examples/`,
+not the library, precisely so the core stays domain-agnostic; each filter is
+built to remove only content-free/invisible markup, never text an LLM would use.
+
 #### Optional page cache
 
 `Extractor(..., cache=)` accepts any object implementing the generic `KVCache`
@@ -189,11 +221,11 @@ uv run awe extract \
   --max-fetches 10
 ```
 
-The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunity`) or a path to a Python file (`./schemas.py:Opportunity`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Add `--stop-on-first-match` to return on the first matching page (or `--gather-all-matches` to force the gather-and-merge default); omit both to use `AWE_STOP_ON_FIRST_MATCH`. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
+The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunity`) or a path to a Python file (`./schemas.py:Opportunity`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Add `--stop-on-first-match` to return on the first matching page (or `--gather-all-matches` to force the gather-and-merge default); omit both to use `AWE_STOP_ON_FIRST_MATCH`. Add `--off-domain-weight 0.5` to softly down-weight off-domain links (`1.0` = full weight / no preference, the default; omit to use `AWE_OFF_DOMAIN_WEIGHT`). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
 
 ### Runnable example
 
-`examples/grants.py` is a runnable end-to-end demo and the reference for the `merge_extractions` hook. It defines a singular `Opportunity` plus an `Opportunities` **collection** schema, and extracts with the collection so a page can yield many opportunities. It seeds against a real Grants.gov page and, in gather-all mode, matches several linked NIH announcements; `Opportunities.merge_extractions` then folds them into one result using an **LLM dedup call** (`provider.extract(..., usage_tag="merge")`), which collapses records describing the same underlying opportunity and surfaces as a `"merge"` bucket in `usage_by_function`. It falls back to a deterministic link-dedup when no provider is available or the call fails.
+`examples/grants.py` is a runnable end-to-end demo and the reference for the `merge_extractions` hook. It defines a singular `Opportunity` plus an `Opportunities` **collection** schema, and extracts with the collection so a page can yield many opportunities. It seeds against a real Grants.gov page and, in gather-all mode, matches several linked NIH announcements; `Opportunities.merge_extractions` then folds them into one result using an **LLM dedup call** (`provider.extract(..., usage_tag="merge")`), which collapses records describing the same underlying opportunity and surfaces as a `"merge"` bucket in `usage_by_function`. It falls back to a deterministic link-dedup when no provider is available or the call fails. It also wires in the cache-stability `text_filters` from [examples/strippers.py](examples/strippers.py) to show how a caller supplies them.
 
 ```bash
 uv run python examples/grants.py
@@ -246,11 +278,12 @@ Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your pr
 | Follow linked PDFs   | `AWE_FOLLOW_PDF`      | `true`                 |
 | Max page fetches     | `AWE_MAX_FETCHES`     | `10`                   |
 | Stop at first match  | `AWE_STOP_ON_FIRST_MATCH` | `false` (gather all + merge) |
+| Off-domain weight    | `AWE_OFF_DOMAIN_WEIGHT` | `1.0` (1.0 = full weight / no preference; < 1.0 = soft same-domain nudge) |
 | HTTP response cache  | `AWE_HTTP_CACHE`      | `data/http_cache.sqlite` (empty = in-memory) |
 
 Settings are loaded from `.env` if present (see `.env.example`).
 
-`AWE_MAX_FETCHES` is the only traversal knob in v0. Depth limits, per-domain scope, and link-relevance thresholds are intentionally **not** user-configurable — the budget is the single lever, and the LLM's link scoring is the navigation policy.
+`AWE_MAX_FETCHES` is the main traversal knob in v0. Depth limits and link-relevance thresholds are intentionally **not** user-configurable — the budget is the main lever and the LLM's link scoring is the navigation policy. The only exception is the opt-in soft same-domain preference (`AWE_OFF_DOMAIN_WEIGHT`, a single knob — `1.0` disables it), which re-weights scores but never excludes a link.
 
 ## Project layout
 
@@ -262,14 +295,15 @@ agentic_web_extraction/
     cache.py             # KVCache protocol + content-hash helpers (opt-in page cache)
     extractor.py         # Extractor: frontier loop
     fetch.py             # httpx + hishel cache + tenacity retry
-    frontier.py          # best-first heap + visited set
-    normalize.py         # HTML→Markdown + raw-HTML link extraction
+    frontier.py          # best-first heap + visited set + PSL registrable-domain (tldextract)
+    normalize.py         # HTML→Markdown + raw-HTML link extraction + caller text_filters hook
     result.py            # ExtractionResult, Usage, ScreenVerdict, PageVerdict
     providers/
         __init__.py      # Provider protocol + factory
         openai_provider.py
 examples/
     grants.py            # reference Opportunity + Opportunities schema (merge_extractions demo)
+    strippers.py         # example cache-stability text_filters (site-specific; kept out of the package)
 pyproject.toml           # uv project, Python ≥3.13
 ```
 
@@ -300,4 +334,6 @@ v0 done:
 - [x] Batch mode with caching (`Extractor.extract_batch`; in-memory hishel cache spans seeds)
 - [x] Opt-in content-addressed page cache (`Extractor(..., cache=)` over a generic `KVCache`; replays screen/extract/score with no LLM calls when page content is unchanged)
 - [x] Multi-match gather + `merge_extractions` hook (accumulate every matching page within budget, then merge)
-- [x] `examples/` directory with reference schemas (`examples/grants.py`, kept out of the package)
+- [x] Caller-supplied `text_filters` (site-specific cache-stability strippers live in `examples/`, not the library)
+- [x] Opt-in soft same-domain preference (single `off_domain_weight` knob, `1.0` = off; PSL-based registrable domain via `tldextract`)
+- [x] `examples/` directory with reference schemas and filters (`examples/grants.py`, `examples/strippers.py`, kept out of the package)

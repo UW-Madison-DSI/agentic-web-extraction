@@ -1,4 +1,5 @@
 import json
+from collections.abc import Sequence
 
 from pydantic import BaseModel
 
@@ -11,8 +12,8 @@ from .cache import (
     page_cache_version,
 )
 from .config import Settings, get_settings
-from .frontier import Frontier
-from .normalize import extract_links, to_markdown
+from .frontier import Frontier, registrable_domain, same_registrable_domain
+from .normalize import TextFilter, extract_links, to_markdown
 from .providers import Provider, get_provider
 from .result import ExtractionResult, PageVerdict, StoppedReason, Usage
 
@@ -25,6 +26,8 @@ class Extractor:
         *,
         provider: Provider | None = None,
         normalize_html: bool | None = None,
+        off_domain_weight: float | None = None,
+        text_filters: Sequence[TextFilter] | None = None,
         settings: Settings | None = None,
         cache: KVCache | None = None,
     ) -> None:
@@ -35,6 +38,20 @@ class Extractor:
         self.normalize_html = (
             normalize_html if normalize_html is not None else self.settings.normalize
         )
+        # Soft same-domain navigation preference (see Settings.off_domain_weight).
+        # A single knob: 1.0 disables it, < 1.0 opts in. Caller-defined and applied
+        # at frontier-push time, not baked into the page cache, so changing it does
+        # not invalidate cached scores.
+        self.off_domain_weight = (
+            off_domain_weight
+            if off_domain_weight is not None
+            else self.settings.off_domain_weight
+        )
+        # Caller-supplied `str -> str` transforms applied to the normalized
+        # markdown (e.g. to strip volatile per-response tokens so the content
+        # hash stays stable). The library ships none -- it is site-agnostic; see
+        # examples/strippers.py. Empty tuple means "leave the markdown as-is".
+        self.text_filters: tuple[TextFilter, ...] = tuple(text_filters or ())
         self.cache = cache
         # Version stamp mixed into every page-cache key so a change to the
         # criterion, schema, models, or normalize flag auto-invalidates entries.
@@ -62,6 +79,13 @@ class Extractor:
         frontier = Frontier()
         frontier.push(seed_url, score=1.0, source="seed")
 
+        # Registrable domain of the seed, used to softly down-weight off-domain
+        # outgoing links when `off_domain_weight` < 1.0 (see _frontier_score).
+        # Empty when the seed host is unparseable, which disables the re-weighting.
+        from urllib.parse import urlsplit as _urlsplit
+
+        seed_domain = registrable_domain(_urlsplit(seed_url).netloc)
+
         path: list[str] = []
         pages_fetched = 0
         verdicts: list[PageVerdict] = []
@@ -86,7 +110,11 @@ class Extractor:
             try:
                 page = fetch_module.fetch(url)
             except Exception as e:
-                print(f"    ! fetch failed on {url}: {type(e).__name__}: {e}", file=_sys.stderr, flush=True)
+                print(
+                    f"    ! fetch failed on {url}: {type(e).__name__}: {e}",
+                    file=_sys.stderr,
+                    flush=True,
+                )
                 frontier.mark_visited(url)
                 continue
             print(
@@ -121,7 +149,12 @@ class Extractor:
 
             try:
                 page_md = (
-                    to_markdown(page.raw_bytes, page.content_type, url=page.url)
+                    to_markdown(
+                        page.raw_bytes,
+                        page.content_type,
+                        url=page.url,
+                        text_filters=self.text_filters,
+                    )
                     if self.normalize_html or page.kind == "pdf"
                     else page.text
                 )
@@ -139,13 +172,19 @@ class Extractor:
             # `pages_fetched` and the budget are unaffected.
             cache_key = f"{self._cache_version}:{content_hash(page_md)}:{page.url}"
             cached_raw = (
-                self.cache.get(PAGE_NAMESPACE, cache_key) if self.cache is not None else None
+                self.cache.get(PAGE_NAMESPACE, cache_key)
+                if self.cache is not None
+                else None
             )
             if cached_raw is not None:
                 cached = CachedPage.from_json(cached_raw)
                 print(f"    [cache] hit {page.url}", file=_sys.stderr, flush=True)
                 verdicts.append(
-                    PageVerdict(url=page.url, match=cached.screen_match, reason=cached.screen_reason)
+                    PageVerdict(
+                        url=page.url,
+                        match=cached.screen_match,
+                        reason=cached.screen_reason,
+                    )
                 )
                 if cached.screen_match and cached.extracted is not None:
                     try:
@@ -158,10 +197,16 @@ class Extractor:
                     else:
                         matches.append((page.url, data))
                 for link_url, score in cached.link_scores:
-                    frontier.push(link_url, score=score, source=page.url)
+                    frontier.push(
+                        link_url,
+                        score=self._frontier_score(link_url, score, seed_domain),
+                        source=page.url,
+                    )
                 continue
 
-            stage_error = False  # don't cache a page whose LLM stages hit a transient error
+            stage_error = (
+                False  # don't cache a page whose LLM stages hit a transient error
+            )
             try:
                 verdict = self.provider.screen(page_md, self.criteria)
             except Exception as e:
@@ -170,7 +215,9 @@ class Extractor:
                     flush=True,
                 )
                 continue
-            verdicts.append(PageVerdict(url=page.url, match=verdict.match, reason=verdict.reason))
+            verdicts.append(
+                PageVerdict(url=page.url, match=verdict.match, reason=verdict.reason)
+            )
             extracted_dump: dict | None = None
             matched_here = False
             if verdict.match:
@@ -203,10 +250,16 @@ class Extractor:
             link_scores: list[list] = []
             if page.kind == "html" and page.text:
                 outgoing = extract_links(page.text, base_url=page.url)
-                fresh = [(text, link) for text, link in outgoing if not frontier.is_visited(link)]
+                fresh = [
+                    (text, link)
+                    for text, link in outgoing
+                    if not frontier.is_visited(link)
+                ]
                 if fresh:
                     try:
-                        scores = self.provider.score_links(fresh, page_md, self.criteria)
+                        scores = self.provider.score_links(
+                            fresh, page_md, self.criteria
+                        )
                     except Exception as e:
                         print(
                             f"    ! score_links failed on {page.url}: {type(e).__name__}: {e}",
@@ -215,7 +268,16 @@ class Extractor:
                         stage_error = True
                     else:
                         for link_url, score in scores:
-                            frontier.push(link_url, score=score, source=page.url)
+                            frontier.push(
+                                link_url,
+                                score=self._frontier_score(
+                                    link_url, score, seed_domain
+                                ),
+                                source=page.url,
+                            )
+                            # Cache the raw LLM score, not the domain-adjusted one,
+                            # so the re-weighting stays a push-time policy the cache
+                            # is oblivious to (toggling it doesn't invalidate entries).
                             link_scores.append([link_url, score])
 
             if self.cache is not None and not stage_error:
@@ -262,6 +324,23 @@ class Extractor:
             usage_by_function_at_start=usage_by_function_at_start,
         )
 
+    def _frontier_score(self, link_url: str, score: float, seed_domain: str) -> float:
+        """Apply the opt-in soft same-domain preference to a link's raw score.
+
+        When `off_domain_weight` is < 1.0 and the link is on a *different*
+        registrable domain than the seed, its score is multiplied by that weight
+        — a nudge that lowers its frontier priority without excluding it, so a
+        high-scoring off-domain page can still be visited. Links whose host is
+        unparseable, or that share the seed's domain, are left untouched. A no-op
+        (and skips the domain lookup entirely) when the weight is 1.0 or the seed
+        domain is unknown, so the default behavior is pure LLM-score ordering.
+        """
+        if self.off_domain_weight == 1.0 or not seed_domain:
+            return score
+        if same_registrable_domain(link_url, seed_domain) is False:
+            return score * self.off_domain_weight
+        return score
+
     def extract_batch(
         self,
         seed_urls: list[str],
@@ -270,7 +349,9 @@ class Extractor:
         stop_on_first_match: bool | None = None,
     ) -> list[ExtractionResult]:
         return [
-            self.extract(url, max_fetches=max_fetches, stop_on_first_match=stop_on_first_match)
+            self.extract(
+                url, max_fetches=max_fetches, stop_on_first_match=stop_on_first_match
+            )
             for url in seed_urls
         ]
 

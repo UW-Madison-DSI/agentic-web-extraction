@@ -1,5 +1,5 @@
 import io
-import re
+from collections.abc import Callable, Sequence
 from html.parser import HTMLParser
 from urllib.parse import urldefrag, urljoin
 
@@ -8,30 +8,29 @@ from markitdown._stream_info import StreamInfo
 
 _md = MarkItDown()
 
-# Cloudflare's email obfuscation rewrites mailto links to
-# `/cdn-cgi/l/email-protection#<hex>` and rotates that hex token on every
-# response. Left in the markdown it changes the content hash on each fetch,
-# permanently defeating the content-addressed page cache for any page with an
-# obfuscated email. Drop the volatile fragment so the normalized text is stable.
-_CF_EMAIL_TOKEN = re.compile(r"(/cdn-cgi/l/email-protection)#[0-9a-fA-F]+")
-
-# Foundant (grantinterface.com) dumps a diagnostic tooltip into the title
-# attribute of its "provided by Foundant Technologies" footer link — a
-# per-render server timestamp and a rotating hex token, both of which change on
-# every response and permanently defeat the content cache for every portal page
-# (login, register, apply). The whole title is an invisible tooltip with no
-# value to the LLM, so drop it entirely. Anchored to the foundant.com footer
-# link so it can match nothing else; `[^"]*` stops at the closing quote (the
-# title contains no interior quote).
-_FOUNDANT_FOOTER_TITLE = re.compile(r'(\]\(https://www\.foundant\.com)\s+"[^"]*"')
+# A text filter is a pure `str -> str` transform applied to the normalized
+# markdown. The library ships none: it is deliberately site-agnostic and does
+# not know about any particular website. Callers that need to strip volatile,
+# per-response tokens (rotating anti-bot tokens, per-render timestamps,
+# shuffled recommendation strips) so a page's content hash stays stable across
+# fetches pass their own filters via `Extractor(text_filters=...)`. See
+# examples/strippers.py for a ready-made set keyed to specific real-world sites.
+TextFilter = Callable[[str], str]
 
 
-def to_markdown(content: bytes, content_type: str, url: str | None = None) -> str:
+def to_markdown(
+    content: bytes,
+    content_type: str,
+    url: str | None = None,
+    text_filters: Sequence[TextFilter] | None = None,
+) -> str:
     extension = ".pdf" if "pdf" in content_type.lower() else ".html"
     info = StreamInfo(extension=extension, mimetype=content_type, url=url)
     result = _md.convert_stream(io.BytesIO(content), stream_info=info)
-    text = _CF_EMAIL_TOKEN.sub(r"\1", result.text_content or "")
-    return _FOUNDANT_FOOTER_TITLE.sub(r"\1", text)
+    text = result.text_content or ""
+    for text_filter in text_filters or ():
+        text = text_filter(text)
+    return text
 
 
 class _LinkParser(HTMLParser):

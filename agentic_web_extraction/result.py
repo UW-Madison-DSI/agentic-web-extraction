@@ -55,7 +55,9 @@ class ExtractionResult:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "data": self.data.model_dump(mode="json") if self.data is not None else None,
+            "data": self.data.model_dump(mode="json")
+            if self.data is not None
+            else None,
             "stopped_reason": self.stopped_reason,
             "pages_fetched": self.pages_fetched,
             "path": list(self.path),

@@ -41,7 +41,9 @@ def load_schema(spec: str) -> type[BaseModel]:
     if obj is None:
         raise typer.BadParameter(f"{class_name!r} not found in {head!r}")
     if not (isinstance(obj, type) and issubclass(obj, BaseModel)):
-        raise typer.BadParameter(f"{class_name!r} must be a Pydantic BaseModel subclass")
+        raise typer.BadParameter(
+            f"{class_name!r} must be a Pydantic BaseModel subclass"
+        )
     return obj
 
 
@@ -89,10 +91,28 @@ def extract(
             ),
         ),
     ] = None,
+    off_domain_weight: Annotated[
+        float | None,
+        typer.Option(
+            "--off-domain-weight",
+            help=(
+                "Score weight for outgoing links off the seed's registrable "
+                "domain. 1.0 (default) = full weight, no preference; < 1.0 softly "
+                "down-weights them (a nudge, not a filter); 0.0 is the strongest "
+                "preference. Defaults to AWE_OFF_DOMAIN_WEIGHT (1.0). Cache-"
+                "stability text filters are Python-API only; use the Python API "
+                "to pass them."
+            ),
+        ),
+    ] = None,
 ) -> None:
     model = load_schema(schema)
     criterion = load_criteria(criteria)
-    extractor = Extractor(schema=model, criteria=criterion)
+    extractor = Extractor(
+        schema=model,
+        criteria=criterion,
+        off_domain_weight=off_domain_weight,
+    )
     result = extractor.extract(
         seed_url=seed_url,
         max_fetches=max_fetches,
