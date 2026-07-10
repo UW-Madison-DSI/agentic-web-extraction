@@ -102,6 +102,52 @@ These are *illustrative* — the schemas and criteria belong to the caller.
 
 **University–industry engagement.** Caller defines a `Company` model (name, contact, engagement type), with criterion *"does this page describe company–university engagement"*, and seeds the agent at a company's homepage. The agent traverses partnership / news / about pages until it finds a matching engagement page.
 
+## Installation
+
+Install directly from GitHub with the `git+` URL syntax — no PyPI release needed.
+
+**uv** (add it to another project):
+
+```bash
+uv add "git+https://github.com/UW-Madison-DSI/agentic-web-extraction.git"
+```
+
+**pip** (into any environment):
+
+```bash
+pip install "git+https://github.com/UW-Madison-DSI/agentic-web-extraction.git"
+```
+
+**In `pyproject.toml`** (declare it as a project dependency):
+
+```toml
+[project]
+dependencies = [
+    "agentic-web-extraction @ git+https://github.com/UW-Madison-DSI/agentic-web-extraction.git",
+]
+```
+
+Pin to a specific tag, branch, or commit by appending `@<ref>` to the URL:
+
+```bash
+uv add "git+https://github.com/UW-Madison-DSI/agentic-web-extraction.git@v0.1.0"   # tag
+pip install "git+https://github.com/UW-Madison-DSI/agentic-web-extraction.git@main" # branch
+```
+
+Once installed, both the Python API and the `awe` CLI are available:
+
+```python
+from agentic_web_extraction import Extractor
+```
+
+```bash
+awe extract --help
+```
+
+Requires Python ≥3.13. If the repository is private, use an SSH URL instead
+(`git+ssh://git@github.com/UW-Madison-DSI/agentic-web-extraction.git`) and make sure
+your Git credentials are configured.
+
 ## Usage
 
 ### Python
