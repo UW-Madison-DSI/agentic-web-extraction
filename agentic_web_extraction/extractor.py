@@ -382,7 +382,7 @@ class Extractor:
             pages_fetched=pages_fetched,
             path=path,
             verdicts=verdicts,
-            provider=self.provider.name,
+            protocol=self.provider.name,
             usage_by_function=usage_by_function,
             function_model=self.provider.function_model,
         )
