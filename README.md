@@ -239,24 +239,18 @@ The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportuni
 
 ### Runnable example
 
-`examples/grants.py` is a runnable end-to-end demo and the reference for the `merge_extractions` hook. It defines a singular `Opportunity` plus an `Opportunities` **collection** schema, and extracts with the collection so a page can yield many opportunities. It seeds against a real Grants.gov page and, in gather-all mode, matches several linked NIH announcements; `Opportunities.merge_extractions` then folds them into one link-deduplicated result (pure Python — note the absence of a `"merge"` bucket in `usage_by_function`).
+`examples/grants.py` is a runnable end-to-end demo and the reference for the `merge_extractions` hook. It defines a singular `Opportunity` plus an `Opportunities` **collection** schema, and extracts with the collection so a page can yield many opportunities. It seeds against a real Grants.gov page and, in gather-all mode, matches several linked NIH announcements; `Opportunities.merge_extractions` then folds them into one result using an **LLM dedup call** (`provider.extract(..., usage_tag="merge")`), which collapses records describing the same underlying opportunity and surfaces as a `"merge"` bucket in `usage_by_function`. It falls back to a deterministic link-dedup when no provider is available or the call fails.
 
 ```bash
 uv run python examples/grants.py
 ```
 
-Seed: `https://simpler.grants.gov/opportunity/24a2e68b-9105-4fc8-8432-7ddff3e3afb8`. Sample output (truncated):
+Seed: `https://simpler.grants.gov/opportunity/24a2e68b-9105-4fc8-8432-7ddff3e3afb8`. Sample output (truncated) — the several matched pages collapse to one canonical opportunity:
 
 ```json
 {
   "data": {
     "items": [
-      {
-        "title": "Development and Application of PET and SPECT Imaging Ligands ...",
-        "deadline": null,
-        "sponsor": "National Institutes of Health",
-        "link": "https://www.grants.gov/search-results-detail/357006"
-      },
       {
         "title": "Development and Application of PET and SPECT Imaging Ligands ...",
         "deadline": "February 05, 2025",
@@ -273,14 +267,15 @@ Seed: `https://simpler.grants.gov/opportunity/24a2e68b-9105-4fc8-8432-7ddff3e3af
   ],
   "provider": "openai",
   "usage_by_function": {
-    "screen":      {"model": "gemma-4-26b-a4b-it", "input_tokens": 13783, "output_tokens": 275, "calls": 5, "cached_input_tokens": 544},
-    "score_links": {"model": "gemma-4-26b-a4b-it", "input_tokens": 17788, "output_tokens": 11706, "calls": 4, "cached_input_tokens": 576},
-    "extract":     {"model": "gemma-4-26b-a4b-it", "input_tokens": 51607, "output_tokens": 725, "calls": 4, "cached_input_tokens": 2144}
+    "screen":      {"model": "gemma-4-26b-a4b-it", "input_tokens": 8637,  "output_tokens": 247,  "calls": 5, "cached_input_tokens": 6816},
+    "score_links": {"model": "gemma-4-26b-a4b-it", "input_tokens": 10581, "output_tokens": 5994, "calls": 4, "cached_input_tokens": 8480},
+    "extract":     {"model": "gemma-4-26b-a4b-it", "input_tokens": 16783, "output_tokens": 410,  "calls": 2, "cached_input_tokens": 16736},
+    "merge":       {"model": "gemma-4-26b-a4b-it", "input_tokens": 593,   "output_tokens": 289,  "calls": 1, "cached_input_tokens": 224}
   }
 }
 ```
 
-(A schema that wanted an LLM-reconciled merge instead of pure-Python dedup would call `provider.extract(..., usage_tag="merge")` inside `merge_extractions`, which would then show up as a `"merge"` bucket above — see the foundation-extraction reference.)
+(For a pure-Python merge instead, drop the `provider.extract` call and reconcile the records in code — the `"merge"` bucket then won't appear. The foundation-extraction reference shows a richer LLM merge that also uses the `cache` argument to memoize the dedup.)
 
 Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your provider's equivalent) — see Configuration. The example's models default to `AWE_MODEL_EXTRACT` / `AWE_MODEL_SCREEN`; point these at models your key can actually access.
 
