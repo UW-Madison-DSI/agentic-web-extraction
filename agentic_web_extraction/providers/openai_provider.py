@@ -102,7 +102,9 @@ class OpenAIProvider:
                 calls=1,
                 cached_input_tokens=cached,
             )
-        self._usage_by_function[function] = self._usage_by_function.get(function, Usage()) + delta
+        self._usage_by_function[function] = (
+            self._usage_by_function.get(function, Usage()) + delta
+        )
         self._function_model[function] = model
         return delta
 
@@ -118,7 +120,11 @@ class OpenAIProvider:
         if delta is None:
             tok = "tok=?"
         else:
-            cached = f"(cached {delta.cached_input_tokens})" if delta.cached_input_tokens else ""
+            cached = (
+                f"(cached {delta.cached_input_tokens})"
+                if delta.cached_input_tokens
+                else ""
+            )
             tok = f"tok_in={delta.input_tokens}{cached} tok_out={delta.output_tokens}"
         status = f"FAIL:{type(error).__name__}" if error is not None else "ok"
         print(
@@ -140,10 +146,19 @@ class OpenAIProvider:
                 text_format=_ScreenSchema,
             )
         except BaseException as e:
-            self._log_call("screen", self.model_screen, len(payload), time.monotonic() - t0, None, e)
+            self._log_call(
+                "screen",
+                self.model_screen,
+                len(payload),
+                time.monotonic() - t0,
+                None,
+                e,
+            )
             raise
         delta = self._accumulate(response, self.model_screen, "screen")
-        self._log_call("screen", self.model_screen, len(payload), time.monotonic() - t0, delta)
+        self._log_call(
+            "screen", self.model_screen, len(payload), time.monotonic() - t0, delta
+        )
         parsed = response.output_parsed
         assert parsed is not None
         return ScreenVerdict(match=parsed.match, reason=parsed.reason)
@@ -174,10 +189,23 @@ class OpenAIProvider:
                 text_format=_LinkScores,
             )
         except BaseException as e:
-            self._log_call(f"score_links[{len(links)}]", self.model_screen, len(payload), time.monotonic() - t0, None, e)
+            self._log_call(
+                f"score_links[{len(links)}]",
+                self.model_screen,
+                len(payload),
+                time.monotonic() - t0,
+                None,
+                e,
+            )
             raise
         delta = self._accumulate(response, self.model_screen, "score_links")
-        self._log_call(f"score_links[{len(links)}]", self.model_screen, len(payload), time.monotonic() - t0, delta)
+        self._log_call(
+            f"score_links[{len(links)}]",
+            self.model_screen,
+            len(payload),
+            time.monotonic() - t0,
+            delta,
+        )
         parsed = response.output_parsed
         assert parsed is not None
         url_set = {url for _, url in links}
@@ -201,10 +229,14 @@ class OpenAIProvider:
                 text_format=schema,
             )
         except BaseException as e:
-            self._log_call(step, self.model_extract, len(payload), time.monotonic() - t0, None, e)
+            self._log_call(
+                step, self.model_extract, len(payload), time.monotonic() - t0, None, e
+            )
             raise
         delta = self._accumulate(response, self.model_extract, usage_tag)
-        self._log_call(step, self.model_extract, len(payload), time.monotonic() - t0, delta)
+        self._log_call(
+            step, self.model_extract, len(payload), time.monotonic() - t0, delta
+        )
         parsed = response.output_parsed
         assert parsed is not None
         return parsed

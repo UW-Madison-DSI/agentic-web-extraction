@@ -38,6 +38,18 @@ class Settings(BaseSettings):
     # merging them (env: AWE_STOP_ON_FIRST_MATCH). Default False preserves the
     # gather-all-then-merge behavior.
     stop_on_first_match: bool = False
+    # Soft same-domain navigation preference (env: AWE_OFF_DOMAIN_WEIGHT), a
+    # single knob. An outgoing link whose registrable domain differs from the
+    # seed's has its LLM relevance score multiplied by this weight before it
+    # enters the frontier. 1.0 (the default) is full weight -- no preference,
+    # pure LLM-score ordering. A value < 1.0 opts into a *soft* same-domain
+    # preference by down-weighting off-domain links: a nudge, not a filter (a
+    # strongly-scored off-domain page can still outrank a weak on-domain one,
+    # and off-domain links are never excluded outright). 0.0 is the strongest
+    # preference; off-domain links are driven to the back of the frontier but
+    # still reachable. The registrable-domain comparison is generic (Public
+    # Suffix List, see frontier.py) -- no logic tied to any particular site.
+    off_domain_weight: float = 1.0
     # On-disk HTTP response cache (hishel), env: AWE_HTTP_CACHE. Persisted across
     # runs so weekly re-crawls can issue conditional GETs; empty string uses an
     # in-memory cache.

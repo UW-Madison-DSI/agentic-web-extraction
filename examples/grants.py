@@ -30,7 +30,9 @@ if TYPE_CHECKING:
     from agentic_web_extraction.cache import KVCache
     from agentic_web_extraction.providers import Provider
 
-DEFAULT_SEED_URL = "https://simpler.grants.gov/opportunity/24a2e68b-9105-4fc8-8432-7ddff3e3afb8"
+DEFAULT_SEED_URL = (
+    "https://simpler.grants.gov/opportunity/24a2e68b-9105-4fc8-8432-7ddff3e3afb8"
+)
 DEFAULT_CRITERIA = (
     "Page describes one or more grant or funding opportunities an academic PI could apply for, "
     "with title, deadline, eligibility, and sponsor information."
@@ -94,14 +96,16 @@ class Opportunities(BaseModel):
         if provider is None or len(flat) <= 1:
             return cls(items=_dedup_by_link(flat))
 
-        payload = (
-            f"{_DEDUP_INSTRUCTIONS}\n\nRECORDS ({len(flat)}):\n"
-            + json.dumps([o.model_dump() for o in flat], indent=2, ensure_ascii=False)
+        payload = f"{_DEDUP_INSTRUCTIONS}\n\nRECORDS ({len(flat)}):\n" + json.dumps(
+            [o.model_dump() for o in flat], indent=2, ensure_ascii=False
         )
         try:
             merged = provider.extract(payload, cls, usage_tag="merge")
         except Exception as e:  # noqa: BLE001 - degrade to deterministic dedup
-            print(f"  [merge] LLM dedup failed ({type(e).__name__}); using URL dedup", file=sys.stderr)
+            print(
+                f"  [merge] LLM dedup failed ({type(e).__name__}); using URL dedup",
+                file=sys.stderr,
+            )
             return cls(items=_dedup_by_link(flat))
         if isinstance(merged, cls):
             return merged
@@ -127,8 +131,25 @@ def _dedup_by_link(opps: list[Opportunity]) -> list[Opportunity]:
 def main() -> int:
     from agentic_web_extraction import Extractor
 
-    extractor = Extractor(schema=Opportunities, criteria=DEFAULT_CRITERIA)
-    result = extractor.extract(seed_url=DEFAULT_SEED_URL, max_fetches=DEFAULT_MAX_FETCHES)
+    try:
+        # When run as a script (`uv run python examples/grants.py`), the examples
+        # dir is on sys.path, so `strippers` is importable top-level.
+        from strippers import CACHE_STABILITY_FILTERS
+    except ImportError:
+        # When imported as part of the `examples` package (repo root on path).
+        from examples.strippers import CACHE_STABILITY_FILTERS
+
+    # `text_filters` is where a caller injects the site-specific cache-stability
+    # strippers the (agnostic) library no longer ships. They're harmless on
+    # sites they don't match, so passing the whole bundle is fine.
+    extractor = Extractor(
+        schema=Opportunities,
+        criteria=DEFAULT_CRITERIA,
+        text_filters=CACHE_STABILITY_FILTERS,
+    )
+    result = extractor.extract(
+        seed_url=DEFAULT_SEED_URL, max_fetches=DEFAULT_MAX_FETCHES
+    )
     print(json.dumps(result.to_dict(), indent=2))
     return 0 if result.stopped_reason == "match" else 2
 

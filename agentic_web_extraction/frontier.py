@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 from itertools import count
 from urllib.parse import parse_qsl, urldefrag, urlencode, urlsplit, urlunsplit
 
+import tldextract
+
 
 def canonical(url: str) -> str:
     no_frag, _ = urldefrag(url)
@@ -12,6 +14,40 @@ def canonical(url: str) -> str:
     query = urlencode(sorted(parse_qsl(parts.query, keep_blank_values=True)))
     path = parts.path or "/"
     return urlunsplit((scheme, netloc, path, query, ""))
+
+
+# Registrable-domain extraction backed by the Public Suffix List (via
+# tldextract). Constructed with no `suffix_list_urls` so it uses the PSL
+# snapshot bundled with tldextract rather than fetching it over the network at
+# runtime -- deterministic and offline-safe, and still covers the full set of
+# multi-label public suffixes (`co.uk`, `ac.za`, `nic.in`, `com.au`, ...) that a
+# hand-maintained suffix list would inevitably miss. Schema-agnostic: no logic
+# tied to any particular website or domain.
+_extract = tldextract.TLDExtract(suffix_list_urls=())
+
+
+def registrable_domain(host: str) -> str:
+    """Best-effort registrable domain (eTLD+1) for `host`, via the Public
+    Suffix List. Returns "" when `host` is empty or has no registrable domain
+    (e.g. a bare hostname like `localhost` or an IP address)."""
+    if not host:
+        return ""
+    ext = _extract(host)
+    if not ext.domain or not ext.suffix:
+        return ""
+    return f"{ext.domain}.{ext.suffix}".lower()
+
+
+def same_registrable_domain(url: str, seed_domain: str) -> bool | None:
+    """True if `url`'s host shares `seed_domain` (an already-registrable
+    domain), False if it is on a different registrable domain, None if `url`'s
+    host is missing/unparseable (so the caller can treat "unknown" as not a
+    penalty)."""
+    host = urlsplit(url).netloc if url else ""
+    dom = registrable_domain(host)
+    if not dom or not seed_domain:
+        return None
+    return dom == seed_domain
 
 
 @dataclass
