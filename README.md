@@ -196,6 +196,8 @@ result = extractor.extract(
 # result.pages_fetched:  int
 # result.path:           list[str]
 # result.verdicts:       list[PageVerdict]  (one per screened page: url, match, reason)
+# result.protocol:       str  -- provider adapter / wire protocol that ran the
+#   crawl (e.g. "openai"); names the SDK/billing surface, not the model vendor.
 # result.usage_by_function: dict[str, Usage]  -- token usage by call purpose
 #   (screen / score_links / extract, plus any tag a caller passes to extract()).
 #   Usage = (input_tokens, output_tokens, calls, cached_input_tokens); the cached
@@ -297,7 +299,7 @@ Seed: `https://simpler.grants.gov/opportunity/24a2e68b-9105-4fc8-8432-7ddff3e3af
   "verdicts": [
     {"url": "https://simpler.grants.gov/opportunity/24a2e68b-...", "match": true, "reason": "..."}
   ],
-  "provider": "openai",
+  "protocol": "openai",
   "usage_by_function": {
     "screen":      {"model": "gemma-4-26b-a4b-it", "input_tokens": 8637,  "output_tokens": 247,  "calls": 5, "cached_input_tokens": 6816},
     "score_links": {"model": "gemma-4-26b-a4b-it", "input_tokens": 10581, "output_tokens": 5994, "calls": 4, "cached_input_tokens": 8480},

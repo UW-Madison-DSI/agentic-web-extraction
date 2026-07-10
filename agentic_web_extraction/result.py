@@ -42,16 +42,44 @@ class PageVerdict:
 @dataclass
 class ExtractionResult:
     data: BaseModel | None
+    """The extracted result: a ``schema`` instance merged across every matching
+    page (or the single match's data when ``stop_on_first_match``), or ``None``
+    when no page matched (``stopped_reason == "budget_exhausted"``)."""
+
     stopped_reason: StoppedReason
+    """Why the traversal ended: ``"match"`` if at least one page matched (even
+    in gather-all mode, which continues past the first), else
+    ``"budget_exhausted"`` when the frontier emptied or ``max_fetches`` ran out
+    with no match."""
+
     pages_fetched: int
+    """Count of *readable* pages that consumed a ``max_fetches`` budget slot —
+    HTML/PDF bodies the agent did LLM work on. Fetches that errored or returned
+    a non-HTML/PDF body are in ``path`` but excluded here."""
+
     path: list[str]
+    """Resolved URLs visited in traversal order, including error/skipped fetches
+    that did not consume budget. Deduped on the post-redirect URL."""
+
     verdicts: list[PageVerdict]
-    provider: str
-    # Token usage split by call purpose (screen / score_links / extract / merge /
-    # review). function_model records which model each function ran on so cost is
-    # reconstructable; aggregate over functions sharing a model for a per-model view.
+    """One ``PageVerdict`` (url, match, reason) per screened page — the full
+    screening record, not just the matches."""
+
+    protocol: str
+    """Name of the provider adapter / wire protocol that ran the crawl (e.g.
+    ``"openai"``). Names the SDK/billing surface, NOT the model vendor — an
+    OpenAI-compatible endpoint may serve a non-OpenAI model. Pair with each
+    bucket's model in ``usage_by_function`` to reconstruct cost."""
+
     usage_by_function: dict[str, Usage] = field(default_factory=dict)
+    """Token usage split by call purpose (``screen`` / ``score_links`` /
+    ``extract`` / ``merge`` / any tag a caller passes to ``extract``). Sum the
+    values for a grand total."""
+
     function_model: dict[str, str] = field(default_factory=dict)
+    """Which model each function bucket in ``usage_by_function`` ran on, so cost
+    is reconstructable; aggregate over functions sharing a model for a per-model
+    view."""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -65,7 +93,7 @@ class ExtractionResult:
                 {"url": v.url, "match": v.match, "reason": v.reason}
                 for v in self.verdicts
             ],
-            "provider": self.provider,
+            "protocol": self.protocol,
             "usage_by_function": {
                 func: {
                     "model": self.function_model.get(func),
