@@ -1,5 +1,9 @@
+import inspect
 import json
-from collections.abc import Sequence
+import sys
+import time
+from collections.abc import Callable, Sequence
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel
 
@@ -63,6 +67,16 @@ class Extractor:
             normalize=self.normalize_html,
         )
 
+    @staticmethod
+    def _log(message: str) -> None:
+        """Emit a progress/diagnostic line.
+
+        Always goes to stderr, never stdout: the CLI writes the result JSON to
+        stdout, so a stray progress line there would corrupt it for a consumer
+        piping the output.
+        """
+        print(message, file=sys.stderr, flush=True)
+
     def extract(
         self,
         seed_url: str,
@@ -82,9 +96,7 @@ class Extractor:
         # Registrable domain of the seed, used to softly down-weight off-domain
         # outgoing links when `off_domain_weight` < 1.0 (see _frontier_score).
         # Empty when the seed host is unparseable, which disables the re-weighting.
-        from urllib.parse import urlsplit as _urlsplit
-
-        seed_domain = registrable_domain(_urlsplit(seed_url).netloc)
+        seed_domain = registrable_domain(urlsplit(seed_url).netloc)
 
         path: list[str] = []
         pages_fetched = 0
@@ -92,35 +104,24 @@ class Extractor:
         usage_by_function_at_start = self.provider.usage_by_function
         matches: list[tuple[str, BaseModel]] = []
 
-        import sys as _sys
-        import time as _time
-
         while pages_fetched < budget:
             popped = frontier.pop()
             if popped is None:
                 break
             url, _score, _source = popped
 
-            print(
-                f"  [page {pages_fetched + 1}/{budget}] (score={_score:.2f}) {url}",
-                file=_sys.stderr,
-                flush=True,
+            self._log(
+                f"  [page {pages_fetched + 1}/{budget}] (score={_score:.2f}) {url}"
             )
-            fetch_t0 = _time.monotonic()
+            fetch_t0 = time.monotonic()
             try:
                 page = fetch_module.fetch(url)
             except Exception as e:
-                print(
-                    f"    ! fetch failed on {url}: {type(e).__name__}: {e}",
-                    file=_sys.stderr,
-                    flush=True,
-                )
+                self._log(f"    ! fetch failed on {url}: {type(e).__name__}: {e}")
                 frontier.mark_visited(url)
                 continue
-            print(
-                f"    [fetch] kind={page.kind} elapsed={_time.monotonic() - fetch_t0:.2f}s",
-                file=_sys.stderr,
-                flush=True,
+            self._log(
+                f"    [fetch] kind={page.kind} elapsed={time.monotonic() - fetch_t0:.2f}s"
             )
             frontier.mark_visited(url)
             # A fetch can redirect, and distinct requested URLs (classically
@@ -128,11 +129,7 @@ class Extractor:
             # run already processed the resolved URL, skip it so no page is
             # fetched-through-to-screen, counted, cached, or path-listed twice.
             if page.url != url and frontier.is_visited(page.url):
-                print(
-                    f"    [dedup] {url} resolved to already-seen {page.url}",
-                    file=_sys.stderr,
-                    flush=True,
-                )
+                self._log(f"    [dedup] {url} resolved to already-seen {page.url}")
                 continue
             frontier.mark_visited(page.url)
             path.append(page.url)
@@ -159,9 +156,8 @@ class Extractor:
                     else page.text
                 )
             except Exception as e:
-                print(
-                    f"    ! normalize failed on {page.url}: {type(e).__name__}: {e}",
-                    flush=True,
+                self._log(
+                    f"    ! normalize failed on {page.url}: {type(e).__name__}: {e}"
                 )
                 continue
 
@@ -178,7 +174,7 @@ class Extractor:
             )
             if cached_raw is not None:
                 cached = CachedPage.from_json(cached_raw)
-                print(f"    [cache] hit {page.url}", file=_sys.stderr, flush=True)
+                self._log(f"    [cache] hit {page.url}")
                 verdicts.append(
                     PageVerdict(
                         url=page.url,
@@ -190,9 +186,9 @@ class Extractor:
                     try:
                         data = self.schema.model_validate(cached.extracted)
                     except Exception as e:
-                        print(
-                            f"    ! cached extract invalid on {page.url}: {type(e).__name__}: {e}",
-                            flush=True,
+                        self._log(
+                            f"    ! cached extract invalid on {page.url}: "
+                            f"{type(e).__name__}: {e}"
                         )
                     else:
                         matches.append((page.url, data))
@@ -210,10 +206,7 @@ class Extractor:
             try:
                 verdict = self.provider.screen(page_md, self.criteria)
             except Exception as e:
-                print(
-                    f"    ! screen failed on {page.url}: {type(e).__name__}: {e}",
-                    flush=True,
-                )
+                self._log(f"    ! screen failed on {page.url}: {type(e).__name__}: {e}")
                 continue
             verdicts.append(
                 PageVerdict(url=page.url, match=verdict.match, reason=verdict.reason)
@@ -224,9 +217,8 @@ class Extractor:
                 try:
                     data = self.provider.extract(page_md, self.schema)
                 except Exception as e:
-                    print(
-                        f"    ! extract failed on {page.url}: {type(e).__name__}: {e}",
-                        flush=True,
+                    self._log(
+                        f"    ! extract failed on {page.url}: {type(e).__name__}: {e}"
                     )
                     stage_error = True
                 else:
@@ -240,11 +232,7 @@ class Extractor:
             # its cache record would be incomplete (no link scores) and could
             # mislead a later gather-all run that replays it.
             if matched_here and stop_first:
-                print(
-                    f"    [stop] first match on {page.url}; stopping traversal",
-                    file=_sys.stderr,
-                    flush=True,
-                )
+                self._log(f"    [stop] first match on {page.url}; stopping traversal")
                 break
 
             link_scores: list[list] = []
@@ -261,9 +249,9 @@ class Extractor:
                             fresh, page_md, self.criteria
                         )
                     except Exception as e:
-                        print(
-                            f"    ! score_links failed on {page.url}: {type(e).__name__}: {e}",
-                            flush=True,
+                        self._log(
+                            f"    ! score_links failed on {page.url}: "
+                            f"{type(e).__name__}: {e}"
                         )
                         stage_error = True
                     else:
@@ -295,15 +283,7 @@ class Extractor:
         if matches:
             merge = getattr(self.schema, "merge_extractions", None)
             if callable(merge):
-                try:
-                    data = merge(matches, provider=self.provider, cache=self.cache)
-                except TypeError:
-                    # Backwards-compat: schema's merge_extractions may accept
-                    # neither cache nor provider. Degrade one kwarg at a time.
-                    try:
-                        data = merge(matches, provider=self.provider)
-                    except TypeError:
-                        data = merge(matches)
+                data = self._merge(merge, matches)
             else:
                 data = matches[0][1]
             return self._result(
@@ -323,6 +303,38 @@ class Extractor:
             verdicts=verdicts,
             usage_by_function_at_start=usage_by_function_at_start,
         )
+
+    def _merge(
+        self,
+        merge: Callable[..., BaseModel],
+        matches: list[tuple[str, BaseModel]],
+    ) -> BaseModel:
+        """Call the schema's `merge_extractions`, passing only the optional kwargs
+        it actually declares.
+
+        Which of `provider` / `cache` a schema accepts is decided by *inspecting
+        the signature*, not by calling and catching `TypeError`. Catching
+        `TypeError` could not tell "this call has the wrong arity" apart from "a
+        `TypeError` was raised inside a correctly-matched call", so it would
+        silently re-run the merge (and any LLM calls it makes) up to two more
+        times and then surface the wrong error. Probing the signature calls the
+        merge exactly once.
+        """
+        available = {"provider": self.provider, "cache": self.cache}
+        try:
+            params = inspect.signature(merge).parameters
+        except (TypeError, ValueError):
+            # Uninspectable callable (rare); offer everything and let it choose.
+            return merge(matches, **available)
+        accepts_var_kwargs = any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+        )
+        kwargs = {
+            name: value
+            for name, value in available.items()
+            if accepts_var_kwargs or name in params
+        }
+        return merge(matches, **kwargs)
 
     def _frontier_score(self, link_url: str, score: float, seed_domain: str) -> float:
         """Apply the opt-in soft same-domain preference to a link's raw score.
