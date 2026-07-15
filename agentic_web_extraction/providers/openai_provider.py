@@ -27,7 +27,32 @@ DEFAULT_EXTRACT_PROMPT = (
     "page text. Do not fabricate."
 )
 
+# Appended to the screen / score instructions only when the caller opts into the
+# soft same-domain preference (Extractor(prefer_seed_domain=True)). Both feed the
+# LLM a Python-computed on-domain signal and ask it to *disfavor* off-domain
+# content -- a nudge, not a hard exclusion.
+SCREEN_DOMAIN_PREFERENCE = (
+    "\n\nDOMAIN PREFERENCE: You are given SEED_URL (where the crawl started), the "
+    "PAGE_URL, and ON_SEED_DOMAIN (whether the page is on the seed's registrable "
+    "domain). Disfavor off-domain pages: when ON_SEED_DOMAIN is 'no', treat the page "
+    "as less likely to be the target and require clearer evidence before returning "
+    "match=true. This is a soft preference, not a hard rule -- a page that is clearly "
+    "the target still matches even when off-domain."
+)
+SCORE_DOMAIN_PREFERENCE = (
+    "\n\nDOMAIN PREFERENCE: You are given SEED_URL (where the crawl started), and each "
+    "link is annotated with on_seed_domain (whether it is on the seed's registrable "
+    "domain). Disfavor off-domain links: assign an off-domain link a lower score than "
+    "an on-domain link of otherwise comparable promise. This is a soft preference, not "
+    "a hard filter -- a clearly on-target off-domain link may still score highly."
+)
+
 PAGE_TRUNC_CHARS = 16000
+
+
+def _yn(on_seed_domain: bool | None) -> str:
+    """Render the on-domain signal for the prompt (None = host unparseable)."""
+    return {True: "yes", False: "no", None: "unknown"}[on_seed_domain]
 
 
 class _ScreenSchema(BaseModel):
@@ -134,14 +159,34 @@ class OpenAIProvider:
             flush=True,
         )
 
-    def screen(self, page_md: str, criterion: str) -> ScreenVerdict:
+    def screen(
+        self,
+        page_md: str,
+        criterion: str,
+        *,
+        page_url: str | None = None,
+        seed_url: str | None = None,
+        on_seed_domain: bool | None = None,
+    ) -> ScreenVerdict:
         truncated = page_md[:PAGE_TRUNC_CHARS]
-        payload = f"CRITERION:\n{criterion}\n\nPAGE:\n{truncated}"
+        # The domain block + preference instruction are added only when the caller
+        # supplies a seed_url (i.e. opted into the same-domain preference); with no
+        # seed_url the prompt and payload are byte-identical to the default path.
+        instructions = self.screen_prompt
+        domain_block = ""
+        if seed_url is not None:
+            instructions = self.screen_prompt + SCREEN_DOMAIN_PREFERENCE
+            domain_block = (
+                f"SEED_URL: {seed_url}\n"
+                f"PAGE_URL: {page_url or '(unknown)'}\n"
+                f"ON_SEED_DOMAIN: {_yn(on_seed_domain)}\n\n"
+            )
+        payload = f"CRITERION:\n{criterion}\n\n{domain_block}PAGE:\n{truncated}"
         t0 = time.monotonic()
         try:
             response = self._client.responses.parse(
                 model=self.model_screen,
-                instructions=self.screen_prompt,
+                instructions=instructions,
                 input=payload,
                 text_format=_ScreenSchema,
             )
@@ -168,15 +213,32 @@ class OpenAIProvider:
         links: list[tuple[str, str]],
         page_md: str,
         criterion: str,
+        *,
+        seed_url: str | None = None,
+        on_seed_domain: dict[str, bool | None] | None = None,
     ) -> list[tuple[str, float]]:
         if not links:
             return []
         page_excerpt = page_md[:4000]
-        link_block = "\n".join(
-            f"- {url}  (anchor: {anchor!r})" for anchor, url in links
-        )
+        # Annotate each link with its on-domain signal (and add the preference
+        # instruction) only when the caller opted in via seed_url; otherwise the
+        # prompt is byte-identical to the default path.
+        annotate = seed_url is not None
+        instructions = self.score_prompt + (SCORE_DOMAIN_PREFERENCE if annotate else "")
+        sig = on_seed_domain or {}
+        link_lines = []
+        for anchor, url in links:
+            if annotate:
+                link_lines.append(
+                    f"- {url}  (anchor: {anchor!r}, on_seed_domain: {_yn(sig.get(url))})"
+                )
+            else:
+                link_lines.append(f"- {url}  (anchor: {anchor!r})")
+        link_block = "\n".join(link_lines)
+        seed_line = f"SEED_URL: {seed_url}\n\n" if annotate else ""
         payload = (
             f"CRITERION:\n{criterion}\n\n"
+            f"{seed_line}"
             f"SOURCE PAGE EXCERPT:\n{page_excerpt}\n\n"
             f"LINKS TO SCORE (one per line):\n{link_block}"
         )
@@ -184,7 +246,7 @@ class OpenAIProvider:
         try:
             response = self._client.responses.parse(
                 model=self.model_screen,
-                instructions=self.score_prompt,
+                instructions=instructions,
                 input=payload,
                 text_format=_LinkScores,
             )

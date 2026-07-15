@@ -91,17 +91,17 @@ def extract(
             ),
         ),
     ] = None,
-    off_domain_weight: Annotated[
-        float | None,
+    prefer_seed_domain: Annotated[
+        bool | None,
         typer.Option(
-            "--off-domain-weight",
+            "--prefer-seed-domain/--no-prefer-seed-domain",
             help=(
-                "Score weight for outgoing links off the seed's registrable "
-                "domain. 1.0 (default) = full weight, no preference; < 1.0 softly "
-                "down-weights them (a nudge, not a filter); 0.0 is the strongest "
-                "preference. Defaults to AWE_OFF_DOMAIN_WEIGHT (1.0). Cache-"
-                "stability text filters are Python-API only; use the Python API "
-                "to pass them."
+                "Softly disfavor pages/links off the seed's registrable domain. "
+                "When on, the screen and link-scorer calls are told the seed/page "
+                "URL and a computed on-domain signal, and asked to disfavor "
+                "off-domain content (a nudge, not a filter -- nothing is excluded). "
+                "Defaults to AWE_PREFER_SEED_DOMAIN (off). Cache-stability text "
+                "filters are Python-API only; use the Python API to pass them."
             ),
         ),
     ] = None,
@@ -111,7 +111,7 @@ def extract(
     extractor = Extractor(
         schema=model,
         criteria=criterion,
-        off_domain_weight=off_domain_weight,
+        prefer_seed_domain=prefer_seed_domain,
     )
     result = extractor.extract(
         seed_url=seed_url,

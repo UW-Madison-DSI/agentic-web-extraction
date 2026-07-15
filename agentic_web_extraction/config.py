@@ -38,18 +38,16 @@ class Settings(BaseSettings):
     # merging them (env: AWE_STOP_ON_FIRST_MATCH). Default False preserves the
     # gather-all-then-merge behavior.
     stop_on_first_match: bool = False
-    # Soft same-domain navigation preference (env: AWE_OFF_DOMAIN_WEIGHT), a
-    # single knob. An outgoing link whose registrable domain differs from the
-    # seed's has its LLM relevance score multiplied by this weight before it
-    # enters the frontier. 1.0 (the default) is full weight -- no preference,
-    # pure LLM-score ordering. A value < 1.0 opts into a *soft* same-domain
-    # preference by down-weighting off-domain links: a nudge, not a filter (a
-    # strongly-scored off-domain page can still outrank a weak on-domain one,
-    # and off-domain links are never excluded outright). 0.0 is the strongest
-    # preference; off-domain links are driven to the back of the frontier but
-    # still reachable. The registrable-domain comparison is generic (Public
-    # Suffix List, see frontier.py) -- no logic tied to any particular site.
-    off_domain_weight: float = 1.0
+    # Soft same-domain preference, expressed to the LLM rather than as a math
+    # weight (env: AWE_PREFER_SEED_DOMAIN). When True, the pre-screen and
+    # link-scorer calls are told the seed URL, the page/link URL, and a
+    # Python-computed `on_seed_domain` signal, with an instruction to *disfavor*
+    # off-domain pages/links -- a soft preference the model applies with its own
+    # judgment, not a hard filter (a clearly on-target off-domain page still
+    # matches / scores high). Off by default: pure LLM-score ordering with no
+    # domain information supplied. The registrable-domain comparison is generic
+    # (Public Suffix List, see frontier.py) -- no logic tied to any particular site.
+    prefer_seed_domain: bool = False
     # On-disk HTTP response cache (hishel), env: AWE_HTTP_CACHE. Persisted across
     # runs so weekly re-crawls can issue conditional GETs; empty string uses an
     # in-memory cache.

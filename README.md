@@ -25,7 +25,7 @@ The agent maintains a **frontier** — every unvisited link it has seen so far, 
 - The loop keeps going until the **fetch budget** is exhausted (or the frontier empties), collecting every matching page along the way.
 - At the end, all matches are combined via the schema's optional `merge_extractions` classmethod (falling back to the first match). `stopped_reason` is `"match"` if at least one page matched, else `"budget_exhausted"`.
 
-This is best-first search, not breadth-first or depth-first. The LLM's relevance scoring is the primary navigation policy; depth and per-link thresholds are deliberately **not** tunable in v0 — the budget is the main lever. The one opt-in exception is a *soft* same-domain preference (off by default; see below), which only re-weights scores and never excludes a link.
+This is best-first search, not breadth-first or depth-first. The LLM's relevance scoring is the primary navigation policy; depth and per-link thresholds are deliberately **not** tunable in v0 — the budget is the main lever. The one opt-in exception is a *soft* same-domain preference (off by default; see below): rather than re-weighting scores in code, it hands the LLM the seed/page URL and a computed on-domain signal and asks it to disfavor off-domain content — a nudge the model applies with its own judgment, never a hard exclusion.
 
 ## What you provide
 
@@ -37,7 +37,7 @@ Optional:
 
 - **Fetch budget** — `max_fetches` (default `10`). The agent stops when it has fetched this many pages.
 - **Match mode** — `stop_on_first_match` (default `False`). `False` spends the budget gathering every matching page and merges them; `True` returns as soon as the first page matches.
-- **Same-domain preference** — `off_domain_weight` (default `1.0`). Links off the seed's registrable domain get their score multiplied by this weight: `1.0` = full weight / no preference (the default), `< 1.0` = a soft nudge toward same-domain, `0.0` = strongest. It's a nudge, not a filter — off-domain links are never excluded. Comparison is at the registrable-domain (eTLD+1) level, so all of `*.wisc.edu` count as one domain.
+- **Same-domain preference** — `prefer_seed_domain` (default `False`). When `True`, the pre-screen and link-scorer calls are told the seed URL, the page/link URL, and a Python-computed `on_seed_domain` signal, with an instruction to *disfavor* off-domain pages and links. The LLM applies it as a soft preference, not a filter — a clearly on-target off-domain page still matches / scores high, and nothing is excluded. Comparison is at the registrable-domain (eTLD+1) level via the Public Suffix List, so all of `*.wisc.edu` count as one domain.
 - **Text filters** — `text_filters`, a list of `str -> str` transforms applied to the normalized markdown. This is where *you* strip volatile per-response tokens (rotating anti-bot tokens, per-render timestamps, shuffled recommendation strips) so a page's content hash stays stable and the page cache can hit. The library ships none — it's site-agnostic; ready-made examples live in [examples/strippers.py](examples/strippers.py).
 - **Provider / model** — defaults to OpenAI; swappable.
 - **Normalization toggle** — HTML→Markdown is on by default for cost reduction.
@@ -176,9 +176,9 @@ extractor = Extractor(
     criteria="Page describes a grant or funding opportunity an academic PI could apply for.",
     # provider/model defaults come from AWE_* env vars (see Configuration).
     # Pass `provider=MyProvider(...)` to inject a custom Provider instance.
-    off_domain_weight=1.0,     # optional; falls back to AWE_OFF_DOMAIN_WEIGHT.
-                               # 1.0 = full weight / no preference; < 1.0 softly favors
-                               # the seed's registrable domain; 0.0 = strongest (never excludes).
+    prefer_seed_domain=False,  # optional; falls back to AWE_PREFER_SEED_DOMAIN.
+                               # True = feed the LLM the seed/page URL + on-domain signal and
+                               # ask it to disfavor off-domain content (a nudge, never excludes).
     text_filters=None,         # optional; list of str->str transforms applied to
                                # the normalized markdown (cache-stability strippers,
                                # etc.). The library ships none — see examples/strippers.py.
@@ -269,7 +269,7 @@ uv run awe extract \
   --max-fetches 10
 ```
 
-The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunity`) or a path to a Python file (`./schemas.py:Opportunity`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Add `--stop-on-first-match` to return on the first matching page (or `--gather-all-matches` to force the gather-and-merge default); omit both to use `AWE_STOP_ON_FIRST_MATCH`. Add `--off-domain-weight 0.5` to softly down-weight off-domain links (`1.0` = full weight / no preference, the default; omit to use `AWE_OFF_DOMAIN_WEIGHT`). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
+The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunity`) or a path to a Python file (`./schemas.py:Opportunity`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Add `--stop-on-first-match` to return on the first matching page (or `--gather-all-matches` to force the gather-and-merge default); omit both to use `AWE_STOP_ON_FIRST_MATCH`. Add `--prefer-seed-domain` to softly disfavor off-domain pages/links (the LLM is told the seed/page URL and an on-domain signal; `--no-prefer-seed-domain` forces it off, the default; omit to use `AWE_PREFER_SEED_DOMAIN`). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
 
 ### Runnable example
 
@@ -326,12 +326,12 @@ Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your pr
 | Follow linked PDFs   | `AWE_FOLLOW_PDF`      | `true`                 |
 | Max page fetches     | `AWE_MAX_FETCHES`     | `10`                   |
 | Stop at first match  | `AWE_STOP_ON_FIRST_MATCH` | `false` (gather all + merge) |
-| Off-domain weight    | `AWE_OFF_DOMAIN_WEIGHT` | `1.0` (1.0 = full weight / no preference; < 1.0 = soft same-domain nudge) |
+| Prefer seed domain   | `AWE_PREFER_SEED_DOMAIN` | `false` (true = LLM disfavors off-domain pages/links) |
 | HTTP response cache  | `AWE_HTTP_CACHE`      | `data/http_cache.sqlite` (empty = in-memory) |
 
 Settings are loaded from `.env` if present (see `.env.example`).
 
-`AWE_MAX_FETCHES` is the main traversal knob in v0. Depth limits and link-relevance thresholds are intentionally **not** user-configurable — the budget is the main lever and the LLM's link scoring is the navigation policy. The only exception is the opt-in soft same-domain preference (`AWE_OFF_DOMAIN_WEIGHT`, a single knob — `1.0` disables it), which re-weights scores but never excludes a link.
+`AWE_MAX_FETCHES` is the main traversal knob in v0. Depth limits and link-relevance thresholds are intentionally **not** user-configurable — the budget is the main lever and the LLM's link scoring is the navigation policy. The only exception is the opt-in soft same-domain preference (`AWE_PREFER_SEED_DOMAIN`, a single on/off knob), which feeds the LLM an on-domain signal and asks it to disfavor off-domain content but never excludes a link.
 
 ## Project layout
 
@@ -383,5 +383,5 @@ v0 done:
 - [x] Opt-in content-addressed page cache (`Extractor(..., cache=)` over a generic `KVCache`; replays screen/extract/score with no LLM calls when page content is unchanged)
 - [x] Multi-match gather + `merge_extractions` hook (accumulate every matching page within budget, then merge)
 - [x] Caller-supplied `text_filters` (site-specific cache-stability strippers live in `examples/`, not the library)
-- [x] Opt-in soft same-domain preference (single `off_domain_weight` knob, `1.0` = off; PSL-based registrable domain via `tldextract`)
+- [x] Opt-in soft same-domain preference (single `prefer_seed_domain` knob, off by default; LLM is fed an on-domain signal and asked to disfavor off-domain content; PSL-based registrable domain via `tldextract`)
 - [x] `examples/` directory with reference schemas and filters (`examples/grants.py`, `examples/strippers.py`, kept out of the package)

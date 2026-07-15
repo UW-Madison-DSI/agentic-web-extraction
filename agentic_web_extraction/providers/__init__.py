@@ -26,13 +26,24 @@ class Provider(Protocol):
     @property
     def function_model(self) -> dict[str, str]: ...
 
-    def screen(self, page_md: str, criterion: str) -> ScreenVerdict: ...
+    def screen(
+        self,
+        page_md: str,
+        criterion: str,
+        *,
+        page_url: str | None = None,
+        seed_url: str | None = None,
+        on_seed_domain: bool | None = None,
+    ) -> ScreenVerdict: ...
 
     def score_links(
         self,
         links: list[tuple[str, str]],
         page_md: str,
         criterion: str,
+        *,
+        seed_url: str | None = None,
+        on_seed_domain: dict[str, bool | None] | None = None,
     ) -> list[tuple[str, float]]: ...
 
     def extract(

@@ -30,7 +30,7 @@ class Extractor:
         *,
         provider: Provider | None = None,
         normalize_html: bool | None = None,
-        off_domain_weight: float | None = None,
+        prefer_seed_domain: bool | None = None,
         text_filters: Sequence[TextFilter] | None = None,
         settings: Settings | None = None,
         cache: KVCache | None = None,
@@ -42,14 +42,17 @@ class Extractor:
         self.normalize_html = (
             normalize_html if normalize_html is not None else self.settings.normalize
         )
-        # Soft same-domain navigation preference (see Settings.off_domain_weight).
-        # A single knob: 1.0 disables it, < 1.0 opts in. Caller-defined and applied
-        # at frontier-push time, not baked into the page cache, so changing it does
-        # not invalidate cached scores.
-        self.off_domain_weight = (
-            off_domain_weight
-            if off_domain_weight is not None
-            else self.settings.off_domain_weight
+        # Soft same-domain preference (see Settings.prefer_seed_domain). When True,
+        # the screen and link-scorer calls are told the seed/page URL and a
+        # Python-computed on_seed_domain signal, with an instruction to disfavor
+        # off-domain content -- the model applies its own judgment; nothing is
+        # excluded. Off by default. Unlike the raw LLM score, this signal does feed
+        # the model, so a crawl's seed domain is mixed into the page-cache key when
+        # it's on (see extract()).
+        self.prefer_seed_domain = (
+            prefer_seed_domain
+            if prefer_seed_domain is not None
+            else self.settings.prefer_seed_domain
         )
         # Caller-supplied `str -> str` transforms applied to the normalized
         # markdown (e.g. to strip volatile per-response tokens so the content
@@ -93,9 +96,9 @@ class Extractor:
         frontier = Frontier()
         frontier.push(seed_url, score=1.0, source="seed")
 
-        # Registrable domain of the seed, used to softly down-weight off-domain
-        # outgoing links when `off_domain_weight` < 1.0 (see _frontier_score).
-        # Empty when the seed host is unparseable, which disables the re-weighting.
+        # Registrable domain of the seed, used to compute the on_seed_domain signal
+        # fed to the screen/score LLM calls when `prefer_seed_domain` is on. Empty
+        # when the seed host is unparseable, which yields an "unknown" signal.
         seed_domain = registrable_domain(urlsplit(seed_url).netloc)
 
         path: list[str] = []
@@ -166,7 +169,17 @@ class Extractor:
             # LLM calls. The version stamp is mixed into the key so a criterion/
             # schema/model change misses. We still fetched (above) to get here, so
             # `pages_fetched` and the budget are unaffected.
-            cache_key = f"{self._cache_version}:{content_hash(page_md)}:{page.url}"
+            # When the same-domain preference is on, the screen verdict and link
+            # scores depend on the seed's registrable domain (via on_seed_domain),
+            # so it's mixed into the key. The default (off) path keeps the exact
+            # key shape it had before, so existing cache entries still hit.
+            if self.prefer_seed_domain:
+                cache_key = (
+                    f"{self._cache_version}:seeddom={seed_domain}:"
+                    f"{content_hash(page_md)}:{page.url}"
+                )
+            else:
+                cache_key = f"{self._cache_version}:{content_hash(page_md)}:{page.url}"
             cached_raw = (
                 self.cache.get(PAGE_NAMESPACE, cache_key)
                 if self.cache is not None
@@ -193,18 +206,24 @@ class Extractor:
                     else:
                         matches.append((page.url, data))
                 for link_url, score in cached.link_scores:
-                    frontier.push(
-                        link_url,
-                        score=self._frontier_score(link_url, score, seed_domain),
-                        source=page.url,
-                    )
+                    frontier.push(link_url, score=score, source=page.url)
                 continue
 
             stage_error = (
                 False  # don't cache a page whose LLM stages hit a transient error
             )
+            # When the same-domain preference is on, hand the screen call the
+            # seed/page URL and the Python-computed on-domain signal so it can
+            # disfavor off-domain pages; otherwise call it exactly as before.
+            screen_kwargs: dict = {}
+            if self.prefer_seed_domain:
+                screen_kwargs = {
+                    "page_url": page.url,
+                    "seed_url": seed_url,
+                    "on_seed_domain": same_registrable_domain(page.url, seed_domain),
+                }
             try:
-                verdict = self.provider.screen(page_md, self.criteria)
+                verdict = self.provider.screen(page_md, self.criteria, **screen_kwargs)
             except Exception as e:
                 self._log(f"    ! screen failed on {page.url}: {type(e).__name__}: {e}")
                 continue
@@ -244,9 +263,21 @@ class Extractor:
                     if not frontier.is_visited(link)
                 ]
                 if fresh:
+                    # When the same-domain preference is on, annotate each link with
+                    # its on-domain signal so the scorer can disfavor off-domain
+                    # links; otherwise call it exactly as before.
+                    score_kwargs: dict = {}
+                    if self.prefer_seed_domain:
+                        score_kwargs = {
+                            "seed_url": seed_url,
+                            "on_seed_domain": {
+                                link: same_registrable_domain(link, seed_domain)
+                                for _, link in fresh
+                            },
+                        }
                     try:
                         scores = self.provider.score_links(
-                            fresh, page_md, self.criteria
+                            fresh, page_md, self.criteria, **score_kwargs
                         )
                     except Exception as e:
                         self._log(
@@ -256,16 +287,7 @@ class Extractor:
                         stage_error = True
                     else:
                         for link_url, score in scores:
-                            frontier.push(
-                                link_url,
-                                score=self._frontier_score(
-                                    link_url, score, seed_domain
-                                ),
-                                source=page.url,
-                            )
-                            # Cache the raw LLM score, not the domain-adjusted one,
-                            # so the re-weighting stays a push-time policy the cache
-                            # is oblivious to (toggling it doesn't invalidate entries).
+                            frontier.push(link_url, score=score, source=page.url)
                             link_scores.append([link_url, score])
 
             if self.cache is not None and not stage_error:
@@ -335,23 +357,6 @@ class Extractor:
             if accepts_var_kwargs or name in params
         }
         return merge(matches, **kwargs)
-
-    def _frontier_score(self, link_url: str, score: float, seed_domain: str) -> float:
-        """Apply the opt-in soft same-domain preference to a link's raw score.
-
-        When `off_domain_weight` is < 1.0 and the link is on a *different*
-        registrable domain than the seed, its score is multiplied by that weight
-        — a nudge that lowers its frontier priority without excluding it, so a
-        high-scoring off-domain page can still be visited. Links whose host is
-        unparseable, or that share the seed's domain, are left untouched. A no-op
-        (and skips the domain lookup entirely) when the weight is 1.0 or the seed
-        domain is unknown, so the default behavior is pure LLM-score ordering.
-        """
-        if self.off_domain_weight == 1.0 or not seed_domain:
-            return score
-        if same_registrable_domain(link_url, seed_domain) is False:
-            return score * self.off_domain_weight
-        return score
 
     def extract_batch(
         self,
