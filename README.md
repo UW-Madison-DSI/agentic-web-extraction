@@ -102,6 +102,16 @@ Each stage is independently swappable.
 
 By default the link-scorer reuses the pre-screen model — both are cheap, comparison-style calls.
 
+**How much of the page each LLM call sees.** The cheap calls read a truncated prefix of the normalized markdown; extraction reads all of it:
+
+| Call        | Page text sent                                            |
+|-------------|-----------------------------------------------------------|
+| Pre-screen  | First 16,000 characters                                   |
+| Score links | First 4,000 characters (links themselves are never truncated — every link is sent with its full URL and anchor text) |
+| Extract     | Full page, untruncated                                    |
+
+Consequence: a page whose matching content sits entirely beyond the first 16k characters of markdown will fail the pre-screen and never reach extraction, and the link scorer judges links with context from only the top of the page. Caller-supplied `text_filters` interact with this — stripping boilerplate moves real content earlier in the document, effectively widening what the screen and scoring calls see. `merge_extractions` payloads go through the same untruncated extract path.
+
 ## Example use cases
 
 These are *illustrative* — the schemas and criteria belong to the caller.
