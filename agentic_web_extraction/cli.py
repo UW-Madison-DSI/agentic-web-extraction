@@ -105,6 +105,17 @@ def extract(
             ),
         ),
     ] = None,
+    log_file: Annotated[
+        str | None,
+        typer.Option(
+            "--log-file",
+            help=(
+                "Also append timestamped progress lines to this file (lines always "
+                "go to stderr regardless). Empty disables it. Defaults to "
+                "AWE_LOG_FILE (off)."
+            ),
+        ),
+    ] = None,
 ) -> None:
     model = load_schema(schema)
     criterion = load_criteria(criteria)
@@ -112,6 +123,7 @@ def extract(
         schema=model,
         criteria=criterion,
         prefer_seed_domain=prefer_seed_domain,
+        log_file=log_file,
     )
     result = extractor.extract(
         seed_url=seed_url,

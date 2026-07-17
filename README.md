@@ -279,7 +279,7 @@ uv run awe extract \
   --max-fetches 10
 ```
 
-The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunity`) or a path to a Python file (`./schemas.py:Opportunity`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Add `--stop-on-first-match` to return on the first matching page (or `--gather-all-matches` to force the gather-and-merge default); omit both to use `AWE_STOP_ON_FIRST_MATCH`. Add `--prefer-seed-domain` to softly disfavor off-domain pages/links (the LLM is told the seed/page URL and an on-domain signal; `--no-prefer-seed-domain` forces it off, the default; omit to use `AWE_PREFER_SEED_DOMAIN`). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
+The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunity`) or a path to a Python file (`./schemas.py:Opportunity`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Add `--stop-on-first-match` to return on the first matching page (or `--gather-all-matches` to force the gather-and-merge default); omit both to use `AWE_STOP_ON_FIRST_MATCH`. Add `--prefer-seed-domain` to softly disfavor off-domain pages/links (the LLM is told the seed/page URL and an on-domain signal; `--no-prefer-seed-domain` forces it off, the default; omit to use `AWE_PREFER_SEED_DOMAIN`). Add `--log-file run.log` to also write a timestamped log file (off by default — no path, no file; see [Logging](#logging)). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
 
 ### Runnable example
 
@@ -338,8 +338,19 @@ Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your pr
 | Stop at first match  | `AWE_STOP_ON_FIRST_MATCH` | `false` (gather all + merge) |
 | Prefer seed domain   | `AWE_PREFER_SEED_DOMAIN` | `false` (true = LLM disfavors off-domain pages/links) |
 | HTTP response cache  | `AWE_HTTP_CACHE`      | `data/http_cache.sqlite` (empty = in-memory) |
+| Log file path        | `AWE_LOG_FILE`        | empty (off; set a path to enable) |
 
 Settings are loaded from `.env` if present (see `.env.example`).
+
+### Logging
+
+Progress and diagnostic lines (per-page fetch/score status, per-LLM-call timing and token counts) always go to **stderr** — never stdout, which carries the result JSON, so piping the CLI's output stays clean. On top of that, giving a **log file path** also appends every line, prefixed with a `YYYY-MM-DD HH:MM:SS` timestamp, to that file — a durable, timestamped record for a host codebase that wants one. It's a single knob: **no path means no file** (the default), mirroring how `AWE_HTTP_CACHE` treats an empty value.
+
+Enable it via env (`AWE_LOG_FILE=run.log`), the CLI (`--log-file run.log`), or the Python API:
+
+```python
+Extractor(schema=..., criteria=..., log_file="run.log")  # "" or omit = no file
+```
 
 `AWE_MAX_FETCHES` is the main traversal knob in v0. Depth limits and link-relevance thresholds are intentionally **not** user-configurable — the budget is the main lever and the LLM's link scoring is the navigation policy. The only exception is the opt-in soft same-domain preference (`AWE_PREFER_SEED_DOMAIN`, a single on/off knob), which feeds the LLM an on-domain signal and asks it to disfavor off-domain content but never excludes a link.
 
@@ -353,6 +364,7 @@ agentic_web_extraction/
     cache.py             # KVCache protocol + content-hash helpers (opt-in page cache)
     extractor.py         # Extractor: frontier loop
     fetch.py             # httpx + hishel cache + tenacity retry
+    logsink.py           # shared stderr + optional timestamped log-file sink
     frontier.py          # best-first heap + visited set + PSL registrable-domain (tldextract)
     normalize.py         # HTML→Markdown + raw-HTML link extraction + caller text_filters hook
     result.py            # ExtractionResult, Usage, ScreenVerdict, PageVerdict

@@ -52,6 +52,12 @@ class Settings(BaseSettings):
     # runs so weekly re-crawls can issue conditional GETs; empty string uses an
     # in-memory cache.
     http_cache: str = "data/http_cache.sqlite"
+    # Log file path (env: AWE_LOG_FILE), resolved relative to the current working
+    # directory. Empty (the default) disables file logging entirely -- a single
+    # knob, mirroring AWE_HTTP_CACHE's empty-means-off convention. Progress lines
+    # always go to stderr regardless; setting a path adds a durable, timestamped
+    # record for a host codebase that wants one.
+    log_file: str = ""
 
     # Provider credentials, read from the un-prefixed OPENAI_* env vars (not AWE_*)
     # so a standard OpenAI environment works as-is. API key is a SecretStr so it

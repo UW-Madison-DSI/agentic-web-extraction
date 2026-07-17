@@ -3,3 +3,4 @@ uv.lock
 .env
 __pycache__/
 data/
+awe.log

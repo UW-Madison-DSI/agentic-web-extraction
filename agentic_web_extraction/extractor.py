@@ -1,6 +1,5 @@
 import inspect
 import json
-import sys
 import time
 from collections.abc import Callable, Sequence
 from urllib.parse import urlsplit
@@ -8,6 +7,7 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel
 
 from . import fetch as fetch_module
+from . import logsink
 from .cache import (
     PAGE_NAMESPACE,
     CachedPage,
@@ -34,10 +34,19 @@ class Extractor:
         text_filters: Sequence[TextFilter] | None = None,
         settings: Settings | None = None,
         cache: KVCache | None = None,
+        log_file: str | None = None,
     ) -> None:
         self.schema = schema
         self.criteria = criteria
         self.settings = settings or get_settings()
+        # Route every progress/diagnostic line through the shared sink: always to
+        # stderr, and -- when a log file path is given -- appended with a
+        # timestamp to that file. A single knob: empty path = no file logging.
+        # `log_file=None` falls back to settings (AWE_LOG_FILE); pass "" to force
+        # file logging off regardless of the environment.
+        logsink.configure(
+            log_file=log_file if log_file is not None else self.settings.log_file,
+        )
         self.provider = provider or get_provider(self.settings)
         self.normalize_html = (
             normalize_html if normalize_html is not None else self.settings.normalize
@@ -72,13 +81,12 @@ class Extractor:
 
     @staticmethod
     def _log(message: str) -> None:
-        """Emit a progress/diagnostic line.
+        """Emit a progress/diagnostic line through the shared sink.
 
-        Always goes to stderr, never stdout: the CLI writes the result JSON to
-        stdout, so a stray progress line there would corrupt it for a consumer
-        piping the output.
+        Goes to stderr (never stdout, which carries the result JSON) and -- when
+        file logging is on -- to a timestamped log file. See logsink.emit.
         """
-        print(message, file=sys.stderr, flush=True)
+        logsink.emit(message)
 
     def extract(
         self,

@@ -1,10 +1,10 @@
-import sys
 import time
 from dataclasses import dataclass
 
 from openai import OpenAI
 from pydantic import BaseModel, Field
 
+from .. import logsink
 from ..config import Settings
 from ..result import ScreenVerdict, Usage
 
@@ -152,11 +152,9 @@ class OpenAIProvider:
             )
             tok = f"tok_in={delta.input_tokens}{cached} tok_out={delta.output_tokens}"
         status = f"FAIL:{type(error).__name__}" if error is not None else "ok"
-        print(
+        logsink.emit(
             f"    [llm {step}] model={model} in_chars={in_chars} "
-            f"elapsed={elapsed:.2f}s {tok} {status}",
-            file=sys.stderr,
-            flush=True,
+            f"elapsed={elapsed:.2f}s {tok} {status}"
         )
 
     def screen(
