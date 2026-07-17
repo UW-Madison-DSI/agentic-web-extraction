@@ -5,6 +5,10 @@ pages it links to each describe a grant, so a gather-all traversal produces
 several matches; ``Opportunities.merge_extractions`` folds them into one
 deduplicated result using the LLM (with a pure-Python fallback).
 
+LLM-call caching is on by default (SQLite at ``AWE_LLM_CACHE``), so a second run
+over unchanged pages replays every screen/extract/score/merge result with no LLM
+calls -- nothing to wire up here; see ``main``.
+
 Run as a script (uses the defaults below):
 
     uv run python examples/grants.py
@@ -20,20 +24,14 @@ Run via the CLI (same schema, override seed/criteria as needed):
 
 from __future__ import annotations
 
-import hashlib
 import json
-import sqlite3
 import sys
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel, Field
 
 if TYPE_CHECKING:
-    from agentic_web_extraction.cache import KVCache
     from agentic_web_extraction.providers import Provider
-
-DEFAULT_CACHE_PATH = Path("data/llm_cache.sqlite")
 
 DEFAULT_SEED_URL = (
     "https://simpler.grants.gov/opportunity/24a2e68b-9105-4fc8-8432-7ddff3e3afb8"
@@ -53,47 +51,6 @@ _DEDUP_INSTRUCTIONS = (
     "specific values, keep the sponsor's own page as `link` when available, and keep "
     "titles concise. Do NOT invent opportunities not present in the input."
 )
-
-
-class SqliteKVCache:
-    """A tiny SQLite-backed ``KVCache`` — the concrete store the library asks callers to supply.
-
-    The library defines only the ``KVCache`` protocol (``get``/``put`` over string
-    namespaces and keys); it ships no storage so path policy stays out of the crawler.
-    This satisfies it with a single ``kv(namespace, key, value)`` table in one SQLite
-    file. Persisting across runs is the whole point — on a re-crawl of unchanged pages
-    the ``Extractor`` replays the screen/extract/link-score outputs from here (and
-    ``merge_extractions`` replays its dedup) and makes zero LLM calls. A composite
-    primary key keeps namespaces from colliding, and ``INSERT .. ON CONFLICT`` makes a
-    re-``put`` idempotent.
-    """
-
-    def __init__(self, path: Path = DEFAULT_CACHE_PATH) -> None:
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        # check_same_thread=False so the single crawler client is reusable if the
-        # caller ever touches it off-thread; access here is otherwise serial.
-        self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
-        self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS kv ("
-            "namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
-            "PRIMARY KEY (namespace, key))"
-        )
-        self._conn.commit()
-
-    def get(self, namespace: str, key: str) -> str | None:
-        row = self._conn.execute(
-            "SELECT value FROM kv WHERE namespace = ? AND key = ?", (namespace, key)
-        ).fetchone()
-        return row[0] if row is not None else None
-
-    def put(self, namespace: str, key: str, value: str) -> None:
-        self._conn.execute(
-            "INSERT INTO kv (namespace, key, value) VALUES (?, ?, ?) "
-            "ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value",
-            (namespace, key, value),
-        )
-        self._conn.commit()
 
 
 class Opportunity(BaseModel):
@@ -125,7 +82,6 @@ class Opportunities(BaseModel):
         matches: list[tuple[str, Opportunities]],
         *,
         provider: Provider | None = None,
-        cache: KVCache | None = None,
     ) -> Opportunities:
         """Fold every matching page's opportunities into one deduped collection.
 
@@ -137,6 +93,10 @@ class Opportunities(BaseModel):
         Falls back to a cheap deterministic dedup (by ``link``, backfilling null
         fields) when no provider is supplied, when there is nothing to reconcile,
         or when the LLM call fails.
+
+        No caching here: the Extractor memoizes this whole call, replaying the
+        merged result with zero LLM calls when every contributing page hit the
+        page cache (i.e. was unchanged). See ``Extractor._merge_cached``.
         """
         flat = [opp for _url, extracted in matches for opp in extracted.items]
         if provider is None or len(flat) <= 1:
@@ -145,18 +105,6 @@ class Opportunities(BaseModel):
         payload = f"{_DEDUP_INSTRUCTIONS}\n\nRECORDS ({len(flat)}):\n" + json.dumps(
             [o.model_dump() for o in flat], indent=2, ensure_ascii=False
         )
-
-        # LLM-call caching for the merge stage: the dedup output is a pure function
-        # of the payload (instructions + flattened records), so key the cache on its
-        # hash. A re-run over the same matches replays the merged result with no
-        # extra `merge` LLM call. `merge_cache_key` mirrors the library's own
-        # content-addressed page keys.
-        merge_key = merge_cache_key(payload)
-        if cache is not None:
-            hit = cache.get("merge", merge_key)
-            if hit is not None:
-                return cls.model_validate_json(hit)
-
         try:
             merged = provider.extract(payload, cls, usage_tag="merge")
         except Exception as e:  # noqa: BLE001 - degrade to deterministic dedup
@@ -166,15 +114,8 @@ class Opportunities(BaseModel):
             )
             return cls(items=_dedup_by_link(flat))
         if isinstance(merged, cls):
-            if cache is not None:
-                cache.put("merge", merge_key, merged.model_dump_json())
             return merged
         return cls(items=_dedup_by_link(flat))
-
-
-def merge_cache_key(payload: str) -> str:
-    """Stable SHA-256 of the merge payload, used as the ``merge`` cache key."""
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _dedup_by_link(opps: list[Opportunity]) -> list[Opportunity]:
@@ -208,17 +149,16 @@ def main() -> int:
     # strippers the (agnostic) library no longer ships. They're harmless on
     # sites they don't match, so passing the whole bundle is fine.
     #
-    # `cache` is the opt-in LLM-call cache: a SQLite-backed KVCache the Extractor keys
-    # by normalized-content hash. The first run populates it; re-running this script
-    # replays screen/extract/link-score outputs for unchanged pages with no LLM
-    # calls (watch `usage_by_function` drop to zero `calls` on the second run). The
-    # same cache is forwarded to `Opportunities.merge_extractions(..., cache=)`.
-    # Delete `data/llm_cache.sqlite` to force a cold crawl.
+    # LLM-call caching is ON by default -- a SQLite store at AWE_LLM_CACHE
+    # (data/llm_cache.sqlite). The first run populates it; re-running this script
+    # replays screen/extract/link-score outputs for unchanged pages, and the merge
+    # too when every contributing page hit the cache, with no LLM calls (watch
+    # `usage_by_function` drop to zero `calls` on the second run). Delete
+    # data/llm_cache.sqlite to force a cold crawl, or pass `cache=None` to disable.
     extractor = Extractor(
         schema=Opportunities,
         criteria=DEFAULT_CRITERIA,
         text_filters=CACHE_STABILITY_FILTERS,
-        cache=SqliteKVCache(),
     )
     result = extractor.extract(
         seed_url=DEFAULT_SEED_URL, max_fetches=DEFAULT_MAX_FETCHES

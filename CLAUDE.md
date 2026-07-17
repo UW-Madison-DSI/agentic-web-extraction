@@ -62,19 +62,25 @@ compare), [normalize.py](agentic_web_extraction/normalize.py),
 - **Logging: never a bare `print`.** All diagnostics go through `logsink.emit` → stderr
   (stdout is reserved for result JSON). A `log_file` path (env `AWE_LOG_FILE`, empty =
   off) also appends timestamped lines. See [logsink.py](agentic_web_extraction/logsink.py).
-- **Opt-in page cache is generic.** `Extractor(..., cache=)` takes a `KVCache`
-  ([cache.py](agentic_web_extraction/cache.py)) — no domain types. On an unchanged
-  content hash it replays screen/extract/link-scores with zero LLM calls. The cache is
-  also forwarded to `merge_extractions(..., cache=)`; keep that call's
-  `try/except TypeError` degradation.
+- **On-by-default LLM cache is generic.** Caching is on by default: the Extractor builds
+  a `SqliteKVCache` at `AWE_LLM_CACHE` (`data/llm_cache.sqlite`) unless the caller passes
+  their own `KVCache`, passes `cache=None` to disable, or the setting is empty. All of
+  [cache.py](agentic_web_extraction/cache.py) stays domain-agnostic — values are opaque
+  JSON round-tripped through the caller's schema. On an unchanged content hash it replays
+  screen/extract/link-scores with zero LLM calls. **Merge is cached by the Extractor**
+  (`_merge_cached`), not by `merge_extractions`: the merge key is derived from the
+  contributing pages' page-cache keys, so the merge replays only when *every* source page
+  hit the cache (unchanged). Don't push merge caching back into schemas' `merge_extractions`.
+  `_merge` still offers `provider`/`cache` to `merge_extractions` by signature inspection —
+  keep that mechanism, but the reference example no longer takes `cache`.
 - **Don't fork CLI vs Python logic.** The CLI wires to the same `Extractor` the Python
   API exposes.
 
 ## Dependency gotchas
 
-- `httpx` + `hishel` — on-disk HTTP cache (`AWE_HTTP_CACHE`, empty = in-memory). Sends
-  `Cache-Control: no-cache` so responses are revalidated (conditional GET), not served
-  blindly-fresh — content-hash change detection sees current bytes.
+- `httpx` — plain client, **no HTTP-response cache** (no hishel). Fetching is cheap and
+  the frontier never re-fetches a URL within a crawl, so an HTTP cache wasn't worth the
+  memory/disk; the content-addressed LLM cache handles the expensive re-work instead.
 - `tldextract` — PSL lookup for the domain comparison; constructed with
   `suffix_list_urls=()` to use the bundled offline snapshot (no runtime network fetch).
 - `markitdown` (HTML→MD), `openai` (default provider, swappable via `AWE_PROVIDER`),
@@ -86,7 +92,7 @@ compare), [normalize.py](agentic_web_extraction/normalize.py),
 ```
 awe extract --schema ./schemas.py:Opportunity --criteria "..." --seed-url https://... \
   [--max-fetches 10] [--stop-on-first-match | --gather-all-matches] \
-  [--prefer-seed-domain | --no-prefer-seed-domain] [--log-file log.txt]
+  [--prefer-seed-domain | --no-prefer-seed-domain] [--log-file log.txt] [--no-cache]
 ```
 
 `--criteria` accepts an inline string or `@path/to/file.txt`. `--schema` takes

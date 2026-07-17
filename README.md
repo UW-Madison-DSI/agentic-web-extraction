@@ -221,7 +221,7 @@ result = extractor.extract(
 output call under its own purpose; the screen and link-score calls are tagged
 automatically. Sum `usage_by_function.values()` for a grand total.
 
-Need to traverse several seed URLs and share the HTTP cache across them?
+Need to traverse several seed URLs in one process?
 
 ```python
 results = extractor.extract_batch(
@@ -229,6 +229,8 @@ results = extractor.extract_batch(
     max_fetches=10,
 )
 ```
+
+There's no HTTP-response cache — fetching is cheap and the frontier never re-fetches a URL within a crawl, so the crawler uses a plain client and spends nothing on memory or disk for HTTP. The expensive LLM work is what's cached (on by default; see below), and that cache persists across seeds and runs.
 
 #### Text filters (cache-stability hacks live in *your* code)
 
@@ -254,23 +256,24 @@ CyberGrants) — copy the ones you need or write your own. They live in `example
 not the library, precisely so the core stays domain-agnostic; each filter is
 built to remove only content-free/invisible markup, never text an LLM would use.
 
-#### Optional page cache
+#### LLM-response cache (on by default)
 
-`Extractor(..., cache=)` accepts any object implementing the generic `KVCache`
-protocol (`get(namespace, key)` / `put(namespace, key, value)`, see
-[cache.py](agentic_web_extraction/cache.py)). When supplied, the crawler
-content-addresses each page by the hash of its normalized markdown (mixed with a
-version stamp over the criterion, schema, and models). If a page's content is
-unchanged from a prior run, the crawler **replays** that page's screen verdict,
-extracted data, and link scores with **zero LLM calls** — the page is still
-fetched, so `pages_fetched` and the `max_fetches` budget are unaffected. It's
-schema-agnostic (extracted data round-trips through your Pydantic model) and
-opt-in; with no `cache` the behavior is exactly as before. The same cache is
-forwarded to the schema's optional `merge_extractions(..., cache=)` so callers
-can cache the merge too. The library ships only the `KVCache` *protocol* — the
-concrete store is yours; [examples/grants.py](examples/grants.py) includes a
-minimal `SqliteKVCache` (one `kv` table in `data/llm_cache.sqlite`) you can lift
-as-is.
+The crawler caches its LLM work, keyed by content: it content-addresses each page
+by the hash of its normalized markdown (mixed with a version stamp over the
+criterion, schema, and models). If a page's content is unchanged from a prior run,
+the crawler **replays** that page's screen verdict, extracted data, and link scores
+with **zero LLM calls** — the page is still fetched, so `pages_fetched` and the
+`max_fetches` budget are unaffected. The final merge is cached too: it replays when
+**every contributing page hit the cache** (the merge key is derived from the source
+pages' cache keys, so any changed/added/dropped page re-runs the dedup). Extracted
+data round-trips through your Pydantic model, so the cache is schema-agnostic.
+
+It's **on by default** — a SQLite store at `AWE_LLM_CACHE` (`data/llm_cache.sqlite`).
+Set `AWE_LLM_CACHE=` empty (or pass `Extractor(..., cache=None)`) to disable it. The
+store is [`SqliteKVCache`](agentic_web_extraction/cache.py), a single
+`kv(namespace, key, value)` table; to use your own backend (Redis, a shared DB),
+pass any object implementing the `KVCache` protocol (`get(namespace, key)` /
+`put(namespace, key, value)`) as `Extractor(..., cache=...)`.
 
 ### CLI
 
@@ -282,11 +285,11 @@ uv run awe extract \
   --max-fetches 10
 ```
 
-The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunity`) or a path to a Python file (`./schemas.py:Opportunity`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Add `--stop-on-first-match` to return on the first matching page (or `--gather-all-matches` to force the gather-and-merge default); omit both to use `AWE_STOP_ON_FIRST_MATCH`. Add `--prefer-seed-domain` to softly disfavor off-domain pages/links (the LLM is told the seed/page URL and an on-domain signal; `--no-prefer-seed-domain` forces it off, the default; omit to use `AWE_PREFER_SEED_DOMAIN`). Add `--log-file run.log` to also write a timestamped log file (off by default — no path, no file; see [Logging](#logging)). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
+The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunity`) or a path to a Python file (`./schemas.py:Opportunity`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Add `--stop-on-first-match` to return on the first matching page (or `--gather-all-matches` to force the gather-and-merge default); omit both to use `AWE_STOP_ON_FIRST_MATCH`. Add `--prefer-seed-domain` to softly disfavor off-domain pages/links (the LLM is told the seed/page URL and an on-domain signal; `--no-prefer-seed-domain` forces it off, the default; omit to use `AWE_PREFER_SEED_DOMAIN`). Add `--log-file run.log` to also write a timestamped log file (off by default — no path, no file; see [Logging](#logging)). Add `--no-cache` to disable the on-by-default LLM-response cache (equivalently `AWE_LLM_CACHE=`). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
 
 ### Runnable example
 
-`examples/grants.py` is a runnable end-to-end demo and the reference for the `merge_extractions` hook. It defines a singular `Opportunity` plus an `Opportunities` **collection** schema, and extracts with the collection so a page can yield many opportunities. It seeds against a real Grants.gov page and, in gather-all mode, matches several linked NIH announcements; `Opportunities.merge_extractions` then folds them into one result using an **LLM dedup call** (`provider.extract(..., usage_tag="merge")`), which collapses records describing the same underlying opportunity and surfaces as a `"merge"` bucket in `usage_by_function`. It falls back to a deterministic link-dedup when no provider is available or the call fails. It also wires in the cache-stability `text_filters` from [examples/strippers.py](examples/strippers.py) to show how a caller supplies them, and passes a `SqliteKVCache` (defined in the same file) as the `cache=` — so every LLM call the demo makes is cached: the crawler replays each unchanged page's screen/extract/link-score outputs, and `merge_extractions` memoizes its dedup call keyed on the payload hash. Run it twice; the second run's `usage_by_function` shows `0` calls across the board (delete `data/llm_cache.sqlite` to force a cold crawl).
+`examples/grants.py` is a runnable end-to-end demo and the reference for the `merge_extractions` hook. It defines a singular `Opportunity` plus an `Opportunities` **collection** schema, and extracts with the collection so a page can yield many opportunities. It seeds against a real Grants.gov page and, in gather-all mode, matches several linked NIH announcements; `Opportunities.merge_extractions` then folds them into one result using an **LLM dedup call** (`provider.extract(..., usage_tag="merge")`), which collapses records describing the same underlying opportunity and surfaces as a `"merge"` bucket in `usage_by_function`. It falls back to a deterministic link-dedup when no provider is available or the call fails. It also wires in the cache-stability `text_filters` from [examples/strippers.py](examples/strippers.py) to show how a caller supplies them. LLM caching is on by default, so nothing cache-related is wired in the example — run it twice and the second run's `usage_by_function` shows `0` calls across the board (screen/extract/score replay per unchanged page, and the merge replays because every contributing page hit the cache). Delete `data/llm_cache.sqlite`, or pass `Extractor(..., cache=None)`, to force a cold crawl.
 
 ```bash
 uv run python examples/grants.py
@@ -322,7 +325,7 @@ Seed: `https://simpler.grants.gov/opportunity/24a2e68b-9105-4fc8-8432-7ddff3e3af
 }
 ```
 
-(For a pure-Python merge instead, drop the `provider.extract` call and reconcile the records in code — the `"merge"` bucket then won't appear. The example's own `merge_extractions` already uses the `cache` argument to memoize the dedup.)
+(For a pure-Python merge instead, drop the `provider.extract` call and reconcile the records in code — the `"merge"` bucket then won't appear. The merge call itself is memoized by the Extractor, so `merge_extractions` needs no cache logic of its own.)
 
 Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your provider's equivalent) — see Configuration. The example's models default to `AWE_MODEL_EXTRACT` / `AWE_MODEL_SCREEN`; point these at models your key can actually access.
 
@@ -340,14 +343,14 @@ Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your pr
 | Max page fetches     | `AWE_MAX_FETCHES`     | `10`                   |
 | Stop at first match  | `AWE_STOP_ON_FIRST_MATCH` | `false` (gather all + merge) |
 | Prefer seed domain   | `AWE_PREFER_SEED_DOMAIN` | `false` (true = LLM disfavors off-domain pages/links) |
-| HTTP response cache  | `AWE_HTTP_CACHE`      | `data/http_cache.sqlite` (empty = in-memory) |
+| LLM-response cache   | `AWE_LLM_CACHE`       | `data/llm_cache.sqlite` (on; empty = disable) |
 | Log file path        | `AWE_LOG_FILE`        | empty (off; set a path to enable) |
 
 Settings are loaded from `.env` if present (see `.env.example`).
 
 ### Logging
 
-Progress and diagnostic lines (per-page fetch/score status, per-LLM-call timing and token counts) always go to **stderr** — never stdout, which carries the result JSON, so piping the CLI's output stays clean. On top of that, giving a **log file path** also appends every line, prefixed with a `YYYY-MM-DD HH:MM:SS` timestamp, to that file — a durable, timestamped record for a host codebase that wants one. It's a single knob: **no path means no file** (the default), mirroring how `AWE_HTTP_CACHE` treats an empty value.
+Progress and diagnostic lines (per-page fetch/score status, per-LLM-call timing and token counts) always go to **stderr** — never stdout, which carries the result JSON, so piping the CLI's output stays clean. On top of that, giving a **log file path** also appends every line, prefixed with a `YYYY-MM-DD HH:MM:SS` timestamp, to that file — a durable, timestamped record for a host codebase that wants one. It's a single knob: **no path means no file** (the default).
 
 Enable it via env (`AWE_LOG_FILE=run.log`), the CLI (`--log-file run.log`), or the Python API:
 
@@ -364,9 +367,9 @@ agentic_web_extraction/
     __init__.py          # re-exports + main() entry point
     cli.py               # Typer CLI: `extract` subcommand
     config.py            # AWE_* settings (pydantic-settings)
-    cache.py             # KVCache protocol + content-hash helpers (opt-in page cache)
+    cache.py             # KVCache protocol + SqliteKVCache + content-hash helpers (on-by-default LLM cache)
     extractor.py         # Extractor: frontier loop
-    fetch.py             # httpx + hishel cache + tenacity retry
+    fetch.py             # httpx (plain, no HTTP cache) + tenacity retry
     logsink.py           # shared stderr + optional timestamped log-file sink
     frontier.py          # best-first heap + visited set + PSL registrable-domain (tldextract)
     normalize.py         # HTML→Markdown + raw-HTML link extraction + caller text_filters hook
@@ -404,8 +407,8 @@ v0 done:
 - [x] Visited-set / dedupe (URL canonicalization; dedup on push and pop)
 - [x] Budget accounting + `stopped_reason` plumbing
 - [x] Path recording in result metadata
-- [x] Batch mode with caching (`Extractor.extract_batch`; in-memory hishel cache spans seeds)
-- [x] Opt-in content-addressed page cache (`Extractor(..., cache=)` over a generic `KVCache`; replays screen/extract/score with no LLM calls when page content is unchanged)
+- [x] Batch mode (`Extractor.extract_batch`; the LLM cache persists across seeds and runs)
+- [x] On-by-default content-addressed LLM cache (`SqliteKVCache` at `AWE_LLM_CACHE`, swappable via the `KVCache` protocol; replays screen/extract/score — and the merge, when every contributing page is unchanged — with no LLM calls)
 - [x] Multi-match gather + `merge_extractions` hook (accumulate every matching page within budget, then merge)
 - [x] Caller-supplied `text_filters` (site-specific cache-stability strippers live in `examples/`, not the library)
 - [x] Opt-in soft same-domain preference (single `prefer_seed_domain` knob, off by default; LLM is fed an on-domain signal and asked to disfavor off-domain content; PSL-based registrable domain via `tldextract`)

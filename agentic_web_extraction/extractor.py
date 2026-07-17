@@ -9,10 +9,13 @@ from pydantic import BaseModel
 from . import fetch as fetch_module
 from . import logsink
 from .cache import (
+    MERGE_NAMESPACE,
     PAGE_NAMESPACE,
     CachedPage,
     KVCache,
+    SqliteKVCache,
     content_hash,
+    merge_cache_key,
     page_cache_version,
 )
 from .config import Settings, get_settings
@@ -20,6 +23,18 @@ from .frontier import Frontier, registrable_domain, same_registrable_domain
 from .normalize import TextFilter, extract_links, to_markdown
 from .providers import Provider, get_provider
 from .result import ExtractionResult, PageVerdict, StoppedReason, Usage
+
+
+class _DefaultCache:
+    """Sentinel for the `cache` arg: caller didn't pass one, so build the default.
+
+    Distinguishes "not supplied" (→ the on-by-default SQLite cache at AWE_LLM_CACHE)
+    from an explicit `cache=None` (→ caching disabled) and from a caller-supplied
+    `KVCache`.
+    """
+
+
+_DEFAULT_CACHE = _DefaultCache()
 
 
 class Extractor:
@@ -33,7 +48,7 @@ class Extractor:
         prefer_seed_domain: bool | None = None,
         text_filters: Sequence[TextFilter] | None = None,
         settings: Settings | None = None,
-        cache: KVCache | None = None,
+        cache: KVCache | None | _DefaultCache = _DEFAULT_CACHE,
         log_file: str | None = None,
     ) -> None:
         self.schema = schema
@@ -68,7 +83,18 @@ class Extractor:
         # hash stays stable). The library ships none -- it is site-agnostic; see
         # examples/strippers.py. Empty tuple means "leave the markdown as-is".
         self.text_filters: tuple[TextFilter, ...] = tuple(text_filters or ())
-        self.cache = cache
+        # Caching is on by default. When the caller doesn't pass `cache`, build the
+        # default SQLite store at AWE_LLM_CACHE (empty setting = disabled); an
+        # explicit `cache=None` disables it; a supplied KVCache is used as-is.
+        self.cache: KVCache | None
+        if isinstance(cache, _DefaultCache):
+            self.cache = (
+                SqliteKVCache(self.settings.llm_cache)
+                if self.settings.llm_cache
+                else None
+            )
+        else:
+            self.cache = cache
         # Version stamp mixed into every page-cache key so a change to the
         # criterion, schema, models, or normalize flag auto-invalidates entries.
         self._cache_version = page_cache_version(
@@ -114,6 +140,10 @@ class Extractor:
         verdicts: list[PageVerdict] = []
         usage_by_function_at_start = self.provider.usage_by_function
         matches: list[tuple[str, BaseModel]] = []
+        # Page cache key of each matched page, in match order. These feed the merge
+        # cache key so the merge replays only when every contributing page is
+        # unchanged (see cache.merge_cache_key).
+        matched_keys: list[str] = []
 
         while pages_fetched < budget:
             popped = frontier.pop()
@@ -213,6 +243,7 @@ class Extractor:
                         )
                     else:
                         matches.append((page.url, data))
+                        matched_keys.append(cache_key)
                 for link_url, score in cached.link_scores:
                     frontier.push(link_url, score=score, source=page.url)
                 continue
@@ -250,6 +281,7 @@ class Extractor:
                     stage_error = True
                 else:
                     matches.append((page.url, data))
+                    matched_keys.append(cache_key)
                     extracted_dump = data.model_dump(mode="json")
                     matched_here = True
 
@@ -313,7 +345,7 @@ class Extractor:
         if matches:
             merge = getattr(self.schema, "merge_extractions", None)
             if callable(merge):
-                data = self._merge(merge, matches)
+                data = self._merge_cached(merge, matches, matched_keys)
             else:
                 data = matches[0][1]
             return self._result(
@@ -333,6 +365,41 @@ class Extractor:
             verdicts=verdicts,
             usage_by_function_at_start=usage_by_function_at_start,
         )
+
+    def _merge_cached(
+        self,
+        merge: Callable[..., BaseModel],
+        matches: list[tuple[str, BaseModel]],
+        matched_keys: list[str],
+    ) -> BaseModel:
+        """Replay the merge from cache when every contributing page hit the cache.
+
+        The merge cache key is derived from the contributing pages' page-cache keys
+        (see cache.merge_cache_key), so it hits exactly when the same set of pages
+        with the same content produced the same per-page extractions -- i.e. every
+        source page was unchanged. On a hit we replay the stored merged object with
+        no LLM `merge` call; on a miss we run the merge and store its result.
+        """
+        if self.cache is None or not matched_keys:
+            return self._merge(merge, matches)
+
+        merge_key = f"{self._cache_version}:{merge_cache_key(matched_keys)}"
+        cached_raw = self.cache.get(MERGE_NAMESPACE, merge_key)
+        if cached_raw is not None:
+            try:
+                data = self.schema.model_validate_json(cached_raw)
+            except Exception as e:
+                self._log(f"    ! cached merge invalid: {type(e).__name__}: {e}")
+            else:
+                self._log("    [cache] merge hit")
+                return data
+
+        data = self._merge(merge, matches)
+        try:
+            self.cache.put(MERGE_NAMESPACE, merge_key, data.model_dump_json())
+        except Exception as e:  # noqa: BLE001 - caching is best-effort
+            self._log(f"    ! merge cache put failed: {type(e).__name__}: {e}")
+        return data
 
     def _merge(
         self,

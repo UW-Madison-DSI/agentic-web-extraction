@@ -116,14 +116,30 @@ def extract(
             ),
         ),
     ] = None,
+    no_cache: Annotated[
+        bool,
+        typer.Option(
+            "--no-cache",
+            help=(
+                "Disable the on-by-default LLM-response cache. By default an "
+                "unchanged page replays its screen/extract/score outputs (and a "
+                "merge whose inputs all hit the cache) with no LLM calls; the store "
+                "is SQLite at AWE_LLM_CACHE (data/llm_cache.sqlite)."
+            ),
+        ),
+    ] = False,
 ) -> None:
     model = load_schema(schema)
     criterion = load_criteria(criteria)
+    # Don't pass `cache` unless disabling: omitting it lets the Extractor build the
+    # on-by-default store; `cache=None` is the explicit off switch.
+    cache_kwargs = {"cache": None} if no_cache else {}
     extractor = Extractor(
         schema=model,
         criteria=criterion,
         prefer_seed_domain=prefer_seed_domain,
         log_file=log_file,
+        **cache_kwargs,
     )
     result = extractor.extract(
         seed_url=seed_url,

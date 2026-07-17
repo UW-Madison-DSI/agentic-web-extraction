@@ -48,15 +48,16 @@ class Settings(BaseSettings):
     # domain information supplied. The registrable-domain comparison is generic
     # (Public Suffix List, see frontier.py) -- no logic tied to any particular site.
     prefer_seed_domain: bool = False
-    # On-disk HTTP response cache (hishel), env: AWE_HTTP_CACHE. Persisted across
-    # runs so weekly re-crawls can issue conditional GETs; empty string uses an
-    # in-memory cache.
-    http_cache: str = "data/http_cache.sqlite"
+    # Content-addressed LLM-response cache path (SQLite), env: AWE_LLM_CACHE. On by
+    # default: when a page's normalized content is unchanged from a prior run the
+    # crawler replays its screen/extract/link-score outputs (and the final merge, if
+    # every contributing page hit the cache) with zero LLM calls. Set to empty to
+    # disable caching entirely. Fetching is unaffected -- this only skips model work.
+    llm_cache: str = "data/llm_cache.sqlite"
     # Log file path (env: AWE_LOG_FILE), resolved relative to the current working
     # directory. Empty (the default) disables file logging entirely -- a single
-    # knob, mirroring AWE_HTTP_CACHE's empty-means-off convention. Progress lines
-    # always go to stderr regardless; setting a path adds a durable, timestamped
-    # record for a host codebase that wants one.
+    # knob. Progress lines always go to stderr regardless; setting a path adds a
+    # durable, timestamped record for a host codebase that wants one.
     log_file: str = ""
 
     # Provider credentials, read from the un-prefixed OPENAI_* env vars (not AWE_*)

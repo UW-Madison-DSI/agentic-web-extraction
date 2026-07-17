@@ -1,11 +1,7 @@
-import sqlite3
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Literal
 
 import httpx
-from hishel import SyncSqliteStorage
-from hishel.httpx import SyncCacheClient
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -28,34 +24,21 @@ class FetchedPage:
     kind: Literal["html", "pdf", "skipped", "error"]
 
 
-_client: SyncCacheClient | None = None
+_client: httpx.Client | None = None
 
 
-def get_client() -> SyncCacheClient:
+def get_client() -> httpx.Client:
     global _client
     if _client is None:
-        # Persist the HTTP response cache on disk (across runs) when a path is
-        # configured, so weekly re-crawls can issue conditional GETs; fall back
-        # to an in-memory cache when the path is empty.
-        cache_path = get_settings().http_cache
-        if cache_path:
-            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
-            storage = SyncSqliteStorage(database_path=cache_path)
-        else:
-            storage = SyncSqliteStorage(
-                connection=sqlite3.connect(":memory:", check_same_thread=False),
-            )
-        _client = SyncCacheClient(
-            storage=storage,
+        # Plain httpx client, no HTTP-response cache of any kind. Fetching is cheap
+        # relative to the LLM stages, and the frontier's visited set already stops a
+        # URL from being fetched twice in one crawl, so an HTTP cache saved too
+        # little to justify the memory/disk it took. The expensive work is memoized
+        # by the content-addressed LLM cache instead (see cache.py / extractor.py).
+        _client = httpx.Client(
+            headers={"User-Agent": USER_AGENT},
             follow_redirects=True,
             timeout=httpx.Timeout(30.0, connect=10.0),
-            # `Cache-Control: no-cache` forces hishel to revalidate every stored
-            # response against the origin (conditional GET) instead of serving a
-            # still-"fresh" cached body — so a page that changed since last week
-            # is never hidden behind a long max-age. On a 304 the stored body is
-            # returned (cheap); the normalized-content hash remains the source of
-            # truth for whether the expensive LLM stages get skipped.
-            headers={"User-Agent": USER_AGENT, "Cache-Control": "no-cache"},
         )
     return _client
 
