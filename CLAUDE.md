@@ -62,13 +62,11 @@ compare), [normalize.py](agentic_web_extraction/normalize.py),
 - **Logging: never a bare `print`.** All diagnostics go through `logsink.emit` → stderr
   (stdout is reserved for result JSON). A `log_file` path (env `AWE_LOG_FILE`, empty =
   off) also appends timestamped lines. See [logsink.py](agentic_web_extraction/logsink.py).
-- **Page cache is generic and on by default.** The default backend is the shipped
-  `SqliteKVCache` at `AWE_PAGE_CACHE` (`data/page_cache.sqlite`, empty = off) — a
-  generic namespaced KV store, no domain types ([cache.py](agentic_web_extraction/cache.py)).
-  On an unchanged content hash it replays screen/extract/link-scores with zero LLM calls.
-  `Extractor(..., cache=)` takes any `KVCache` and overrides the default (explicit
-  `cache=` always wins). The cache is also forwarded to `merge_extractions(..., cache=)`;
-  keep that call's degradation. Don't add domain types to the store.
+- **Opt-in page cache is generic.** `Extractor(..., cache=)` takes a `KVCache`
+  ([cache.py](agentic_web_extraction/cache.py)) — no domain types. On an unchanged
+  content hash it replays screen/extract/link-scores with zero LLM calls. The cache is
+  also forwarded to `merge_extractions(..., cache=)`; keep that call's
+  `try/except TypeError` degradation.
 - **Don't fork CLI vs Python logic.** The CLI wires to the same `Extractor` the Python
   API exposes.
 

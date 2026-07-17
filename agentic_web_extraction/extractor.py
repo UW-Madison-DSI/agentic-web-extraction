@@ -12,7 +12,6 @@ from .cache import (
     PAGE_NAMESPACE,
     CachedPage,
     KVCache,
-    SqliteKVCache,
     content_hash,
     page_cache_version,
 )
@@ -69,18 +68,7 @@ class Extractor:
         # hash stays stable). The library ships none -- it is site-agnostic; see
         # examples/strippers.py. Empty tuple means "leave the markdown as-is".
         self.text_filters: tuple[TextFilter, ...] = tuple(text_filters or ())
-        # Page cache (LLM-output replay). An explicit `cache=` always wins -- a
-        # caller can supply any KVCache. Otherwise default to the on-disk
-        # SqliteKVCache at settings.page_cache, so re-crawls skip the expensive
-        # screen/extract/score calls out of the box; an empty AWE_PAGE_CACHE
-        # turns page caching off (self.cache stays None). To disable from the
-        # Python API without env, pass settings with page_cache="".
-        if cache is not None:
-            self.cache: KVCache | None = cache
-        elif self.settings.page_cache:
-            self.cache = SqliteKVCache(self.settings.page_cache)
-        else:
-            self.cache = None
+        self.cache = cache
         # Version stamp mixed into every page-cache key so a change to the
         # criterion, schema, models, or normalize flag auto-invalidates entries.
         self._cache_version = page_cache_version(

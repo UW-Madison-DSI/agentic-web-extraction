@@ -52,15 +52,6 @@ class Settings(BaseSettings):
     # runs so weekly re-crawls can issue conditional GETs; empty string uses an
     # in-memory cache.
     http_cache: str = "data/http_cache.sqlite"
-    # On-disk page cache (env: AWE_PAGE_CACHE) -- the LLM-output replay store. On
-    # an unchanged normalized-content hash the crawler replays a page's screen
-    # verdict, extracted data, and link scores with zero LLM calls (see
-    # cache.py / extractor.extract). On by default so re-crawls are cheap;
-    # empty string disables it entirely (no page caching). A caller that passes
-    # its own KVCache to Extractor(cache=) overrides this backend. Distinct from
-    # http_cache: that stores raw HTTP responses, this stores the derived LLM
-    # outcomes -- the expensive part.
-    page_cache: str = "data/page_cache.sqlite"
     # Log file path (env: AWE_LOG_FILE), resolved relative to the current working
     # directory. Empty (the default) disables file logging entirely -- a single
     # knob, mirroring AWE_HTTP_CACHE's empty-means-off convention. Progress lines
