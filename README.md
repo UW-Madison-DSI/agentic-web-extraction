@@ -269,8 +269,8 @@ opt-in; with no `cache` the behavior is exactly as before. The same cache is
 forwarded to the schema's optional `merge_extractions(..., cache=)` so callers
 can cache the merge too. The library ships only the `KVCache` *protocol* — the
 concrete store is yours; [examples/grants.py](examples/grants.py) includes a
-minimal `DiskKVCache` (one JSON file per key under `data/llm_cache/`) you can
-lift as-is.
+minimal `SqliteKVCache` (one `kv` table in `data/llm_cache.sqlite`) you can lift
+as-is.
 
 ### CLI
 
@@ -286,7 +286,7 @@ The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportuni
 
 ### Runnable example
 
-`examples/grants.py` is a runnable end-to-end demo and the reference for the `merge_extractions` hook. It defines a singular `Opportunity` plus an `Opportunities` **collection** schema, and extracts with the collection so a page can yield many opportunities. It seeds against a real Grants.gov page and, in gather-all mode, matches several linked NIH announcements; `Opportunities.merge_extractions` then folds them into one result using an **LLM dedup call** (`provider.extract(..., usage_tag="merge")`), which collapses records describing the same underlying opportunity and surfaces as a `"merge"` bucket in `usage_by_function`. It falls back to a deterministic link-dedup when no provider is available or the call fails. It also wires in the cache-stability `text_filters` from [examples/strippers.py](examples/strippers.py) to show how a caller supplies them, and passes a `DiskKVCache` (defined in the same file) as the `cache=` — so every LLM call the demo makes is cached: the crawler replays each unchanged page's screen/extract/link-score outputs, and `merge_extractions` memoizes its dedup call keyed on the payload hash. Run it twice; the second run's `usage_by_function` shows `0` calls across the board (delete `data/llm_cache/` to force a cold crawl).
+`examples/grants.py` is a runnable end-to-end demo and the reference for the `merge_extractions` hook. It defines a singular `Opportunity` plus an `Opportunities` **collection** schema, and extracts with the collection so a page can yield many opportunities. It seeds against a real Grants.gov page and, in gather-all mode, matches several linked NIH announcements; `Opportunities.merge_extractions` then folds them into one result using an **LLM dedup call** (`provider.extract(..., usage_tag="merge")`), which collapses records describing the same underlying opportunity and surfaces as a `"merge"` bucket in `usage_by_function`. It falls back to a deterministic link-dedup when no provider is available or the call fails. It also wires in the cache-stability `text_filters` from [examples/strippers.py](examples/strippers.py) to show how a caller supplies them, and passes a `SqliteKVCache` (defined in the same file) as the `cache=` — so every LLM call the demo makes is cached: the crawler replays each unchanged page's screen/extract/link-score outputs, and `merge_extractions` memoizes its dedup call keyed on the payload hash. Run it twice; the second run's `usage_by_function` shows `0` calls across the board (delete `data/llm_cache.sqlite` to force a cold crawl).
 
 ```bash
 uv run python examples/grants.py
