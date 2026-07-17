@@ -139,6 +139,19 @@ def merge_cache_key(page_cache_keys: Sequence[str]) -> str:
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
+def merge_signature_stamp(merge_signature: str) -> str:
+    """Short hash of a schema's optional `merge_signature`, for the merge-cache key.
+
+    The schema's merge logic (and any prompt it sends) is opaque to the Extractor,
+    so a schema exposes a `merge_signature` string describing its merge behavior --
+    typically the dedup instruction text itself, so editing the prompt changes the
+    signature. Hashing keeps the key compact regardless of the signature's length.
+    Only called for a non-empty signature; an absent one leaves the merge key in its
+    prior shape so existing entries still hit.
+    """
+    return hashlib.sha256(merge_signature.encode("utf-8")).hexdigest()[:16]
+
+
 def page_cache_version(
     *,
     criteria: str,

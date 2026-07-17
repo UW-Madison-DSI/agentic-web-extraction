@@ -74,7 +74,13 @@ compare), [normalize.py](agentic_web_extraction/normalize.py),
   with zero LLM calls. **Merge is cached by the Extractor**
   (`_merge_cached`), not by `merge_extractions`: the merge key is derived from the
   contributing pages' page-cache keys, so the merge replays only when *every* source page
-  hit the cache (unchanged). Don't push merge caching back into schemas' `merge_extractions`.
+  hit the cache (unchanged). The schema's merge logic is opaque to the Extractor, so its
+  own dedup prompt can't reach the key the way the provider's `prompt_signature` does; a
+  schema may expose an optional `merge_signature` (a `ClassVar` string — typically the
+  dedup instruction text itself, as in [examples/grants.py](examples/grants.py)) that the
+  Extractor folds into the merge key, so editing that prompt invalidates the cached merge.
+  A schema that omits it keeps its prior merge-key shape (old entries still hit). Don't
+  push merge caching back into schemas' `merge_extractions`.
   `_merge` still offers `provider`/`cache` to `merge_extractions` by signature inspection —
   keep that mechanism, but the reference example no longer takes `cache`.
 - **Don't fork CLI vs Python logic.** The CLI wires to the same `Extractor` the Python

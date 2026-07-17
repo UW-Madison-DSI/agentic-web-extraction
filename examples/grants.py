@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from pydantic import BaseModel, Field
 
@@ -76,6 +76,12 @@ class Opportunities(BaseModel):
         description="All distinct grant/funding opportunities described on the page.",
     )
 
+    # Optional hook the Extractor folds into the merge-cache key. The merge logic
+    # (and its dedup prompt) is opaque to the Extractor, so pointing the signature
+    # at `_DEDUP_INSTRUCTIONS` makes editing that prompt invalidate the cached
+    # merged result. A ClassVar so pydantic treats it as config, not a model field.
+    merge_signature: ClassVar[str] = _DEDUP_INSTRUCTIONS
+
     @classmethod
     def merge_extractions(
         cls,
@@ -96,7 +102,9 @@ class Opportunities(BaseModel):
 
         No caching here: the Extractor memoizes this whole call, replaying the
         merged result with zero LLM calls when every contributing page hit the
-        page cache (i.e. was unchanged). See ``Extractor._merge_cached``.
+        page cache (i.e. was unchanged). Editing ``_DEDUP_INSTRUCTIONS`` busts that
+        memo via the ``merge_signature`` ClassVar above. See
+        ``Extractor._merge_cached``.
         """
         flat = [opp for _url, extracted in matches for opp in extracted.items]
         if provider is None or len(flat) <= 1:

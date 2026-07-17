@@ -16,6 +16,7 @@ from .cache import (
     SqliteKVCache,
     content_hash,
     merge_cache_key,
+    merge_signature_stamp,
     page_cache_version,
 )
 from .config import Settings, get_settings
@@ -383,11 +384,28 @@ class Extractor:
         with the same content produced the same per-page extractions -- i.e. every
         source page was unchanged. On a hit we replay the stored merged object with
         no LLM `merge` call; on a miss we run the merge and store its result.
+
+        The schema's merge logic is a black box to the Extractor, so its own prompt
+        (a dedup instruction, say) can't reach the key the way the provider's
+        `prompt_signature` does. To let a schema invalidate the merge cache when its
+        merge behavior changes, an optional `merge_signature` string on the schema is
+        folded into the key. A schema that omits it contributes an empty signature,
+        keeping its existing merge-key shape (so old entries still hit).
         """
         if self.cache is None or not matched_keys:
             return self._merge(merge, matches)
 
-        merge_key = f"{self._cache_version}:{merge_cache_key(matched_keys)}"
+        merge_sig = getattr(self.schema, "merge_signature", "") or ""
+        # Only insert the merge-signature segment when the schema actually declares
+        # one, so a schema without `merge_signature` keeps the exact key shape it
+        # had before and its existing merge-cache entries still hit.
+        if merge_sig:
+            merge_key = (
+                f"{self._cache_version}:{merge_signature_stamp(merge_sig)}:"
+                f"{merge_cache_key(matched_keys)}"
+            )
+        else:
+            merge_key = f"{self._cache_version}:{merge_cache_key(matched_keys)}"
         cached_raw = self.cache.get(MERGE_NAMESPACE, merge_key)
         if cached_raw is not None:
             try:

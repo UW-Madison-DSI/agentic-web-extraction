@@ -267,8 +267,13 @@ the crawler **replays** that page's screen verdict, extracted data, and link sco
 with **zero LLM calls** — the page is still fetched, so `pages_fetched` and the
 `max_fetches` budget are unaffected. The final merge is cached too: it replays when
 **every contributing page hit the cache** (the merge key is derived from the source
-pages' cache keys, so any changed/added/dropped page re-runs the dedup). Extracted
-data round-trips through your Pydantic model, so the cache is schema-agnostic.
+pages' cache keys, so any changed/added/dropped page re-runs the dedup). Your
+`merge_extractions` is opaque to the crawler, so its own dedup prompt isn't captured
+automatically — if your schema declares an optional `merge_signature` class attribute
+(a string, typically the dedup instruction text itself; see
+[examples/grants.py](examples/grants.py)), the crawler folds it into the merge key so
+editing that prompt invalidates the cached merge. Extracted data round-trips through
+your Pydantic model, so the cache is schema-agnostic.
 
 It's **on by default** — a SQLite store at `AWE_LLM_CACHE` (`data/llm_cache.sqlite`).
 Set `AWE_LLM_CACHE=` empty (or pass `Extractor(..., cache=None)`) to disable it. The
