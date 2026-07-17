@@ -254,18 +254,23 @@ CyberGrants) — copy the ones you need or write your own. They live in `example
 not the library, precisely so the core stays domain-agnostic; each filter is
 built to remove only content-free/invisible markup, never text an LLM would use.
 
-#### Optional page cache
+#### Page cache
 
-`Extractor(..., cache=)` accepts any object implementing the generic `KVCache`
-protocol (`get(namespace, key)` / `put(namespace, key, value)`, see
-[cache.py](agentic_web_extraction/cache.py)). When supplied, the crawler
-content-addresses each page by the hash of its normalized markdown (mixed with a
-version stamp over the criterion, schema, and models). If a page's content is
-unchanged from a prior run, the crawler **replays** that page's screen verdict,
-extracted data, and link scores with **zero LLM calls** — the page is still
-fetched, so `pages_fetched` and the `max_fetches` budget are unaffected. It's
-schema-agnostic (extracted data round-trips through your Pydantic model) and
-opt-in; with no `cache` the behavior is exactly as before. The same cache is
+**On by default.** The crawler content-addresses each page by the hash of its
+normalized markdown (mixed with a version stamp over the criterion, schema, and
+models). If a page's content is unchanged from a prior run, the crawler
+**replays** that page's screen verdict, extracted data, and link scores with
+**zero LLM calls** — the page is still fetched, so `pages_fetched` and the
+`max_fetches` budget are unaffected. Out of the box this is backed by an on-disk
+SQLite store at `data/page_cache.sqlite` (`AWE_PAGE_CACHE`); set that env var
+empty to disable page caching entirely.
+
+The backend is any object implementing the generic `KVCache` protocol
+(`get(namespace, key)` / `put(namespace, key, value)`, see
+[cache.py](agentic_web_extraction/cache.py)); the default is the shipped
+`SqliteKVCache`. Pass your own to `Extractor(..., cache=)` to override it (an
+explicit `cache=` always wins over `AWE_PAGE_CACHE`). It's schema-agnostic
+(extracted data round-trips through your Pydantic model), and the same cache is
 forwarded to the schema's optional `merge_extractions(..., cache=)` so callers
 can cache the merge too.
 
@@ -338,6 +343,7 @@ Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your pr
 | Stop at first match  | `AWE_STOP_ON_FIRST_MATCH` | `false` (gather all + merge) |
 | Prefer seed domain   | `AWE_PREFER_SEED_DOMAIN` | `false` (true = LLM disfavors off-domain pages/links) |
 | HTTP response cache  | `AWE_HTTP_CACHE`      | `data/http_cache.sqlite` (empty = in-memory) |
+| Page cache (LLM outputs) | `AWE_PAGE_CACHE`  | `data/page_cache.sqlite` (empty = off) |
 | Log file path        | `AWE_LOG_FILE`        | empty (off; set a path to enable) |
 
 Settings are loaded from `.env` if present (see `.env.example`).
@@ -361,7 +367,7 @@ agentic_web_extraction/
     __init__.py          # re-exports + main() entry point
     cli.py               # Typer CLI: `extract` subcommand
     config.py            # AWE_* settings (pydantic-settings)
-    cache.py             # KVCache protocol + content-hash helpers (opt-in page cache)
+    cache.py             # KVCache protocol + SqliteKVCache default store + content-hash helpers (page cache, on by default)
     extractor.py         # Extractor: frontier loop
     fetch.py             # httpx + hishel cache + tenacity retry
     logsink.py           # shared stderr + optional timestamped log-file sink
@@ -402,7 +408,7 @@ v0 done:
 - [x] Budget accounting + `stopped_reason` plumbing
 - [x] Path recording in result metadata
 - [x] Batch mode with caching (`Extractor.extract_batch`; in-memory hishel cache spans seeds)
-- [x] Opt-in content-addressed page cache (`Extractor(..., cache=)` over a generic `KVCache`; replays screen/extract/score with no LLM calls when page content is unchanged)
+- [x] Content-addressed page cache, on by default (`SqliteKVCache` at `data/page_cache.sqlite`, `AWE_PAGE_CACHE`; override via `Extractor(..., cache=)` over a generic `KVCache`; replays screen/extract/score with no LLM calls when page content is unchanged)
 - [x] Multi-match gather + `merge_extractions` hook (accumulate every matching page within budget, then merge)
 - [x] Caller-supplied `text_filters` (site-specific cache-stability strippers live in `examples/`, not the library)
 - [x] Opt-in soft same-domain preference (single `prefer_seed_domain` knob, off by default; LLM is fed an on-domain signal and asked to disfavor off-domain content; PSL-based registrable domain via `tldextract`)

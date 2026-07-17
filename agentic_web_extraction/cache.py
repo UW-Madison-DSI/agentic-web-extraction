@@ -2,19 +2,22 @@
 
 The frontier loop is the only place that knows, per page, the normalized content
 and the three LLM outputs derived from it (screen verdict, extracted data, link
-scores), so page caching has to hook here. This module defines only the cache
-*interface* and content-hashing helpers; the concrete persistent store is
-supplied by the caller (so storage-path policy stays out of the crawler), and no
-domain knowledge lives here — extracted data is round-tripped as a plain dict via
-the caller's schema, and the caller's `merge_extractions` uses the same generic
-store for its own (domain-specific) caching.
+scores), so page caching has to hook here. This module defines the cache
+*interface* (`KVCache`), the content-hashing helpers, and a generic on-disk
+default store (`SqliteKVCache`). No domain knowledge lives here — extracted data
+is round-tripped as a plain dict via the caller's schema, and the caller's
+`merge_extractions` uses the same generic store for its own (domain-specific)
+caching. A caller can still supply its own `KVCache` implementation to override
+the default store.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 
@@ -91,3 +94,43 @@ def page_cache_version(
         [criteria, schema_json, model_screen, model_extract, "1" if normalize else "0"]
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+
+
+class SqliteKVCache:
+    """On-disk namespaced KV store — the default page-cache backend.
+
+    Satisfies the `KVCache` protocol with a single SQLite table keyed by
+    (namespace, key); values are the JSON blobs the crawler already round-trips
+    (see `CachedPage`). Persisting to a file is what lets LLM-derived page
+    outcomes replay across runs. Storage is generic and domain-free, mirroring
+    the hishel HTTP cache in `fetch.py`: the parent directory is created on
+    demand, and `check_same_thread=False` matches that store's connection policy.
+    Pass `":memory:"` for a per-process store (rarely useful for page caching,
+    since each page is visited once per run).
+    """
+
+    def __init__(self, database_path: str) -> None:
+        if database_path != ":memory:":
+            Path(database_path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(database_path, check_same_thread=False)
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS kv ("
+            "namespace TEXT NOT NULL, key TEXT NOT NULL, value TEXT NOT NULL, "
+            "PRIMARY KEY (namespace, key))"
+        )
+        self._conn.commit()
+
+    def get(self, namespace: str, key: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT value FROM kv WHERE namespace = ? AND key = ?",
+            (namespace, key),
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def put(self, namespace: str, key: str, value: str) -> None:
+        self._conn.execute(
+            "INSERT INTO kv (namespace, key, value) VALUES (?, ?, ?) "
+            "ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value",
+            (namespace, key, value),
+        )
+        self._conn.commit()
