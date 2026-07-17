@@ -106,6 +106,25 @@ class OpenAIProvider:
         return self.settings.model_extract
 
     @property
+    def prompt_signature(self) -> str:
+        """Stable fingerprint of every prompt template this provider sends.
+
+        Covers the three base instructions plus the two same-domain-preference
+        appendices, so editing any of them (whether the module defaults or a
+        per-instance override) busts the page cache. The domain appendices are
+        static constants, but including them keeps the signature complete even if
+        they change. Order is fixed so the string is deterministic.
+        """
+        parts = [
+            self.screen_prompt,
+            self.score_prompt,
+            self.extract_prompt,
+            SCREEN_DOMAIN_PREFERENCE,
+            SCORE_DOMAIN_PREFERENCE,
+        ]
+        return "\x00".join(parts)
+
+    @property
     def usage_by_function(self) -> dict[str, Usage]:
         return dict(self._usage_by_function)
 

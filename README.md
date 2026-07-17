@@ -260,7 +260,9 @@ built to remove only content-free/invisible markup, never text an LLM would use.
 
 The crawler caches its LLM work, keyed by content: it content-addresses each page
 by the hash of its normalized markdown (mixed with a version stamp over the
-criterion, schema, and models). If a page's content is unchanged from a prior run,
+criterion, schema, provider prompt templates, and models — so changing any of
+those, or requesting a different schema for the same URL, misses instead of
+serving a stale result). If a page's content is unchanged from a prior run,
 the crawler **replays** that page's screen verdict, extracted data, and link scores
 with **zero LLM calls** — the page is still fetched, so `pages_fetched` and the
 `max_fetches` budget are unaffected. The final merge is cached too: it replays when

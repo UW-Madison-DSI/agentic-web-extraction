@@ -96,10 +96,14 @@ class Extractor:
         else:
             self.cache = cache
         # Version stamp mixed into every page-cache key so a change to the
-        # criterion, schema, models, or normalize flag auto-invalidates entries.
+        # criterion, schema, prompt templates, models, or normalize flag auto-
+        # invalidates entries. `prompt_signature` is optional on the Provider
+        # protocol; a provider that omits it contributes an empty signature (and
+        # so keeps its existing cache key shape).
         self._cache_version = page_cache_version(
             criteria=self.criteria,
             schema_json=json.dumps(self.schema.model_json_schema(), sort_keys=True),
+            prompt_signature=getattr(self.provider, "prompt_signature", "") or "",
             model_screen=self.provider.model_screen,
             model_extract=self.provider.model_extract,
             normalize=self.normalize_html,

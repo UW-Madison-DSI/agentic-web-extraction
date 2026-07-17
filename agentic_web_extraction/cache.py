@@ -143,6 +143,7 @@ def page_cache_version(
     *,
     criteria: str,
     schema_json: str,
+    prompt_signature: str,
     model_screen: str,
     model_extract: str,
     normalize: bool,
@@ -150,10 +151,18 @@ def page_cache_version(
     """Version stamp mixed into page-cache keys.
 
     Derived from every input that determines a page's screen/extract/score
-    outcome, so editing the criterion, the schema, the models, or the normalize
-    setting auto-invalidates page-cache entries without a manual bump.
+    outcome, so editing the criterion, the schema, the provider's prompt
+    templates, the models, or the normalize setting auto-invalidates page-cache
+    entries without a manual bump.
     """
     material = "\x00".join(
-        [criteria, schema_json, model_screen, model_extract, "1" if normalize else "0"]
+        [
+            criteria,
+            schema_json,
+            prompt_signature,
+            model_screen,
+            model_extract,
+            "1" if normalize else "0",
+        ]
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]

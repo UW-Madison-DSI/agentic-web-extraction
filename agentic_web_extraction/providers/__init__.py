@@ -19,6 +19,13 @@ class Provider(Protocol):
     @property
     def model_extract(self) -> str: ...
 
+    # A stable fingerprint of every prompt template the provider sends (screen,
+    # score, extract, and any conditional appendices). Mixed into the page-cache
+    # key so editing a prompt auto-invalidates stale cached outcomes. Optional:
+    # the Extractor treats a missing implementation as an empty signature.
+    @property
+    def prompt_signature(self) -> str: ...
+
     # Token usage bucketed by call-purpose tag, and the model each tag ran on.
     @property
     def usage_by_function(self) -> dict[str, Usage]: ...

@@ -66,8 +66,12 @@ compare), [normalize.py](agentic_web_extraction/normalize.py),
   a `SqliteKVCache` at `AWE_LLM_CACHE` (`data/llm_cache.sqlite`) unless the caller passes
   their own `KVCache`, passes `cache=None` to disable, or the setting is empty. All of
   [cache.py](agentic_web_extraction/cache.py) stays domain-agnostic — values are opaque
-  JSON round-tripped through the caller's schema. On an unchanged content hash it replays
-  screen/extract/link-scores with zero LLM calls. **Merge is cached by the Extractor**
+  JSON round-tripped through the caller's schema. Page-cache keys embed a version stamp
+  (`page_cache_version`) over the criterion, schema JSON, the provider's `prompt_signature`,
+  the models, and the normalize flag, so editing any prompt/schema/criterion — or requesting
+  a different schema for the same URL — misses instead of replaying a stale entry. On an
+  unchanged content hash (and matching version stamp) it replays screen/extract/link-scores
+  with zero LLM calls. **Merge is cached by the Extractor**
   (`_merge_cached`), not by `merge_extractions`: the merge key is derived from the
   contributing pages' page-cache keys, so the merge replays only when *every* source page
   hit the cache (unchanged). Don't push merge caching back into schemas' `merge_extractions`.
