@@ -80,5 +80,15 @@ class Frontier:
     def is_visited(self, url: str) -> bool:
         return canonical(url) in self._visited
 
+    def snapshot(self) -> frozenset[str]:
+        """Immutable copy of every canonical URL already seen or visited.
+
+        Handed to worker threads so they can pre-filter links they'd otherwise
+        score pointlessly, without reading the live (main-thread-mutated) sets.
+        A link that slips through (queued by another page in the same wave) is
+        still deduped by `push`, so the snapshot only needs to be good enough.
+        """
+        return frozenset(self._seen | self._visited)
+
     def __len__(self) -> int:
         return len(self._heap)

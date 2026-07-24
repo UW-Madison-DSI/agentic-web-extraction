@@ -42,20 +42,21 @@ class PageVerdict:
 @dataclass
 class ExtractionResult:
     data: BaseModel | None
-    """The extracted result: a ``schema`` instance merged across every matching
-    page (or the single match's data when ``stop_on_first_match``), or ``None``
-    when no page matched (``stopped_reason == "budget_exhausted"``)."""
+    """The extracted result: a single ``schema`` instance produced by one
+    extraction over the concatenated content of every screened-in page (across
+    all seeds), or ``None`` when no page matched
+    (``stopped_reason == "budget_exhausted"``)."""
 
     stopped_reason: StoppedReason
-    """Why the traversal ended: ``"match"`` if at least one page matched (even
-    in gather-all mode, which continues past the first), else
-    ``"budget_exhausted"`` when the frontier emptied or ``max_fetches`` ran out
-    with no match."""
+    """Why the traversal ended: ``"match"`` if at least one page passed screening
+    and the consolidated extraction produced data, else ``"budget_exhausted"``
+    when the frontier emptied or the budget ran out with no screened-in page."""
 
     pages_fetched: int
-    """Count of *readable* pages that consumed a ``max_fetches`` budget slot —
-    HTML/PDF bodies the agent did LLM work on. Fetches that errored or returned
-    a non-HTML/PDF body are in ``path`` but excluded here."""
+    """Count of *readable* pages that consumed a budget slot — HTML/PDF bodies the
+    agent did LLM work on, across all seeds. The total budget is
+    ``max_fetches * number_of_seeds``. Fetches that errored or returned a
+    non-HTML/PDF body are in ``path`` but excluded here."""
 
     path: list[str]
     """Resolved URLs visited in traversal order, including error/skipped fetches
@@ -73,13 +74,26 @@ class ExtractionResult:
 
     usage_by_function: dict[str, Usage] = field(default_factory=dict)
     """Token usage split by call purpose (``screen`` / ``score_links`` /
-    ``extract`` / ``merge`` / any tag a caller passes to ``extract``). Sum the
+    ``summarize`` / ``extract`` / any tag a caller passes to ``extract``). Sum the
     values for a grand total."""
 
     function_model: dict[str, str] = field(default_factory=dict)
     """Which model each function bucket in ``usage_by_function`` ran on, so cost
     is reconstructable; aggregate over functions sharing a model for a per-model
     view."""
+
+    content_tokens: int = 0
+    """Estimated token size of the raw concatenation of all screened-in pages,
+    before any summarization (see ``tokens.count_tokens``)."""
+
+    extraction_input_tokens: int = 0
+    """Estimated token size of what actually fed the single extraction call —
+    equal to ``content_tokens`` when it fit the budget, smaller when
+    ``summarized`` is True."""
+
+    summarized: bool = False
+    """True when the concatenation exceeded ``max_context_tokens`` and was
+    map-reduce summarized down before extraction."""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -94,6 +108,9 @@ class ExtractionResult:
                 for v in self.verdicts
             ],
             "protocol": self.protocol,
+            "content_tokens": self.content_tokens,
+            "extraction_input_tokens": self.extraction_input_tokens,
+            "summarized": self.summarized,
             "usage_by_function": {
                 func: {
                     "model": self.function_model.get(func),
