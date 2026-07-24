@@ -91,6 +91,19 @@ def extract(
             ),
         ),
     ] = None,
+    seed_is_content: Annotated[
+        bool | None,
+        typer.Option(
+            "--seed-is-content/--no-seed-is-content",
+            help=(
+                "Treat the seed URL as the content to extract from directly: skip "
+                "pre-screening and link-scoring, extract the seed page, and stop "
+                "(no links are followed, so max-fetches is effectively 1). Use it "
+                "when each seed is already a known target page. Defaults to "
+                "AWE_SEED_IS_CONTENT (off)."
+            ),
+        ),
+    ] = None,
     prefer_seed_domain: Annotated[
         bool | None,
         typer.Option(
@@ -145,6 +158,7 @@ def extract(
         seed_url=seed_url,
         max_fetches=max_fetches,
         stop_on_first_match=stop_on_first_match,
+        seed_is_content=seed_is_content,
     )
     typer.echo(json.dumps(result.to_dict(), indent=2))
     sys.exit(0 if result.stopped_reason == "match" else 2)

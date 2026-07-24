@@ -125,12 +125,22 @@ class Extractor:
         max_fetches: int | None = None,
         *,
         stop_on_first_match: bool | None = None,
+        seed_is_content: bool | None = None,
     ) -> ExtractionResult:
         budget = max_fetches if max_fetches is not None else self.settings.max_fetches
         stop_first = (
             stop_on_first_match
             if stop_on_first_match is not None
             else self.settings.stop_on_first_match
+        )
+        # Direct mode: the caller asserts the seed page *is* the content to extract,
+        # so skip pre-screening (treat it as a guaranteed match) and link-scoring (queue
+        # no outgoing links). With nothing pushed after the seed, the frontier empties
+        # and the crawl stops after the one page -- see the screen/score gates below.
+        direct = (
+            seed_is_content
+            if seed_is_content is not None
+            else self.settings.seed_is_content
         )
         frontier = Frontier()
         frontier.push(seed_url, score=1.0, source="seed")
@@ -216,13 +226,17 @@ class Extractor:
             # scores depend on the seed's registrable domain (via on_seed_domain),
             # so it's mixed into the key. The default (off) path keeps the exact
             # key shape it had before, so existing cache entries still hit.
+            # Build the key from optional segments so the default (both off) path is
+            # byte-identical to before and existing entries still hit. `direct` adds a
+            # `:direct` segment because it changes what's stored (screen forced to a
+            # match, no link scores), so a direct entry must not collide with a
+            # screened one for the same page content.
+            key_prefix = self._cache_version
             if self.prefer_seed_domain:
-                cache_key = (
-                    f"{self._cache_version}:seeddom={seed_domain}:"
-                    f"{content_hash(page_md)}:{page.url}"
-                )
-            else:
-                cache_key = f"{self._cache_version}:{content_hash(page_md)}:{page.url}"
+                key_prefix = f"{key_prefix}:seeddom={seed_domain}"
+            if direct:
+                key_prefix = f"{key_prefix}:direct"
+            cache_key = f"{key_prefix}:{content_hash(page_md)}:{page.url}"
             cached_raw = (
                 self.cache.get(PAGE_NAMESPACE, cache_key)
                 if self.cache is not None
@@ -256,27 +270,42 @@ class Extractor:
             stage_error = (
                 False  # don't cache a page whose LLM stages hit a transient error
             )
-            # When the same-domain preference is on, hand the screen call the
-            # seed/page URL and the Python-computed on-domain signal so it can
-            # disfavor off-domain pages; otherwise call it exactly as before.
-            screen_kwargs: dict = {}
-            if self.prefer_seed_domain:
-                screen_kwargs = {
-                    "page_url": page.url,
-                    "seed_url": seed_url,
-                    "on_seed_domain": same_registrable_domain(page.url, seed_domain),
-                }
-            try:
-                verdict = self.provider.screen(page_md, self.criteria, **screen_kwargs)
-            except Exception as e:
-                self._log(f"    ! screen failed on {page.url}: {type(e).__name__}: {e}")
-                continue
+            if direct:
+                # Direct mode: skip the pre-screen and take the seed page as a match.
+                screen_match = True
+                screen_reason = (
+                    "seed_is_content: screening skipped, page treated as a match"
+                )
+            else:
+                # When the same-domain preference is on, hand the screen call the
+                # seed/page URL and the Python-computed on-domain signal so it can
+                # disfavor off-domain pages; otherwise call it exactly as before.
+                screen_kwargs: dict = {}
+                if self.prefer_seed_domain:
+                    screen_kwargs = {
+                        "page_url": page.url,
+                        "seed_url": seed_url,
+                        "on_seed_domain": same_registrable_domain(
+                            page.url, seed_domain
+                        ),
+                    }
+                try:
+                    verdict = self.provider.screen(
+                        page_md, self.criteria, **screen_kwargs
+                    )
+                except Exception as e:
+                    self._log(
+                        f"    ! screen failed on {page.url}: {type(e).__name__}: {e}"
+                    )
+                    continue
+                screen_match = verdict.match
+                screen_reason = verdict.reason
             verdicts.append(
-                PageVerdict(url=page.url, match=verdict.match, reason=verdict.reason)
+                PageVerdict(url=page.url, match=screen_match, reason=screen_reason)
             )
             extracted_dump: dict | None = None
             matched_here = False
-            if verdict.match:
+            if screen_match:
                 try:
                     data = self.provider.extract(page_md, self.schema)
                 except Exception as e:
@@ -300,7 +329,10 @@ class Extractor:
                 break
 
             link_scores: list[list] = []
-            if page.kind == "html" and page.text:
+            # Direct mode queues no links: the seed is the only page we want, so
+            # skip scoring and frontier expansion. With nothing pushed, the frontier
+            # empties after the seed and the crawl ends.
+            if page.kind == "html" and page.text and not direct:
                 outgoing = extract_links(page.text, base_url=page.url)
                 fresh = [
                     (text, link)
@@ -340,8 +372,8 @@ class Extractor:
                     PAGE_NAMESPACE,
                     cache_key,
                     CachedPage(
-                        screen_match=verdict.match,
-                        screen_reason=verdict.reason,
+                        screen_match=screen_match,
+                        screen_reason=screen_reason,
                         extracted=extracted_dump,
                         link_scores=link_scores,
                     ).to_json(),
@@ -461,10 +493,14 @@ class Extractor:
         max_fetches: int | None = None,
         *,
         stop_on_first_match: bool | None = None,
+        seed_is_content: bool | None = None,
     ) -> list[ExtractionResult]:
         return [
             self.extract(
-                url, max_fetches=max_fetches, stop_on_first_match=stop_on_first_match
+                url,
+                max_fetches=max_fetches,
+                stop_on_first_match=stop_on_first_match,
+                seed_is_content=seed_is_content,
             )
             for url in seed_urls
         ]

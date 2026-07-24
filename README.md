@@ -114,6 +114,7 @@ Optional:
 
 - **Fetch budget** — `max_fetches` (default `10`). The agent stops when it has fetched this many pages.
 - **Match mode** — `stop_on_first_match` (default `False`). `False` spends the budget gathering every matching page and merges them; `True` returns as soon as the first page matches.
+- **Direct extraction** — `seed_is_content` (default `False`). When `True`, the seed URL is taken to *be* the content: the pre-screen is skipped (the seed is treated as a guaranteed match) and link-scoring is skipped (no links are queued), so the agent fetches just the seed, extracts it, and stops (`max_fetches` is effectively `1`). Use it when every seed is already a known target page and you only want the structured extraction — it skips the discovery machinery and the screen/score LLM calls entirely.
 - **Same-domain preference** — `prefer_seed_domain` (default `False`). When `True`, the pre-screen and link-scorer calls are told the seed URL, the page/link URL, and a Python-computed `on_seed_domain` signal, with an instruction to *disfavor* off-domain pages and links. The LLM applies it as a soft preference, not a filter — a clearly on-target off-domain page still matches / scores high, and nothing is excluded. Comparison is at the registrable-domain (eTLD+1) level via the Public Suffix List, so all of `*.wisc.edu` count as one domain.
 - **Text filters** — `text_filters`, a list of `str -> str` transforms applied to the normalized markdown. This is where *you* strip volatile per-response tokens (rotating anti-bot tokens, per-render timestamps, shuffled recommendation strips) so a page's content hash stays stable and the page cache can hit. The library ships none — it's site-agnostic; ready-made examples live in [examples/strippers.py](examples/strippers.py).
 - **Provider / model** — defaults to OpenAI; swappable.
@@ -277,6 +278,9 @@ result = extractor.extract(
     stop_on_first_match=False, # optional; falls back to AWE_STOP_ON_FIRST_MATCH.
                                # True = return on the first match; False (default)
                                # = spend the budget gathering every match, then merge.
+    seed_is_content=False,     # optional; falls back to AWE_SEED_IS_CONTENT.
+                               # True = the seed IS the content: skip pre-screen +
+                               # link-scoring, extract the seed page, and stop.
 )
 # result.data:           Opportunity | None  (merged across all matching pages)
 # result.stopped_reason: "match" | "budget_exhausted"
@@ -369,7 +373,7 @@ uv run awe extract \
   --max-fetches 10
 ```
 
-The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunity`) or a path to a Python file (`./schemas.py:Opportunity`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Add `--stop-on-first-match` to return on the first matching page (or `--gather-all-matches` to force the gather-and-merge default); omit both to use `AWE_STOP_ON_FIRST_MATCH`. Add `--prefer-seed-domain` to softly disfavor off-domain pages/links (the LLM is told the seed/page URL and an on-domain signal; `--no-prefer-seed-domain` forces it off, the default; omit to use `AWE_PREFER_SEED_DOMAIN`). Add `--log-file run.log` to also write a timestamped log file (off by default — no path, no file; see [Logging](#logging)). Add `--no-cache` to disable the on-by-default LLM-response cache (equivalently `AWE_LLM_CACHE=`). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
+The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunity`) or a path to a Python file (`./schemas.py:Opportunity`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Add `--stop-on-first-match` to return on the first matching page (or `--gather-all-matches` to force the gather-and-merge default); omit both to use `AWE_STOP_ON_FIRST_MATCH`. Add `--seed-is-content` to treat the seed URL as the content directly — skip the pre-screen and link-scoring, extract the seed page, and stop (`--no-seed-is-content` forces it off, the default; omit to use `AWE_SEED_IS_CONTENT`). Add `--prefer-seed-domain` to softly disfavor off-domain pages/links (the LLM is told the seed/page URL and an on-domain signal; `--no-prefer-seed-domain` forces it off, the default; omit to use `AWE_PREFER_SEED_DOMAIN`). Add `--log-file run.log` to also write a timestamped log file (off by default — no path, no file; see [Logging](#logging)). Add `--no-cache` to disable the on-by-default LLM-response cache (equivalently `AWE_LLM_CACHE=`). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
 
 ### Runnable example
 
@@ -426,6 +430,7 @@ Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your pr
 | Follow linked PDFs   | `AWE_FOLLOW_PDF`      | `true`                 |
 | Max page fetches     | `AWE_MAX_FETCHES`     | `10`                   |
 | Stop at first match  | `AWE_STOP_ON_FIRST_MATCH` | `false` (gather all + merge) |
+| Seed is content      | `AWE_SEED_IS_CONTENT` | `false` (true = skip screen + link-scoring, extract the seed page directly) |
 | Prefer seed domain   | `AWE_PREFER_SEED_DOMAIN` | `false` (true = LLM disfavors off-domain pages/links) |
 | LLM-response cache   | `AWE_LLM_CACHE`       | `data/llm_cache.sqlite` (on; empty = disable) |
 | Log file path        | `AWE_LOG_FILE`        | empty (off; set a path to enable) |
@@ -500,5 +505,6 @@ v0 done:
 - [x] Multi-match gather + `merge_extractions` hook (accumulate every matching page within budget, then merge)
 - [x] Caller-supplied `text_filters` (site-specific cache-stability strippers live in `examples/`, not the library)
 - [x] Opt-in soft same-domain preference (single `prefer_seed_domain` knob, off by default; LLM is fed an on-domain signal and asked to disfavor off-domain content; PSL-based registrable domain via `tldextract`)
+- [x] Opt-in direct extraction (single `seed_is_content` knob, off by default; treats the seed page as the content — skips the pre-screen and link-scoring, extracts just the seed, no discovery)
 - [x] `examples/` directory with reference schemas and filters (`examples/grants.py`, `examples/strippers.py`, kept out of the package)
 - [x] Weekly org adoption scan (`scripts/adopters.py` + `.github/workflows/adopters.yml`; index-independent repo/tree sweep → shields badges in the [Adopters](#adopters) block, hard-fails and reports coverage rather than committing a silent undercount)
