@@ -38,6 +38,17 @@ class Settings(BaseSettings):
     # merging them (env: AWE_STOP_ON_FIRST_MATCH). Default False preserves the
     # gather-all-then-merge behavior.
     stop_on_first_match: bool = False
+    # Treat the seed URL as the content to extract from directly (env:
+    # AWE_SEED_IS_CONTENT). When True, the seed page is taken as a guaranteed
+    # match: the pre-screen LLM call is skipped (the page is not judged for
+    # relevance) and link-scoring is skipped (no outgoing links are queued), so
+    # the traversal fetches exactly the seed, extracts it, and stops -- max_fetches
+    # is effectively 1. Use it when you already know each seed is a target page and
+    # only want the structured extraction, skipping the discovery machinery. Default
+    # False preserves the screen-then-crawl behavior. Page caching still applies (a
+    # distinct key segment keeps direct-mode entries from colliding with screened
+    # ones for the same page).
+    seed_is_content: bool = False
     # Soft same-domain preference, expressed to the LLM rather than as a math
     # weight (env: AWE_PREFER_SEED_DOMAIN). When True, the pre-screen and
     # link-scorer calls are told the seed URL, the page/link URL, and a
