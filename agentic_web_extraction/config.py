@@ -29,26 +29,42 @@ class Settings(BaseSettings):
     # Whether to fetch and read linked PDFs as page content (env: AWE_FOLLOW_PDF).
     # When False, PDF responses are treated as skipped (no LLM work, no budget cost).
     follow_pdf: bool = True
-    # Fetch budget: the max number of readable pages the traversal will spend LLM
-    # calls on (env: AWE_MAX_FETCHES). The only traversal knob in v0. Errored and
+    # Fetch budget PER SEED: the max number of readable pages the traversal will
+    # spend LLM calls on for each seed URL (env: AWE_MAX_FETCHES). With N seeds the
+    # single shared frontier gets a total budget of max_fetches * N. Errored and
     # skipped (non-HTML/PDF) fetches don't count against it.
     max_fetches: int = 10
-    # When True, the traversal returns as soon as one page matches and is
-    # extracted, instead of spending the whole budget gathering every match and
-    # merging them (env: AWE_STOP_ON_FIRST_MATCH). Default False preserves the
-    # gather-all-then-merge behavior.
-    stop_on_first_match: bool = False
-    # Treat the seed URL as the content to extract from directly (env:
-    # AWE_SEED_IS_CONTENT). When True, the seed page is taken as a guaranteed
-    # match: the pre-screen LLM call is skipped (the page is not judged for
-    # relevance) and link-scoring is skipped (no outgoing links are queued), so
-    # the traversal fetches exactly the seed, extracts it, and stops -- max_fetches
-    # is effectively 1. Use it when you already know each seed is a target page and
-    # only want the structured extraction, skipping the discovery machinery. Default
-    # False preserves the screen-then-crawl behavior. Page caching still applies (a
+    # Treat every seed URL as content to extract from directly (env:
+    # AWE_SEED_IS_CONTENT). When True, each seed is taken as a guaranteed match:
+    # the pre-screen LLM call is skipped (pages are not judged for relevance) and
+    # link-scoring is skipped (no outgoing links are queued), so the traversal
+    # fetches exactly the seeds, consolidates them, extracts once, and stops. Use
+    # it when you already know each seed is a target page and only want the
+    # structured extraction, skipping the discovery machinery. Default False
+    # preserves the screen-then-crawl behavior. Page caching still applies (a
     # distinct key segment keeps direct-mode entries from colliding with screened
     # ones for the same page).
     seed_is_content: bool = False
+    # Input-token budget for the single consolidated extraction call (env:
+    # AWE_MAX_CONTEXT_TOKENS). The normalized markdown of every screened-in page is
+    # concatenated; if the result exceeds this budget it is summarized down (see
+    # summarize.py) before extraction, which also uses this value as the per-chunk
+    # target for the summarizer. The default sits safely under a large frontier-
+    # model context window (e.g. gpt-5.5) while leaving room for the schema,
+    # instructions, and output; lower it for models with smaller windows.
+    max_context_tokens: int = 128000
+    # Wave concurrency / beam width (env: AWE_MAX_WORKERS). The traversal processes
+    # the frontier in waves: it pops up to this many top-scored links at once and
+    # fetches/screens/scores them concurrently in a thread pool, then folds the
+    # results back. 1 makes the crawl strictly sequential (classic best-first);
+    # higher values trade a little best-first strictness (best-first *within* a
+    # wave) for parallelism, even on a single seed.
+    max_workers: int = 8
+    # Base tiktoken encoding used for token counting when the model name is unknown
+    # to tiktoken (env: AWE_TIKTOKEN_ENCODING). Swappable providers routinely use
+    # names tiktoken has no mapping for; the count is then an approximation, which
+    # is fine -- it only drives the fit-or-summarize decision, not billing.
+    tiktoken_encoding: str = "o200k_base"
     # Soft same-domain preference, expressed to the LLM rather than as a math
     # weight (env: AWE_PREFER_SEED_DOMAIN). When True, the pre-screen and
     # link-scorer calls are told the seed URL, the page/link URL, and a

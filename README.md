@@ -1,6 +1,6 @@
 # agentic-web-extraction
 
-An agent that **traverses** the web to find and extract structured data. Given a seed URL, a target schema, and a relevance criterion, the agent reads each page, ranks outgoing links by how likely they lead to a match, and follows the best one — until it satisfies the schema or hits its fetch budget.
+An agent that **traverses** the web to find and consolidate structured data. Given one or more seed URLs, a target schema, and a relevance criterion, the agent reads each page, ranks outgoing links by how likely they lead to relevant content, follows the best ones — then pools every page that passed screening into a **single** structured extraction.
 
 > **Status: v0.** Public API below is implemented end-to-end. Expect breaking changes between minor versions.
 
@@ -83,89 +83,97 @@ so an adopter on an unmerged branch is invisible by design.
 
 ## What it is
 
-You give it a *seed URL*, a Pydantic schema describing what you're looking for, and a natural-language relevance criterion. The agent then:
+You give it one or more *seed URLs*, a Pydantic schema describing what you're looking for, and a natural-language relevance criterion. The agent then:
 
-1. Fetches the seed page (HTML, optionally a linked PDF if part of the content).
+1. Fetches each page (HTML, optionally a linked PDF if part of the content).
 2. Normalizes HTML → Markdown to cut token cost.
-3. Pre-screens the page against your criterion. If it matches, runs structured extraction against your schema and records the result.
-4. Either way, scores every outgoing link by how likely it leads to a match, adds them to a frontier, and pops the highest-scoring unvisited link as the next page to fetch.
-5. Repeats until the fetch budget is exhausted (or the frontier empties), accumulating every matching page, then merges them into a single result via the schema's optional `merge_extractions` hook (or returns the first match if the schema doesn't define one).
+3. Pre-screens the page against your criterion. Pages that match are kept.
+4. Either way, scores every outgoing link by how likely it leads to relevant content, adds them to a frontier, and pops the highest-scoring unvisited links as the next pages to fetch.
+5. Repeats until the fetch budget is exhausted (or the frontier empties), then **concatenates the markdown of every screened-in page and runs one structured extraction over the whole thing**.
 
 The library is **schema-agnostic and goal-directed**. It does not ship with built-in domains like "grants" or "companies" — you bring the schema, you bring the criterion, and the agent navigates *to* the answer.
 
 ## How the agent decides
 
-The agent maintains a **frontier** — every unvisited link it has seen so far, each annotated with an LLM-assigned relevance score against your criterion. On each step it pops the highest-scoring link, fetches and normalizes it, then pre-screens.
+The agent maintains a **frontier** — every unvisited link it has seen so far, each annotated with an LLM-assigned relevance score against your criterion. It processes the frontier in **parallel waves**: it pops the top-scoring links (up to `max_workers` at once), fetches/normalizes/screens/scores them concurrently in a thread pool, and folds the results back.
 
-- If pre-screen says **match**, it runs structured extraction and records the page as a match.
-- Whether or not the page matched, it scores the new page's outgoing links against the goal and merges them into the frontier.
-- The loop keeps going until the **fetch budget** is exhausted (or the frontier empties), collecting every matching page along the way.
-- At the end, all matches are combined via the schema's optional `merge_extractions` classmethod (falling back to the first match). `stopped_reason` is `"match"` if at least one page matched, else `"budget_exhausted"`.
+- If pre-screen says **match**, the page's normalized markdown is collected for extraction.
+- Whether or not the page matched, its outgoing links are scored against the goal and merged into the frontier.
+- The loop keeps going until the **fetch budget** is exhausted (or the frontier empties), collecting every screened-in page along the way.
+- At the end, all collected pages are concatenated and fed to **one** extraction call (summarized down first if they exceed the context budget — see below). `stopped_reason` is `"match"` if at least one page passed screening and extraction produced data, else `"budget_exhausted"`.
 
-This is best-first search, not breadth-first or depth-first. The LLM's relevance scoring is the primary navigation policy; depth and per-link thresholds are deliberately **not** tunable in v0 — the budget is the main lever. The one opt-in exception is a *soft* same-domain preference (off by default; see below): rather than re-weighting scores in code, it hands the LLM the seed/page URL and a computed on-domain signal and asks it to disfavor off-domain content — a nudge the model applies with its own judgment, never a hard exclusion.
+**Multiple seeds pool into one result.** Pass a list of seed URLs and they all share one frontier; the fetch budget is `max_fetches` *per seed* (so `max_fetches × len(seeds)` total). Every seed is guaranteed to be fetched, a URL reachable from several seeds is screened/scored only once, and everything that passes screening across all seeds feeds the same single extraction. More seeds simply means more content in the one result.
+
+This is best-first search, not breadth-first or depth-first. The LLM's relevance scoring is the primary navigation policy; depth and per-link thresholds are deliberately **not** tunable — the budget is the main lever. `max_workers` trades a little best-first strictness (best-first *within* a wave) for parallelism, even on a single seed; set it to `1` for strictly sequential best-first. The one opt-in navigation exception is a *soft* same-domain preference (off by default; see below): rather than re-weighting scores in code, it hands the LLM the seed/page URL and a computed on-domain signal and asks it to disfavor off-domain content — a nudge the model applies with its own judgment, never a hard exclusion.
+
+**Fit-or-summarize.** The concatenated content of all screened-in pages is measured (via tiktoken) against `max_context_tokens`. If it fits, it's extracted as-is. If not, it's compressed first with a criteria-aware map-reduce on the cheap screen model — each page is summarized (keeping everything relevant to your criterion), the summaries are concatenated, and if still over budget the combined text is summarized again until it fits. The concatenated and post-summarization sizes are logged.
 
 ## What you provide
 
-1. **Target schema** — a Pydantic model describing the fields you want extracted. It must be a `BaseModel` subclass (not a bare `list`), so to capture *many* records per page, use a container schema with a list field (e.g. `class Opportunities(BaseModel): items: list[Opportunity]`) and optionally define `merge_extractions` on it to fuse the per-page results — see [examples/grants.py](examples/grants.py).
+1. **Target schema** — a Pydantic model describing the fields you want extracted. It must be a `BaseModel` subclass (not a bare `list`), so to capture *many* records, use a container schema with a list field (e.g. `class Opportunities(BaseModel): items: list[Opportunity]`) — the single extraction fills its list from the pooled content of every screened-in page. See [examples/grants.py](examples/grants.py).
 2. **Screening criterion** — a natural-language description of what makes a page "in scope". Used by the pre-screen *and* by the link-scorer to rank the frontier. Example: *"Page describes a grant or funding opportunity that an academic PI could apply for."*
-3. **Seed URL** — a single starting point. The agent traverses outward from there.
+3. **Seed URL(s)** — one starting point or a list. The agent traverses outward from all of them and pools the results into one extraction.
 
 Optional:
 
-- **Fetch budget** — `max_fetches` (default `10`). The agent stops when it has fetched this many pages.
-- **Match mode** — `stop_on_first_match` (default `False`). `False` spends the budget gathering every matching page and merges them; `True` returns as soon as the first page matches.
-- **Direct extraction** — `seed_is_content` (default `False`). When `True`, the seed URL is taken to *be* the content: the pre-screen is skipped (the seed is treated as a guaranteed match) and link-scoring is skipped (no links are queued), so the agent fetches just the seed, extracts it, and stops (`max_fetches` is effectively `1`). Use it when every seed is already a known target page and you only want the structured extraction — it skips the discovery machinery and the screen/score LLM calls entirely.
-- **Same-domain preference** — `prefer_seed_domain` (default `False`). When `True`, the pre-screen and link-scorer calls are told the seed URL, the page/link URL, and a Python-computed `on_seed_domain` signal, with an instruction to *disfavor* off-domain pages and links. The LLM applies it as a soft preference, not a filter — a clearly on-target off-domain page still matches / scores high, and nothing is excluded. Comparison is at the registrable-domain (eTLD+1) level via the Public Suffix List, so all of `*.wisc.edu` count as one domain.
+- **Fetch budget** — `max_fetches` (default `10`), applied *per seed* (total budget is `max_fetches × number of seeds`).
+- **Context budget** — `max_context_tokens` (default `128000`). The input-token budget for the single extraction; if the concatenated pages exceed it, they're summarized down first.
+- **Wave concurrency** — `max_workers` (default `8`). How many top-scored links are fetched/screened/scored at once. `1` = strictly sequential best-first.
+- **Direct extraction** — `seed_is_content` (default `False`). When `True`, every seed URL is taken to *be* the content: the pre-screen is skipped (seeds are treated as guaranteed matches) and link-scoring is skipped (no links are queued), so the agent fetches just the seeds, consolidates them, extracts once, and stops. Use it when every seed is already a known target page and you only want the structured extraction — it skips the discovery machinery and the screen/score LLM calls entirely.
+- **Same-domain preference** — `prefer_seed_domain` (default `False`). When `True`, the pre-screen and link-scorer calls are told the seed URL(s), the page/link URL, and a Python-computed `on_seed_domain` signal (on *any* seed's domain, for multi-seed runs), with an instruction to *disfavor* off-domain pages and links. The LLM applies it as a soft preference, not a filter — a clearly on-target off-domain page still matches / scores high, and nothing is excluded. Comparison is at the registrable-domain (eTLD+1) level via the Public Suffix List, so all of `*.wisc.edu` count as one domain.
 - **Text filters** — `text_filters`, a list of `str -> str` transforms applied to the normalized markdown. This is where *you* strip volatile per-response tokens (rotating anti-bot tokens, per-render timestamps, shuffled recommendation strips) so a page's content hash stays stable and the page cache can hit. The library ships none — it's site-agnostic; ready-made examples live in [examples/strippers.py](examples/strippers.py).
 - **Provider / model** — defaults to OpenAI; swappable.
 - **Normalization toggle** — HTML→Markdown is on by default for cost reduction.
-- **Custom prompts** — override the default link-scoring, pre-screen, and extraction prompts.
+- **Custom prompts** — override the default link-scoring, pre-screen, extraction, and summarize prompts.
 
 ## What you get back
 
-A typed object conforming to your schema (or `None` if budget ran out before a match), plus traversal metadata:
+A typed object conforming to your schema (or `None` if nothing screened in), plus traversal metadata:
 
-- `data` — the extracted Pydantic instance, or `None`
+- `data` — the single extracted Pydantic instance (pooled across every screened-in page), or `None`
 - `stopped_reason` — `"match"` | `"budget_exhausted"`
-- `pages_fetched` — total fetches the traversal used
+- `pages_fetched` — total readable pages the traversal did LLM work on (across all seeds)
 - `path` — ordered list of URLs the agent visited
-- `verdicts` — one pre-screen verdict (`url`, `match`, `reason`) per screened page, in visit order
+- `verdicts` — one pre-screen verdict (`url`, `match`, `reason`) per screened page
+- `content_tokens` — estimated token size of the raw concatenation of all screened-in pages
+- `extraction_input_tokens` — token size of what actually fed the extraction (smaller than `content_tokens` when `summarized`)
+- `summarized` — `True` when the concatenation exceeded `max_context_tokens` and was summarized down first
 - provider and token usage across all calls, split by call purpose (each with the model it ran on)
 
 Whether the agent succeeded or gave up, the result is structured the same way — easy to audit.
 
 ## Pipeline
 
-The four extraction stages run inside a frontier loop:
+The traversal stages run inside a parallel-wave frontier loop, then one extraction consolidates everything:
 
 ```
-seed URL
+seed URL(s)
    │
    ▼
-   Fetch ──▶ Normalize ──▶ Pre-screen
+   Fetch ──▶ Normalize ──▶ Pre-screen ──▶ match? ──▶ collect page markdown
    ▲                            │
-   │                     match? ─┴─ not yet
-   │                       │          │
-   │                       ▼          │
-   │                   Extract        │
-   │                (record match)    │
-   │                       │          │
-   │                       └────┬─────┘
    │                            ▼
    │                    Score outgoing
    │                    links (LLM);
    │                    add to frontier;
    │                    pop highest-scoring
-   │                       unvisited
+   │                    unvisited (wave of N)
    │                            │
    │                     budget left?
    │                       │      │
    └───────── yes ─────────┘      no
                                   │
                                   ▼
-                          merge all matches
-                          ──▶ return result
-                        (data=None if no match)
+                        concatenate all collected pages
+                        ──▶ fits max_context_tokens?
+                              │              │
+                             yes             no ──▶ summarize (map-reduce,
+                              │                        screen model)
+                              └──────┬───────────────────┘
+                                     ▼
+                            one Extract call
+                            ──▶ return result
+                          (data=None if nothing screened in)
 ```
 
 Each stage is independently swappable.
@@ -176,27 +184,29 @@ Each stage is independently swappable.
 | Normalize      | HTML → Markdown for token reduction; pluggable converter; caller-supplied `text_filters` run here |
 | Pre-screen     | Cheap LLM call returning a binary yes/no against user-supplied criterion                    |
 | Score links    | LLM scores every outgoing link's promise against the criterion; output feeds the frontier   |
-| Extract        | Structured-output LLM call; provider-swappable; produces JSON conforming to user schema     |
+| Summarize      | Only when the concatenation overflows `max_context_tokens`; criteria-aware map-reduce on the screen model |
+| Extract        | One structured-output LLM call over the concatenated (possibly summarized) content; produces JSON conforming to user schema |
 
-By default the link-scorer reuses the pre-screen model — both are cheap, comparison-style calls.
+By default the link-scorer and summarizer reuse the pre-screen model — all cheap, comparison/compression-style calls.
 
-**How much of the page each LLM call sees.** The cheap calls read a truncated prefix of the normalized markdown; extraction reads all of it:
+**How much of the page each LLM call sees.** The cheap traversal calls read a truncated prefix of the normalized markdown; extraction reads the full concatenated content:
 
-| Call        | Page text sent                                            |
+| Call        | Text sent                                                 |
 |-------------|-----------------------------------------------------------|
-| Pre-screen  | First 16,000 characters                                   |
+| Pre-screen  | First 16,000 characters of the page                       |
 | Score links | First 4,000 characters (links themselves are never truncated — every link is sent with its full URL and anchor text) |
-| Extract     | Full page, untruncated                                    |
+| Summarize   | Full chunk (input is pre-chunked to fit the model window) |
+| Extract     | Full concatenated content of all screened-in pages, untruncated (summarized first if over `max_context_tokens`) |
 
-Consequence: a page whose matching content sits entirely beyond the first 16k characters of markdown will fail the pre-screen and never reach extraction, and the link scorer judges links with context from only the top of the page. Caller-supplied `text_filters` interact with this — stripping boilerplate moves real content earlier in the document, effectively widening what the screen and scoring calls see. `merge_extractions` payloads go through the same untruncated extract path.
+Consequence: a page whose relevant content sits entirely beyond the first 16k characters of markdown will fail the pre-screen and never reach extraction, and the link scorer judges links with context from only the top of the page. Caller-supplied `text_filters` interact with this — stripping boilerplate moves real content earlier in the document, effectively widening what the screen and scoring calls see.
 
 ## Example use cases
 
 These are *illustrative* — the schemas and criteria belong to the caller.
 
-**Grant opportunities.** Caller defines an `Opportunity` model (title, deadline, eligibility, sponsor, link), with criterion *"is this a grant a PI could apply for"*, and seeds the agent at a funding agency's landing page. The agent navigates the agency's site and stops on the first matching grant page within its fetch budget.
+**Grant opportunities.** Caller defines an `Opportunity` model (title, deadline, eligibility, sponsor, link) inside an `Opportunities` list container, with criterion *"is this a grant a PI could apply for"*, and seeds the agent at a funding agency's landing page. The agent navigates the agency's site, collects every matching grant page within its budget, and extracts them all in one pass.
 
-**University–industry engagement.** Caller defines a `Company` model (name, contact, engagement type), with criterion *"does this page describe company–university engagement"*, and seeds the agent at a company's homepage. The agent traverses partnership / news / about pages until it finds a matching engagement page.
+**University–industry engagement.** Caller defines a `Company` model (name, contact, engagement type) in a list container, with criterion *"does this page describe company–university engagement"*, and seeds the agent at a company's homepage (or several companies' homepages at once). The agent traverses partnership / news / about pages and consolidates the matching ones into a single result.
 
 ## Installation
 
@@ -249,7 +259,7 @@ your Git credentials are configured.
 ### Python
 
 ```python
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from agentic_web_extraction import Extractor
 
 class Opportunity(BaseModel):
@@ -259,8 +269,11 @@ class Opportunity(BaseModel):
     sponsor: str | None = None
     link: str
 
+class Opportunities(BaseModel):          # list container: the one extraction fills it
+    items: list[Opportunity] = Field(default_factory=list)
+
 extractor = Extractor(
-    schema=Opportunity,
+    schema=Opportunities,
     criteria="Page describes a grant or funding opportunity an academic PI could apply for.",
     # provider/model defaults come from AWE_* env vars (see Configuration).
     # Pass `provider=MyProvider(...)` to inject a custom Provider instance.
@@ -273,24 +286,24 @@ extractor = Extractor(
 )
 
 result = extractor.extract(
-    seed_url="https://example.gov/grants",
-    max_fetches=10,            # optional; falls back to AWE_MAX_FETCHES
-    stop_on_first_match=False, # optional; falls back to AWE_STOP_ON_FIRST_MATCH.
-                               # True = return on the first match; False (default)
-                               # = spend the budget gathering every match, then merge.
+    "https://example.gov/grants",   # a single URL, or a list of seed URLs
+    max_fetches=10,            # optional; falls back to AWE_MAX_FETCHES (PER seed)
     seed_is_content=False,     # optional; falls back to AWE_SEED_IS_CONTENT.
-                               # True = the seed IS the content: skip pre-screen +
-                               # link-scoring, extract the seed page, and stop.
+                               # True = the seeds ARE the content: skip pre-screen +
+                               # link-scoring, consolidate the seeds, extract, and stop.
 )
-# result.data:           Opportunity | None  (merged across all matching pages)
+# result.data:           Opportunities | None  (one extraction over all screened-in pages)
 # result.stopped_reason: "match" | "budget_exhausted"
 # result.pages_fetched:  int
 # result.path:           list[str]
 # result.verdicts:       list[PageVerdict]  (one per screened page: url, match, reason)
+# result.content_tokens: int  -- raw concatenation size (tokens)
+# result.extraction_input_tokens: int  -- what fed extraction (< content_tokens if summarized)
+# result.summarized:     bool -- whether the concatenation was summarized down to fit
 # result.protocol:       str  -- provider adapter / wire protocol that ran the
 #   crawl (e.g. "openai"); names the SDK/billing surface, not the model vendor.
 # result.usage_by_function: dict[str, Usage]  -- token usage by call purpose
-#   (screen / score_links / extract, plus any tag a caller passes to extract()).
+#   (screen / score_links / summarize / extract, plus any tag a caller passes to extract()).
 #   Usage = (input_tokens, output_tokens, calls, cached_input_tokens); the cached
 #   count is the prompt-cache subset of input_tokens, populated when the provider
 #   reports it (OpenAI's usage.input_tokens_details.cached_tokens).
@@ -298,16 +311,17 @@ result = extractor.extract(
 #   cost is reconstructable; aggregate functions sharing a model for a per-model view.
 ```
 
-`provider.extract(..., usage_tag="merge")` lets a caller bucket a structured-
-output call under its own purpose; the screen and link-score calls are tagged
-automatically. Sum `usage_by_function.values()` for a grand total.
+`provider.extract(..., usage_tag="...")` lets a caller bucket a structured-
+output call under its own purpose; the screen, link-score, summarize, and extract
+calls are tagged automatically. Sum `usage_by_function.values()` for a grand total.
 
-Need to traverse several seed URLs in one process?
+Need to pool several seed URLs into one extraction? Pass a list — the budget is
+`max_fetches` per seed, and a URL reachable from more than one seed is screened once:
 
 ```python
-results = extractor.extract_batch(
-    seed_urls=["https://a.example/", "https://b.example/"],
-    max_fetches=10,
+result = extractor.extract(
+    ["https://a.example/", "https://b.example/"],
+    max_fetches=10,   # 10 per seed → 20 total budget for the shared frontier
 )
 ```
 
@@ -339,22 +353,13 @@ built to remove only content-free/invisible markup, never text an LLM would use.
 
 #### LLM-response cache (on by default)
 
-The crawler caches its LLM work, keyed by content: it content-addresses each page
-by the hash of its normalized markdown (mixed with a version stamp over the
-criterion, schema, provider prompt templates, and models — so changing any of
-those, or requesting a different schema for the same URL, misses instead of
-serving a stale result). If a page's content is unchanged from a prior run,
-the crawler **replays** that page's screen verdict, extracted data, and link scores
-with **zero LLM calls** — the page is still fetched, so `pages_fetched` and the
-`max_fetches` budget are unaffected. The final merge is cached too: it replays when
-**every contributing page hit the cache** (the merge key is derived from the source
-pages' cache keys, so any changed/added/dropped page re-runs the dedup). Your
-`merge_extractions` is opaque to the crawler, so its own dedup prompt isn't captured
-automatically — if your schema declares an optional `merge_signature` class attribute
-(a string, typically the dedup instruction text itself; see
-[examples/grants.py](examples/grants.py)), the crawler folds it into the merge key so
-editing that prompt invalidates the cached merge. Extracted data round-trips through
-your Pydantic model, so the cache is schema-agnostic.
+The crawler caches its LLM work, keyed by content, at three levels:
+
+- **Per page** — each page is content-addressed by the hash of its normalized markdown (mixed with a version stamp over the criterion, schema, provider prompt templates, and models — so changing any of those, or requesting a different schema for the same URL, misses instead of serving a stale result). If a page's content is unchanged from a prior run, the crawler **replays** that page's screen verdict and link scores with **zero LLM calls** — the page is still fetched, so `pages_fetched` and the budget are unaffected.
+- **The consolidated extraction** — keyed on the *set* of contributing pages (a hash of all their per-page cache keys, plus the context/encoding settings that govern the summarize-or-not decision). It replays only when **the exact same set of pages with the same content** recurs — change, add, or drop any screened-in page and the extraction re-runs. The stored value carries the context-size metadata too, so a hit replays the full result (including `content_tokens` / `summarized`).
+- **Per summary chunk** — when summarization runs, each chunk's summary is cached by its content hash, so an unchanged page replays its summary for free.
+
+Extracted data round-trips through your Pydantic model, so the cache is schema-agnostic.
 
 It's **on by default** — a SQLite store at `AWE_LLM_CACHE` (`data/llm_cache.sqlite`).
 Set `AWE_LLM_CACHE=` empty (or pass `Extractor(..., cache=None)`) to disable it. The
@@ -367,23 +372,23 @@ pass any object implementing the `KVCache` protocol (`get(namespace, key)` /
 
 ```bash
 uv run awe extract \
-  --schema examples/grants.py:Opportunity \
+  --schema examples/grants.py:Opportunities \
   --criteria "Page describes a grant a PI could apply for." \
   --seed-url https://example.gov/grants \
   --max-fetches 10
 ```
 
-The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunity`) or a path to a Python file (`./schemas.py:Opportunity`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Add `--stop-on-first-match` to return on the first matching page (or `--gather-all-matches` to force the gather-and-merge default); omit both to use `AWE_STOP_ON_FIRST_MATCH`. Add `--seed-is-content` to treat the seed URL as the content directly — skip the pre-screen and link-scoring, extract the seed page, and stop (`--no-seed-is-content` forces it off, the default; omit to use `AWE_SEED_IS_CONTENT`). Add `--prefer-seed-domain` to softly disfavor off-domain pages/links (the LLM is told the seed/page URL and an on-domain signal; `--no-prefer-seed-domain` forces it off, the default; omit to use `AWE_PREFER_SEED_DOMAIN`). Add `--log-file run.log` to also write a timestamped log file (off by default — no path, no file; see [Logging](#logging)). Add `--no-cache` to disable the on-by-default LLM-response cache (equivalently `AWE_LLM_CACHE=`). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
+The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunities`) or a path to a Python file (`./schemas.py:Opportunities`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Repeat `--seed-url` to pool several seeds into one extraction (`--seed-url URL1 --seed-url URL2`); the fetch budget applies per seed. Add `--max-context-tokens N` to change the extraction input budget (over it, pages are summarized down; defaults to `AWE_MAX_CONTEXT_TOKENS`), and `--max-workers N` to change wave concurrency (defaults to `AWE_MAX_WORKERS`). Add `--seed-is-content` to treat the seeds as the content directly — skip the pre-screen and link-scoring, consolidate the seeds, and extract (`--no-seed-is-content` forces it off, the default; omit to use `AWE_SEED_IS_CONTENT`). Add `--prefer-seed-domain` to softly disfavor off-domain pages/links (the LLM is told the seed/page URL and an on-domain signal; `--no-prefer-seed-domain` forces it off, the default; omit to use `AWE_PREFER_SEED_DOMAIN`). Add `--log-file run.log` to also write a timestamped log file (off by default — no path, no file; see [Logging](#logging)). Add `--no-cache` to disable the on-by-default LLM-response cache (equivalently `AWE_LLM_CACHE=`). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
 
 ### Runnable example
 
-`examples/grants.py` is a runnable end-to-end demo and the reference for the `merge_extractions` hook. It defines a singular `Opportunity` plus an `Opportunities` **collection** schema, and extracts with the collection so a page can yield many opportunities. It seeds against a real Grants.gov page and, in gather-all mode, matches several linked NIH announcements; `Opportunities.merge_extractions` then folds them into one result using an **LLM dedup call** (`provider.extract(..., usage_tag="merge")`), which collapses records describing the same underlying opportunity and surfaces as a `"merge"` bucket in `usage_by_function`. It falls back to a deterministic link-dedup when no provider is available or the call fails. It also wires in the cache-stability `text_filters` from [examples/strippers.py](examples/strippers.py) to show how a caller supplies them. LLM caching is on by default, so nothing cache-related is wired in the example — run it twice and the second run's `usage_by_function` shows `0` calls across the board (screen/extract/score replay per unchanged page, and the merge replays because every contributing page hit the cache). Delete `data/llm_cache.sqlite`, or pass `Extractor(..., cache=None)`, to force a cold crawl.
+`examples/grants.py` is a runnable end-to-end demo. It defines a singular `Opportunity` plus an `Opportunities` **collection** schema, and extracts with the collection so the one extraction can return many opportunities. It seeds against a real Grants.gov page, collects several linked NIH announcement pages that pass screening, and extracts them all in a single pass over the concatenated content. It also wires in the cache-stability `text_filters` from [examples/strippers.py](examples/strippers.py) to show how a caller supplies them. LLM caching is on by default, so nothing cache-related is wired in the example — run it twice and the second run's `usage_by_function` shows `0` calls across the board (screen/score replay per unchanged page, and the consolidated extraction replays because every contributing page hit the cache). Delete `data/llm_cache.sqlite`, or pass `Extractor(..., cache=None)`, to force a cold crawl.
 
 ```bash
 uv run python examples/grants.py
 ```
 
-Seed: `https://simpler.grants.gov/opportunity/24a2e68b-9105-4fc8-8432-7ddff3e3afb8`. Sample output (truncated) — the several matched pages collapse to one canonical opportunity:
+Seed: `https://simpler.grants.gov/opportunity/24a2e68b-9105-4fc8-8432-7ddff3e3afb8`. Sample output (truncated) — every screened-in page is pooled into one extraction:
 
 ```json
 {
@@ -404,16 +409,16 @@ Seed: `https://simpler.grants.gov/opportunity/24a2e68b-9105-4fc8-8432-7ddff3e3af
     {"url": "https://simpler.grants.gov/opportunity/24a2e68b-...", "match": true, "reason": "..."}
   ],
   "protocol": "openai",
+  "content_tokens": 14820,
+  "extraction_input_tokens": 14820,
+  "summarized": false,
   "usage_by_function": {
     "screen":      {"model": "gemma-4-26b-a4b-it", "input_tokens": 8637,  "output_tokens": 247,  "calls": 5, "cached_input_tokens": 6816},
     "score_links": {"model": "gemma-4-26b-a4b-it", "input_tokens": 10581, "output_tokens": 5994, "calls": 4, "cached_input_tokens": 8480},
-    "extract":     {"model": "gemma-4-26b-a4b-it", "input_tokens": 16783, "output_tokens": 410,  "calls": 2, "cached_input_tokens": 16736},
-    "merge":       {"model": "gemma-4-26b-a4b-it", "input_tokens": 593,   "output_tokens": 289,  "calls": 1, "cached_input_tokens": 224}
+    "extract":     {"model": "gemma-4-26b-a4b-it", "input_tokens": 14820, "output_tokens": 512,  "calls": 1, "cached_input_tokens": 0}
   }
 }
 ```
-
-(For a pure-Python merge instead, drop the `provider.extract` call and reconcile the records in code — the `"merge"` bucket then won't appear. The merge call itself is memoized by the Extractor, so `merge_extractions` needs no cache logic of its own.)
 
 Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your provider's equivalent) — see Configuration. The example's models default to `AWE_MODEL_EXTRACT` / `AWE_MODEL_SCREEN`; point these at models your key can actually access.
 
@@ -428,9 +433,11 @@ Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your pr
 | Pre-screen model     | `AWE_MODEL_SCREEN`    | `gpt-5.4-mini`         |
 | HTML→MD normalize    | `AWE_NORMALIZE`       | `true`                 |
 | Follow linked PDFs   | `AWE_FOLLOW_PDF`      | `true`                 |
-| Max page fetches     | `AWE_MAX_FETCHES`     | `10`                   |
-| Stop at first match  | `AWE_STOP_ON_FIRST_MATCH` | `false` (gather all + merge) |
-| Seed is content      | `AWE_SEED_IS_CONTENT` | `false` (true = skip screen + link-scoring, extract the seed page directly) |
+| Max page fetches     | `AWE_MAX_FETCHES`     | `10` (per seed)        |
+| Extraction context budget | `AWE_MAX_CONTEXT_TOKENS` | `128000` (over it → summarize to fit) |
+| Wave concurrency / beam width | `AWE_MAX_WORKERS` | `8` (1 = sequential best-first) |
+| Token-count encoding | `AWE_TIKTOKEN_ENCODING` | `o200k_base` (fallback for models tiktoken doesn't know) |
+| Seed is content      | `AWE_SEED_IS_CONTENT` | `false` (true = skip screen + link-scoring, extract the seeds directly) |
 | Prefer seed domain   | `AWE_PREFER_SEED_DOMAIN` | `false` (true = LLM disfavors off-domain pages/links) |
 | LLM-response cache   | `AWE_LLM_CACHE`       | `data/llm_cache.sqlite` (on; empty = disable) |
 | Log file path        | `AWE_LOG_FILE`        | empty (off; set a path to enable) |
@@ -447,7 +454,7 @@ Enable it via env (`AWE_LOG_FILE=run.log`), the CLI (`--log-file run.log`), or t
 Extractor(schema=..., criteria=..., log_file="run.log")  # "" or omit = no file
 ```
 
-`AWE_MAX_FETCHES` is the main traversal knob in v0. Depth limits and link-relevance thresholds are intentionally **not** user-configurable — the budget is the main lever and the LLM's link scoring is the navigation policy. The only exception is the opt-in soft same-domain preference (`AWE_PREFER_SEED_DOMAIN`, a single on/off knob), which feeds the LLM an on-domain signal and asks it to disfavor off-domain content but never excludes a link.
+`AWE_MAX_FETCHES` (per seed) is the main traversal knob. Depth limits and link-relevance thresholds are intentionally **not** user-configurable — the budget is the main lever and the LLM's link scoring is the navigation policy. `AWE_MAX_WORKERS` is a concurrency knob (wave/beam width), not a relevance policy: best-first ordering holds within each wave. The opt-in soft same-domain preference (`AWE_PREFER_SEED_DOMAIN`, a single on/off knob) feeds the LLM an on-domain signal and asks it to disfavor off-domain content but never excludes a link.
 
 ## Project layout
 
@@ -457,7 +464,9 @@ agentic_web_extraction/
     cli.py               # Typer CLI: `extract` subcommand
     config.py            # AWE_* settings (pydantic-settings)
     cache.py             # KVCache protocol + SqliteKVCache + content-hash helpers (on-by-default LLM cache)
-    extractor.py         # Extractor: frontier loop
+    extractor.py         # Extractor: parallel-wave frontier loop + consolidated extraction
+    summarize.py         # criteria-aware map-reduce summarization (fit to context budget)
+    tokens.py            # tiktoken-backed token counting + token-aware splitting
     fetch.py             # httpx (plain, no HTTP cache) + tenacity retry
     logsink.py           # shared stderr + optional timestamped log-file sink
     frontier.py          # best-first heap + visited set + PSL registrable-domain (tldextract)
@@ -467,7 +476,7 @@ agentic_web_extraction/
         __init__.py      # Provider protocol + factory
         openai_provider.py
 examples/
-    grants.py            # reference Opportunity + Opportunities schema (merge_extractions demo)
+    grants.py            # reference Opportunity + Opportunities list-container schema
     strippers.py         # example cache-stability text_filters (site-specific; kept out of the package)
 pyproject.toml           # uv project, Python ≥3.13
 scripts/
@@ -500,11 +509,13 @@ v0 done:
 - [x] Visited-set / dedupe (URL canonicalization; dedup on push and pop)
 - [x] Budget accounting + `stopped_reason` plumbing
 - [x] Path recording in result metadata
-- [x] Batch mode (`Extractor.extract_batch`; the LLM cache persists across seeds and runs)
-- [x] On-by-default content-addressed LLM cache (`SqliteKVCache` at `AWE_LLM_CACHE`, swappable via the `KVCache` protocol; replays screen/extract/score — and the merge, when every contributing page is unchanged — with no LLM calls)
-- [x] Multi-match gather + `merge_extractions` hook (accumulate every matching page within budget, then merge)
+- [x] Multi-seed pooling (pass a list of seeds into one shared frontier; budget is per seed; a URL reachable from several seeds is screened once; the LLM cache persists across seeds and runs)
+- [x] Consolidate-then-extract (concatenate every screened-in page and run one structured extraction over the whole thing — no per-page extraction, no merge/dedup)
+- [x] Fit-or-summarize (`max_context_tokens`; over budget, a criteria-aware map-reduce on the screen model compresses the content to fit, via tiktoken chunking)
+- [x] Parallel-wave traversal (`max_workers`; pop the top-N frontier links and fetch/screen/score them concurrently, even on a single seed)
+- [x] On-by-default content-addressed LLM cache (`SqliteKVCache` at `AWE_LLM_CACHE`, swappable via the `KVCache` protocol; replays per-page screen/score, per-chunk summaries, and the consolidated extraction — when every contributing page is unchanged — with no LLM calls)
 - [x] Caller-supplied `text_filters` (site-specific cache-stability strippers live in `examples/`, not the library)
 - [x] Opt-in soft same-domain preference (single `prefer_seed_domain` knob, off by default; LLM is fed an on-domain signal and asked to disfavor off-domain content; PSL-based registrable domain via `tldextract`)
-- [x] Opt-in direct extraction (single `seed_is_content` knob, off by default; treats the seed page as the content — skips the pre-screen and link-scoring, extracts just the seed, no discovery)
+- [x] Opt-in direct extraction (single `seed_is_content` knob, off by default; treats the seed pages as the content — skips the pre-screen and link-scoring, no discovery)
 - [x] `examples/` directory with reference schemas and filters (`examples/grants.py`, `examples/strippers.py`, kept out of the package)
 - [x] Weekly org adoption scan (`scripts/adopters.py` + `.github/workflows/adopters.yml`; index-independent repo/tree sweep → shields badges in the [Adopters](#adopters) block, hard-fails and reports coverage rather than committing a silent undercount)

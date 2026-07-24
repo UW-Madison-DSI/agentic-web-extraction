@@ -1,19 +1,20 @@
 """Reference schema + runnable example for grant extraction.
 
-Demonstrates the optional ``merge_extractions`` hook. The seed page and the
-pages it links to each describe a grant, so a gather-all traversal produces
-several matches; ``Opportunities.merge_extractions`` folds them into one
-deduplicated result using the LLM (with a pure-Python fallback).
+The crawler screens pages during a best-first traversal, then concatenates the
+markdown of *every* screened-in page (across all seeds) and runs a **single**
+structured extraction over the whole thing — so `Opportunities` is just a list
+container the one extraction fills. No per-page extraction, no merge/dedup step.
 
 LLM-call caching is on by default (SQLite at ``AWE_LLM_CACHE``), so a second run
-over unchanged pages replays every screen/extract/score/merge result with no LLM
-calls -- nothing to wire up here; see ``main``.
+over unchanged pages replays every screen/score result and the consolidated
+extraction with no LLM calls -- nothing to wire up here; see ``main``.
 
 Run as a script (uses the defaults below):
 
     uv run python examples/grants.py
 
-Run via the CLI (same schema, override seed/criteria as needed):
+Run via the CLI (same schema, override seed/criteria as needed; repeat
+``--seed-url`` to pool several seeds into one extraction):
 
     uv run awe extract \\
         --schema examples/grants.py:Opportunities \\
@@ -26,12 +27,8 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import TYPE_CHECKING, ClassVar
 
 from pydantic import BaseModel, Field
-
-if TYPE_CHECKING:
-    from agentic_web_extraction.providers import Provider
 
 DEFAULT_SEED_URL = (
     "https://simpler.grants.gov/opportunity/24a2e68b-9105-4fc8-8432-7ddff3e3afb8"
@@ -41,16 +38,6 @@ DEFAULT_CRITERIA = (
     "with title, deadline, eligibility, and sponsor information."
 )
 DEFAULT_MAX_FETCHES = 5
-
-_DEDUP_INSTRUCTIONS = (
-    "TASK: The RECORDS below are grant/funding opportunities extracted from several "
-    "pages of one crawl. Some records describe the SAME underlying opportunity seen "
-    "on different pages (e.g. a Grants.gov listing and the sponsor's own announcement, "
-    "or the same program across years). Return EXACTLY ONE canonical record per "
-    "distinct opportunity. When collapsing duplicates, prefer non-null and more "
-    "specific values, keep the sponsor's own page as `link` when available, and keep "
-    "titles concise. Do NOT invent opportunities not present in the input."
-)
 
 
 class Opportunity(BaseModel):
@@ -62,84 +49,19 @@ class Opportunity(BaseModel):
 
 
 class Opportunities(BaseModel):
-    """Per-page extraction container: every opportunity found on one page.
+    """Extraction container: every opportunity found across the crawl.
 
     Passing this collection schema (not the singular ``Opportunity``) to the
-    Extractor is what lets a single page yield many opportunities — the
-    structured-output call fills one ``Opportunities`` object whose ``items``
-    list holds them all. Across a gather-all traversal you then get one
-    ``Opportunities`` per matching page, which ``merge_extractions`` fuses.
+    Extractor is what lets the single consolidated extraction return many
+    opportunities — the structured-output call fills one ``Opportunities`` object
+    whose ``items`` list holds every opportunity it found in the concatenated
+    content of all screened-in pages.
     """
 
     items: list[Opportunity] = Field(
         default_factory=list,
-        description="All distinct grant/funding opportunities described on the page.",
+        description="All distinct grant/funding opportunities described in the content.",
     )
-
-    # Optional hook the Extractor folds into the merge-cache key. The merge logic
-    # (and its dedup prompt) is opaque to the Extractor, so pointing the signature
-    # at `_DEDUP_INSTRUCTIONS` makes editing that prompt invalidate the cached
-    # merged result. A ClassVar so pydantic treats it as config, not a model field.
-    merge_signature: ClassVar[str] = _DEDUP_INSTRUCTIONS
-
-    @classmethod
-    def merge_extractions(
-        cls,
-        matches: list[tuple[str, Opportunities]],
-        *,
-        provider: Provider | None = None,
-    ) -> Opportunities:
-        """Fold every matching page's opportunities into one deduped collection.
-
-        LLM-based: flatten all per-page opportunities, then ask the extraction
-        model to collapse records that describe the same underlying opportunity.
-        The dedup call is tagged ``usage_tag="merge"`` so its tokens show up under
-        a ``"merge"`` bucket in ``result.usage_by_function``.
-
-        Falls back to a cheap deterministic dedup (by ``link``, backfilling null
-        fields) when no provider is supplied, when there is nothing to reconcile,
-        or when the LLM call fails.
-
-        No caching here: the Extractor memoizes this whole call, replaying the
-        merged result with zero LLM calls when every contributing page hit the
-        page cache (i.e. was unchanged). Editing ``_DEDUP_INSTRUCTIONS`` busts that
-        memo via the ``merge_signature`` ClassVar above. See
-        ``Extractor._merge_cached``.
-        """
-        flat = [opp for _url, extracted in matches for opp in extracted.items]
-        if provider is None or len(flat) <= 1:
-            return cls(items=_dedup_by_link(flat))
-
-        payload = f"{_DEDUP_INSTRUCTIONS}\n\nRECORDS ({len(flat)}):\n" + json.dumps(
-            [o.model_dump() for o in flat], indent=2, ensure_ascii=False
-        )
-        try:
-            merged = provider.extract(payload, cls, usage_tag="merge")
-        except Exception as e:  # noqa: BLE001 - degrade to deterministic dedup
-            print(
-                f"  [merge] LLM dedup failed ({type(e).__name__}); using URL dedup",
-                file=sys.stderr,
-            )
-            return cls(items=_dedup_by_link(flat))
-        if isinstance(merged, cls):
-            return merged
-        return cls(items=_dedup_by_link(flat))
-
-
-def _dedup_by_link(opps: list[Opportunity]) -> list[Opportunity]:
-    """Deterministic fallback: collapse by ``link``, backfilling null/empty fields."""
-    by_link: dict[str, Opportunity] = {}
-    for opp in opps:
-        existing = by_link.get(opp.link)
-        if existing is None:
-            by_link[opp.link] = opp
-            continue
-        filled = existing.model_dump()
-        for field, value in opp.model_dump().items():
-            if filled.get(field) in (None, "") and value not in (None, ""):
-                filled[field] = value
-        by_link[opp.link] = Opportunity(**filled)
-    return list(by_link.values())
 
 
 def main() -> int:
@@ -159,18 +81,18 @@ def main() -> int:
     #
     # LLM-call caching is ON by default -- a SQLite store at AWE_LLM_CACHE
     # (data/llm_cache.sqlite). The first run populates it; re-running this script
-    # replays screen/extract/link-score outputs for unchanged pages, and the merge
-    # too when every contributing page hit the cache, with no LLM calls (watch
-    # `usage_by_function` drop to zero `calls` on the second run). Delete
+    # replays screen/link-score outputs for unchanged pages, and the consolidated
+    # extraction too when every contributing page hit the cache, with no LLM calls
+    # (watch `usage_by_function` drop to zero `calls` on the second run). Delete
     # data/llm_cache.sqlite to force a cold crawl, or pass `cache=None` to disable.
     extractor = Extractor(
         schema=Opportunities,
         criteria=DEFAULT_CRITERIA,
         text_filters=CACHE_STABILITY_FILTERS,
     )
-    result = extractor.extract(
-        seed_url=DEFAULT_SEED_URL, max_fetches=DEFAULT_MAX_FETCHES
-    )
+    # `extract` also accepts a list of seed URLs to pool more content into the one
+    # extraction, e.g. extractor.extract([url_a, url_b], max_fetches=5).
+    result = extractor.extract(DEFAULT_SEED_URL, max_fetches=DEFAULT_MAX_FETCHES)
     print(json.dumps(result.to_dict(), indent=2))
     return 0 if result.stopped_reason == "match" else 2
 

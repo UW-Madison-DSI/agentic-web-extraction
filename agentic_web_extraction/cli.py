@@ -8,6 +8,7 @@ from typing import Annotated
 import typer
 from pydantic import BaseModel
 
+from .config import get_settings
 from .extractor import Extractor
 
 app = typer.Typer(
@@ -70,24 +71,41 @@ def extract(
         ),
     ],
     seed_url: Annotated[
-        str,
-        typer.Option("--seed-url", help="URL to start traversal from."),
+        list[str],
+        typer.Option(
+            "--seed-url",
+            help=(
+                "URL to start traversal from. Repeat the flag to pass several "
+                "seeds; everything screened-in across all of them is pooled into "
+                "one extraction, and the fetch budget applies per seed."
+            ),
+        ),
     ],
     max_fetches: Annotated[
         int | None,
         typer.Option(
             "--max-fetches",
-            help="Fetch budget. Defaults to AWE_MAX_FETCHES (10).",
+            help="Fetch budget PER SEED. Defaults to AWE_MAX_FETCHES (10).",
         ),
     ] = None,
-    stop_on_first_match: Annotated[
-        bool | None,
+    max_context_tokens: Annotated[
+        int | None,
         typer.Option(
-            "--stop-on-first-match/--gather-all-matches",
+            "--max-context-tokens",
             help=(
-                "Stop as soon as one page matches, or spend the whole budget "
-                "gathering every match and merging them. Defaults to "
-                "AWE_STOP_ON_FIRST_MATCH (gather-all)."
+                "Input-token budget for the single consolidated extraction. If the "
+                "concatenated pages exceed it, they are summarized down first. "
+                "Defaults to AWE_MAX_CONTEXT_TOKENS (128000)."
+            ),
+        ),
+    ] = None,
+    max_workers: Annotated[
+        int | None,
+        typer.Option(
+            "--max-workers",
+            help=(
+                "Wave concurrency / beam width: how many top-scored links are "
+                "fetched/screened/scored at once. Defaults to AWE_MAX_WORKERS (8)."
             ),
         ),
     ] = None,
@@ -96,11 +114,10 @@ def extract(
         typer.Option(
             "--seed-is-content/--no-seed-is-content",
             help=(
-                "Treat the seed URL as the content to extract from directly: skip "
-                "pre-screening and link-scoring, extract the seed page, and stop "
-                "(no links are followed, so max-fetches is effectively 1). Use it "
-                "when each seed is already a known target page. Defaults to "
-                "AWE_SEED_IS_CONTENT (off)."
+                "Treat every seed URL as content to extract from directly: skip "
+                "pre-screening and link-scoring, then consolidate and extract the "
+                "seed pages (no links are followed). Use it when each seed is "
+                "already a known target page. Defaults to AWE_SEED_IS_CONTENT (off)."
             ),
         ),
     ] = None,
@@ -144,6 +161,15 @@ def extract(
 ) -> None:
     model = load_schema(schema)
     criterion = load_criteria(criteria)
+    # Apply the two settings-only knobs from the CLI via a copy of the base
+    # settings (leaving the cached singleton untouched); everything else keeps its
+    # AWE_* / env default.
+    overrides: dict[str, int] = {}
+    if max_context_tokens is not None:
+        overrides["max_context_tokens"] = max_context_tokens
+    if max_workers is not None:
+        overrides["max_workers"] = max_workers
+    settings = get_settings().model_copy(update=overrides) if overrides else None
     # Don't pass `cache` unless disabling: omitting it lets the Extractor build the
     # on-by-default store; `cache=None` is the explicit off switch.
     cache_kwargs = {"cache": None} if no_cache else {}
@@ -151,13 +177,13 @@ def extract(
         schema=model,
         criteria=criterion,
         prefer_seed_domain=prefer_seed_domain,
+        settings=settings,
         log_file=log_file,
         **cache_kwargs,
     )
     result = extractor.extract(
-        seed_url=seed_url,
+        seed_url,
         max_fetches=max_fetches,
-        stop_on_first_match=stop_on_first_match,
         seed_is_content=seed_is_content,
     )
     typer.echo(json.dumps(result.to_dict(), indent=2))

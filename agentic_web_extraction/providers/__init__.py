@@ -53,6 +53,10 @@ class Provider(Protocol):
         on_seed_domain: dict[str, bool | None] | None = None,
     ) -> list[tuple[str, float]]: ...
 
+    def summarize(
+        self, text: str, criterion: str, *, usage_tag: str = "summarize"
+    ) -> str: ...
+
     def extract(
         self, page_md: str, schema: type[BaseModel], *, usage_tag: str = "extract"
     ) -> BaseModel: ...

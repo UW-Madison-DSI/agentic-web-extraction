@@ -1,13 +1,14 @@
 """Generic, schema-agnostic caching support for the crawler.
 
 The frontier loop is the only place that knows, per page, the normalized content
-and the three LLM outputs derived from it (screen verdict, extracted data, link
-scores), so page caching has to hook here. This module defines only the cache
-*interface* and content-hashing helpers; the concrete persistent store is
-supplied by the caller (so storage-path policy stays out of the crawler), and no
-domain knowledge lives here — extracted data is round-tripped as a plain dict via
-the caller's schema, and the caller's `merge_extractions` uses the same generic
-store for its own (domain-specific) caching.
+and the two LLM outputs derived from it (screen verdict, link scores), so page
+caching has to hook here. Extraction happens once, over the concatenated content
+of every screened-in page, so its cache is keyed on the *set* of contributing
+pages (see `extract_cache_key`). This module defines only the cache *interface*
+and content-hashing helpers; the concrete persistent store is supplied by the
+caller (so storage-path policy stays out of the crawler), and no domain knowledge
+lives here — the extracted object is round-tripped as opaque JSON via the caller's
+schema.
 """
 
 from __future__ import annotations
@@ -41,9 +42,10 @@ class SqliteKVCache:
     On by default (the Extractor builds one at `AWE_LLM_CACHE` unless the caller
     passes their own store or disables caching), so the storage policy lives here
     rather than in the crawler. Persisting across runs is the whole point -- an
-    unchanged page replays its screen/extract/link-score outcomes (and a merge whose
-    inputs all hit the cache) with zero LLM calls. A composite primary key keeps
-    namespaces from colliding, and `INSERT .. ON CONFLICT` makes a re-`put` idempotent.
+    unchanged page replays its screen/link-score outcomes (and the consolidated
+    extraction replays when every contributing page hit the cache) with zero LLM
+    calls. A composite primary key keeps namespaces from colliding, and
+    `INSERT .. ON CONFLICT` makes a re-`put` idempotent.
     No domain knowledge lives here: values are opaque JSON strings the caller round-
     trips through its own schema.
     """
@@ -82,22 +84,24 @@ class SqliteKVCache:
 
 
 PAGE_NAMESPACE = "page"
-MERGE_NAMESPACE = "merge"
+# The single consolidated extraction, keyed on the set of contributing pages.
+EXTRACT_NAMESPACE = "extract"
+# Per-chunk criteria-aware summaries produced when the concatenation overflows.
+SUMMARY_NAMESPACE = "summary"
 
 
 @dataclass
 class CachedPage:
-    """The cached, LLM-derived outcome for one page at a given content hash.
+    """The cached, LLM-derived traversal outcome for one page at a content hash.
 
-    `extracted` is the extraction schema's `model_dump(mode="json")` (or None when
-    the page did not match the screen); `link_scores` is the scorer's output as
-    `[url, score]` pairs. Everything is JSON-native so the store need not know the
-    caller's schema.
+    Extraction is no longer per-page (it runs once over the concatenated content
+    of every screened-in page), so only the two traversal decisions are cached
+    here: the screen verdict and the scorer's `[url, score]` link pairs.
+    Everything is JSON-native so the store need not know the caller's schema.
     """
 
     screen_match: bool
     screen_reason: str
-    extracted: dict | None = None
     link_scores: list[list] = field(default_factory=list)
 
     def to_json(self) -> str:
@@ -109,7 +113,6 @@ class CachedPage:
         return cls(
             screen_match=d["screen_match"],
             screen_reason=d.get("screen_reason", ""),
-            extracted=d.get("extracted"),
             link_scores=d.get("link_scores") or [],
         )
 
@@ -124,32 +127,22 @@ def content_hash(markdown: str) -> str:
     return hashlib.sha256(markdown.encode("utf-8")).hexdigest()
 
 
-def merge_cache_key(page_cache_keys: Sequence[str]) -> str:
-    """Cache key for a merged result, derived from its contributing pages' keys.
+def extract_cache_key(page_cache_keys: Sequence[str]) -> str:
+    """Fingerprint of the *set* of pages feeding the one consolidated extraction.
 
-    The merge is a pure function of the per-page extractions it folds together, and
-    each page's `page` cache key already embeds everything that determines its
-    extraction (content hash + version stamp + URL + seed-domain signal). Hashing the
-    *set* of those keys therefore means the merge replays from cache exactly when
-    every contributing page is unchanged (i.e. hit the page cache): change, add, or
-    drop any source page and its key changes, so the merge key misses and the LLM
-    dedup re-runs. Sorted so contributing order doesn't matter.
+    Extraction is a pure function of the concatenated (and possibly summarized)
+    content of every screened-in page, and each page's `page` cache key already
+    embeds everything that determines its content and screen outcome (content hash
+    + version stamp + URL + seed-domain signal). Hashing the *set* of those keys
+    therefore means the extraction replays from cache exactly when the same set of
+    pages with the same content recurs: change, add, or drop any source page and
+    its key changes, so this key misses and the extraction re-runs. Sorted so the
+    order pages were gathered in (nondeterministic under parallel waves) doesn't
+    matter. The Extractor prefixes this with the version stamp and the context/
+    encoding settings, which govern the summarize-or-not decision.
     """
     material = "\x00".join(sorted(page_cache_keys))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
-
-
-def merge_signature_stamp(merge_signature: str) -> str:
-    """Short hash of a schema's optional `merge_signature`, for the merge-cache key.
-
-    The schema's merge logic (and any prompt it sends) is opaque to the Extractor,
-    so a schema exposes a `merge_signature` string describing its merge behavior --
-    typically the dedup instruction text itself, so editing the prompt changes the
-    signature. Hashing keeps the key compact regardless of the signature's length.
-    Only called for a non-empty signature; an absent one leaves the merge key in its
-    prior shape so existing entries still hit.
-    """
-    return hashlib.sha256(merge_signature.encode("utf-8")).hexdigest()[:16]
 
 
 def page_cache_version(
