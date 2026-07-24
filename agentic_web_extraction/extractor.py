@@ -1,7 +1,9 @@
-import inspect
 import json
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from functools import partial
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel
@@ -9,21 +11,27 @@ from pydantic import BaseModel
 from . import fetch as fetch_module
 from . import logsink
 from .cache import (
-    MERGE_NAMESPACE,
+    EXTRACT_NAMESPACE,
     PAGE_NAMESPACE,
     CachedPage,
     KVCache,
     SqliteKVCache,
     content_hash,
-    merge_cache_key,
-    merge_signature_stamp,
+    extract_cache_key,
     page_cache_version,
 )
 from .config import Settings, get_settings
-from .frontier import Frontier, registrable_domain, same_registrable_domain
+from .fetch import FetchedPage
+from .frontier import Frontier, canonical, registrable_domain
 from .normalize import TextFilter, extract_links, to_markdown
 from .providers import Provider, get_provider
 from .result import ExtractionResult, PageVerdict, StoppedReason, Usage
+from .summarize import fit_pages
+
+# Sentinel score for seed URLs: above the 0..1 range a link scorer can return, so
+# every seed is popped (and fetched) before any discovered link, regardless of how
+# many seeds there are.
+SEED_SCORE = float("inf")
 
 
 class _DefaultCache:
@@ -36,6 +44,22 @@ class _DefaultCache:
 
 
 _DEFAULT_CACHE = _DefaultCache()
+
+
+@dataclass
+class _PageOutcome:
+    """What a worker thread computes for one popped URL, folded back on the main
+    thread (which owns the frontier). Carries no frontier mutations."""
+
+    requested_url: str
+    page: FetchedPage
+    readable: bool = False  # HTML/PDF body → consumes a budget slot
+    has_verdict: bool = False  # a screen result (live or cached) was produced
+    screen_match: bool = False
+    screen_reason: str = ""
+    page_md: str | None = None  # normalized content, kept only when matched
+    cache_key: str | None = None
+    link_scores: list[list] = field(default_factory=list)
 
 
 class Extractor:
@@ -69,11 +93,11 @@ class Extractor:
         )
         # Soft same-domain preference (see Settings.prefer_seed_domain). When True,
         # the screen and link-scorer calls are told the seed/page URL and a
-        # Python-computed on_seed_domain signal, with an instruction to disfavor
+        # Python-computed on_seed_domain signal (generalized to "on ANY seed's
+        # registrable domain" for multi-seed runs), with an instruction to disfavor
         # off-domain content -- the model applies its own judgment; nothing is
-        # excluded. Off by default. Unlike the raw LLM score, this signal does feed
-        # the model, so a crawl's seed domain is mixed into the page-cache key when
-        # it's on (see extract()).
+        # excluded. Off by default. This signal feeds the model, so the set of seed
+        # domains is mixed into the page-cache key when it's on (see extract()).
         self.prefer_seed_domain = (
             prefer_seed_domain
             if prefer_seed_domain is not None
@@ -121,389 +145,433 @@ class Extractor:
 
     def extract(
         self,
-        seed_url: str,
+        seeds: str | Sequence[str],
         max_fetches: int | None = None,
         *,
-        stop_on_first_match: bool | None = None,
         seed_is_content: bool | None = None,
     ) -> ExtractionResult:
-        budget = max_fetches if max_fetches is not None else self.settings.max_fetches
-        stop_first = (
-            stop_on_first_match
-            if stop_on_first_match is not None
-            else self.settings.stop_on_first_match
-        )
-        # Direct mode: the caller asserts the seed page *is* the content to extract,
-        # so skip pre-screening (treat it as a guaranteed match) and link-scoring (queue
-        # no outgoing links). With nothing pushed after the seed, the frontier empties
-        # and the crawl stops after the one page -- see the screen/score gates below.
+        """Traverse from one or more seeds, then run a single consolidated extraction.
+
+        Every seed is pushed into one shared frontier; the budget is
+        ``max_fetches`` *per seed* (so ``max_fetches * len(seeds)`` total). The
+        frontier is processed in parallel waves. The normalized markdown of every
+        page that passes screening (across all seeds) is concatenated and, if it
+        exceeds ``max_context_tokens``, summarized down; then one extraction runs
+        over the whole thing. `seeds` accepts a single URL string or a sequence.
+        """
+        seed_list = [seeds] if isinstance(seeds, str) else list(seeds)
+        if not seed_list:
+            raise ValueError("extract requires at least one seed URL")
+        per_seed = max_fetches if max_fetches is not None else self.settings.max_fetches
+        budget = per_seed * len(seed_list)
+        # Direct mode: the caller asserts each seed page *is* the content, so skip
+        # pre-screening (guaranteed match) and link-scoring (no expansion). With no
+        # links queued the frontier empties after the seeds.
         direct = (
             seed_is_content
             if seed_is_content is not None
             else self.settings.seed_is_content
         )
-        frontier = Frontier()
-        frontier.push(seed_url, score=1.0, source="seed")
 
-        # Registrable domain of the seed, used to compute the on_seed_domain signal
-        # fed to the screen/score LLM calls when `prefer_seed_domain` is on. Empty
-        # when the seed host is unparseable, which yields an "unknown" signal.
-        seed_domain = registrable_domain(urlsplit(seed_url).netloc)
+        # Registrable domains of all seeds, for the on_seed_domain signal fed to the
+        # screen/score calls when prefer_seed_domain is on. A page/link is "on
+        # domain" if it shares ANY seed's registrable domain. `seed_ref` is the
+        # human-readable SEED context shown to the model.
+        seed_domains = frozenset(
+            d for d in (registrable_domain(urlsplit(u).netloc) for u in seed_list) if d
+        )
+        seed_ref = " ".join(seed_list)
+
+        frontier = Frontier()
+        for seed in seed_list:
+            frontier.push(seed, score=SEED_SCORE, source="seed")
+
+        self._log(
+            f"[traverse] {len(seed_list)} seed(s), budget={budget} "
+            f"({per_seed}/seed), workers={self.settings.max_workers}"
+        )
 
         path: list[str] = []
         pages_fetched = 0
         verdicts: list[PageVerdict] = []
         usage_by_function_at_start = self.provider.usage_by_function
-        matches: list[tuple[str, BaseModel]] = []
-        # Page cache key of each matched page, in match order. These feed the merge
-        # cache key so the merge replays only when every contributing page is
-        # unchanged (see cache.merge_cache_key).
-        matched_keys: list[str] = []
+        # Screened-in pages feeding the one extraction: (resolved_url, markdown,
+        # page_cache_key). Deduped on resolved URL via `resolved_seen`.
+        matched_pages: list[tuple[str, str, str]] = []
+        # Canonical resolved URLs already folded, so two requests that redirect to
+        # the same target (or a later pop of an already-resolved URL) count once.
+        resolved_seen: set[str] = set()
 
-        while pages_fetched < budget:
-            popped = frontier.pop()
-            if popped is None:
-                break
-            url, _score, _source = popped
+        worker = partial(
+            self._process_page,
+            seed_ref=seed_ref,
+            seed_domains=seed_domains,
+            direct=direct,
+        )
 
-            self._log(
-                f"  [page {pages_fetched + 1}/{budget}] (score={_score:.2f}) {url}"
-            )
-            fetch_t0 = time.monotonic()
-            try:
-                page = fetch_module.fetch(url)
-            except Exception as e:
-                self._log(f"    ! fetch failed on {url}: {type(e).__name__}: {e}")
-                frontier.mark_visited(url)
-                continue
-            self._log(
-                f"    [fetch] kind={page.kind} elapsed={time.monotonic() - fetch_t0:.2f}s"
-            )
-            frontier.mark_visited(url)
-            # A fetch can redirect, and distinct requested URLs (classically
-            # `/foo` and `/foo/`) can resolve to the same final page. If this
-            # run already processed the resolved URL, skip it so no page is
-            # fetched-through-to-screen, counted, cached, or path-listed twice.
-            if page.url != url and frontier.is_visited(page.url):
-                self._log(f"    [dedup] {url} resolved to already-seen {page.url}")
-                continue
-            frontier.mark_visited(page.url)
-            path.append(page.url)
-
-            # A page we couldn't actually read -- a fetch error, or a non-HTML/PDF
-            # content type -- triggers no screen/extract/score LLM work, so it does
-            # NOT consume a `max_fetches` slot. The budget caps the pages we spend
-            # model calls on, not raw fetch attempts, so a run of dead links or
-            # binary files can't starve the crawl of real pages. It's still
-            # recorded in `path` (it was visited) and marked so it isn't retried.
-            if page.kind in ("skipped", "error"):
-                continue
-            pages_fetched += 1
-
-            try:
-                page_md = (
-                    to_markdown(
-                        page.raw_bytes,
-                        page.content_type,
-                        url=page.url,
-                        text_filters=self.text_filters,
-                    )
-                    if self.normalize_html or page.kind == "pdf"
-                    else page.text
+        with ThreadPoolExecutor(max_workers=max(1, self.settings.max_workers)) as pool:
+            while pages_fetched < budget:
+                batch = self._pop_batch(
+                    frontier, min(self.settings.max_workers, budget - pages_fetched)
                 )
-            except Exception as e:
-                self._log(
-                    f"    ! normalize failed on {page.url}: {type(e).__name__}: {e}"
-                )
-                continue
+                if not batch:
+                    break
+                # Reserve every popped URL against re-popping, then snapshot the
+                # known set for workers to pre-filter links against.
+                for url, _score, _source in batch:
+                    frontier.mark_visited(url)
+                known = frontier.snapshot()
+                outcomes = pool.map(partial(worker, known=known), batch)
 
-            # Content-addressed cache: if this exact page content was screened,
-            # extracted, and scored on a prior run, replay those outcomes with no
-            # LLM calls. The version stamp is mixed into the key so a criterion/
-            # schema/model change misses. We still fetched (above) to get here, so
-            # `pages_fetched` and the budget are unaffected.
-            # When the same-domain preference is on, the screen verdict and link
-            # scores depend on the seed's registrable domain (via on_seed_domain),
-            # so it's mixed into the key. The default (off) path keeps the exact
-            # key shape it had before, so existing cache entries still hit.
-            # Build the key from optional segments so the default (both off) path is
-            # byte-identical to before and existing entries still hit. `direct` adds a
-            # `:direct` segment because it changes what's stored (screen forced to a
-            # match, no link scores), so a direct entry must not collide with a
-            # screened one for the same page content.
-            key_prefix = self._cache_version
-            if self.prefer_seed_domain:
-                key_prefix = f"{key_prefix}:seeddom={seed_domain}"
-            if direct:
-                key_prefix = f"{key_prefix}:direct"
-            cache_key = f"{key_prefix}:{content_hash(page_md)}:{page.url}"
-            cached_raw = (
-                self.cache.get(PAGE_NAMESPACE, cache_key)
-                if self.cache is not None
-                else None
-            )
-            if cached_raw is not None:
-                cached = CachedPage.from_json(cached_raw)
-                self._log(f"    [cache] hit {page.url}")
-                verdicts.append(
-                    PageVerdict(
-                        url=page.url,
-                        match=cached.screen_match,
-                        reason=cached.screen_reason,
-                    )
-                )
-                if cached.screen_match and cached.extracted is not None:
-                    try:
-                        data = self.schema.model_validate(cached.extracted)
-                    except Exception as e:
+                for outcome in outcomes:
+                    page = outcome.page
+                    rurl = canonical(page.url)
+                    if rurl in resolved_seen:
                         self._log(
-                            f"    ! cached extract invalid on {page.url}: "
-                            f"{type(e).__name__}: {e}"
+                            f"    [dedup] {outcome.requested_url} → already-seen "
+                            f"{page.url}"
                         )
-                    else:
-                        matches.append((page.url, data))
-                        matched_keys.append(cache_key)
-                for link_url, score in cached.link_scores:
-                    frontier.push(link_url, score=score, source=page.url)
-                continue
-
-            stage_error = (
-                False  # don't cache a page whose LLM stages hit a transient error
-            )
-            if direct:
-                # Direct mode: skip the pre-screen and take the seed page as a match.
-                screen_match = True
-                screen_reason = (
-                    "seed_is_content: screening skipped, page treated as a match"
-                )
-            else:
-                # When the same-domain preference is on, hand the screen call the
-                # seed/page URL and the Python-computed on-domain signal so it can
-                # disfavor off-domain pages; otherwise call it exactly as before.
-                screen_kwargs: dict = {}
-                if self.prefer_seed_domain:
-                    screen_kwargs = {
-                        "page_url": page.url,
-                        "seed_url": seed_url,
-                        "on_seed_domain": same_registrable_domain(
-                            page.url, seed_domain
-                        ),
-                    }
-                try:
-                    verdict = self.provider.screen(
-                        page_md, self.criteria, **screen_kwargs
-                    )
-                except Exception as e:
-                    self._log(
-                        f"    ! screen failed on {page.url}: {type(e).__name__}: {e}"
-                    )
-                    continue
-                screen_match = verdict.match
-                screen_reason = verdict.reason
-            verdicts.append(
-                PageVerdict(url=page.url, match=screen_match, reason=screen_reason)
-            )
-            extracted_dump: dict | None = None
-            matched_here = False
-            if screen_match:
-                try:
-                    data = self.provider.extract(page_md, self.schema)
-                except Exception as e:
-                    self._log(
-                        f"    ! extract failed on {page.url}: {type(e).__name__}: {e}"
-                    )
-                    stage_error = True
-                else:
-                    matches.append((page.url, data))
-                    matched_keys.append(cache_key)
-                    extracted_dump = data.model_dump(mode="json")
-                    matched_here = True
-
-            # Early-exit mode: the caller asked to stop at the first successful
-            # match instead of spending the whole budget gathering every match.
-            # Skip link scoring, frontier expansion, and caching for this page --
-            # its cache record would be incomplete (no link scores) and could
-            # mislead a later gather-all run that replays it.
-            if matched_here and stop_first:
-                self._log(f"    [stop] first match on {page.url}; stopping traversal")
-                break
-
-            link_scores: list[list] = []
-            # Direct mode queues no links: the seed is the only page we want, so
-            # skip scoring and frontier expansion. With nothing pushed, the frontier
-            # empties after the seed and the crawl ends.
-            if page.kind == "html" and page.text and not direct:
-                outgoing = extract_links(page.text, base_url=page.url)
-                fresh = [
-                    (text, link)
-                    for text, link in outgoing
-                    if not frontier.is_visited(link)
-                ]
-                if fresh:
-                    # When the same-domain preference is on, annotate each link with
-                    # its on-domain signal so the scorer can disfavor off-domain
-                    # links; otherwise call it exactly as before.
-                    score_kwargs: dict = {}
-                    if self.prefer_seed_domain:
-                        score_kwargs = {
-                            "seed_url": seed_url,
-                            "on_seed_domain": {
-                                link: same_registrable_domain(link, seed_domain)
-                                for _, link in fresh
-                            },
-                        }
-                    try:
-                        scores = self.provider.score_links(
-                            fresh, page_md, self.criteria, **score_kwargs
+                        continue
+                    resolved_seen.add(rurl)
+                    frontier.mark_visited(page.url)
+                    path.append(page.url)
+                    if not outcome.readable:
+                        continue
+                    pages_fetched += 1
+                    if outcome.has_verdict:
+                        verdicts.append(
+                            PageVerdict(
+                                url=page.url,
+                                match=outcome.screen_match,
+                                reason=outcome.screen_reason,
+                            )
                         )
-                    except Exception as e:
-                        self._log(
-                            f"    ! score_links failed on {page.url}: "
-                            f"{type(e).__name__}: {e}"
+                    if outcome.screen_match and outcome.page_md is not None:
+                        matched_pages.append(
+                            (page.url, outcome.page_md, outcome.cache_key or "")
                         )
-                        stage_error = True
-                    else:
-                        for link_url, score in scores:
-                            frontier.push(link_url, score=score, source=page.url)
-                            link_scores.append([link_url, score])
+                    for link_url, score in outcome.link_scores:
+                        frontier.push(link_url, score=score, source=page.url)
 
-            if self.cache is not None and not stage_error:
-                self.cache.put(
-                    PAGE_NAMESPACE,
-                    cache_key,
-                    CachedPage(
-                        screen_match=screen_match,
-                        screen_reason=screen_reason,
-                        extracted=extracted_dump,
-                        link_scores=link_scores,
-                    ).to_json(),
-                )
-
-        if matches:
-            merge = getattr(self.schema, "merge_extractions", None)
-            if callable(merge):
-                data = self._merge_cached(merge, matches, matched_keys)
-            else:
-                data = matches[0][1]
-            return self._result(
-                data=data,
-                stopped="match",
-                pages_fetched=pages_fetched,
-                path=path,
-                verdicts=verdicts,
-                usage_by_function_at_start=usage_by_function_at_start,
-            )
-
-        return self._result(
-            data=None,
-            stopped="budget_exhausted",
+        return self._consolidate_and_extract(
+            matched_pages=matched_pages,
             pages_fetched=pages_fetched,
             path=path,
             verdicts=verdicts,
             usage_by_function_at_start=usage_by_function_at_start,
         )
 
-    def _merge_cached(
+    @staticmethod
+    def _pop_batch(frontier: Frontier, n: int) -> list[tuple[str, float, str]]:
+        """Pop up to `n` top-scored links (main thread; frontier isn't concurrent)."""
+        batch: list[tuple[str, float, str]] = []
+        for _ in range(max(0, n)):
+            popped = frontier.pop()
+            if popped is None:
+                break
+            batch.append(popped)
+        return batch
+
+    def _on_any_seed_domain(
+        self, url: str, seed_domains: frozenset[str]
+    ) -> bool | None:
+        """True if `url`'s host shares any seed's registrable domain, False if not,
+        None if the host is missing/unparseable or no seed domain is known."""
+        host = urlsplit(url).netloc if url else ""
+        dom = registrable_domain(host)
+        if not dom or not seed_domains:
+            return None
+        return dom in seed_domains
+
+    def _process_page(
         self,
-        merge: Callable[..., BaseModel],
-        matches: list[tuple[str, BaseModel]],
-        matched_keys: list[str],
-    ) -> BaseModel:
-        """Replay the merge from cache when every contributing page hit the cache.
+        item: tuple[str, float, str],
+        *,
+        seed_ref: str,
+        seed_domains: frozenset[str],
+        direct: bool,
+        known: frozenset[str],
+    ) -> _PageOutcome:
+        """Worker: fetch → normalize → (cache | screen + score_links) for one URL.
 
-        The merge cache key is derived from the contributing pages' page-cache keys
-        (see cache.merge_cache_key), so it hits exactly when the same set of pages
-        with the same content produced the same per-page extractions -- i.e. every
-        source page was unchanged. On a hit we replay the stored merged object with
-        no LLM `merge` call; on a miss we run the merge and store its result.
-
-        The schema's merge logic is a black box to the Extractor, so its own prompt
-        (a dedup instruction, say) can't reach the key the way the provider's
-        `prompt_signature` does. To let a schema invalidate the merge cache when its
-        merge behavior changes, an optional `merge_signature` string on the schema is
-        folded into the key. A schema that omits it contributes an empty signature,
-        keeping its existing merge-key shape (so old entries still hit).
+        Runs on a pool thread. Does NO frontier mutation — it returns a
+        `_PageOutcome` the main thread folds back. Extraction is not done here; the
+        one consolidated extraction happens after the whole traversal.
         """
-        if self.cache is None or not matched_keys:
-            return self._merge(merge, matches)
+        url, score, _source = item
+        score_str = "seed" if score == SEED_SCORE else f"{score:.2f}"
+        self._log(f"  [page] (score={score_str}) {url}")
+        fetch_t0 = time.monotonic()
+        try:
+            page = fetch_module.fetch(url)
+        except Exception as e:
+            self._log(f"    ! fetch failed on {url}: {type(e).__name__}: {e}")
+            return _PageOutcome(
+                requested_url=url,
+                page=FetchedPage(
+                    url=url,
+                    status=0,
+                    content_type="",
+                    raw_bytes=b"",
+                    text="",
+                    kind="error",
+                ),
+            )
+        self._log(
+            f"    [fetch] kind={page.kind} elapsed={time.monotonic() - fetch_t0:.2f}s"
+        )
+        # A page we couldn't read (fetch error / non-HTML-PDF) does no LLM work and
+        # consumes no budget slot. The main thread still records it in `path`.
+        if page.kind in ("skipped", "error"):
+            return _PageOutcome(requested_url=url, page=page)
 
-        merge_sig = getattr(self.schema, "merge_signature", "") or ""
-        # Only insert the merge-signature segment when the schema actually declares
-        # one, so a schema without `merge_signature` keeps the exact key shape it
-        # had before and its existing merge-cache entries still hit.
-        if merge_sig:
-            merge_key = (
-                f"{self._cache_version}:{merge_signature_stamp(merge_sig)}:"
-                f"{merge_cache_key(matched_keys)}"
+        try:
+            page_md = (
+                to_markdown(
+                    page.raw_bytes,
+                    page.content_type,
+                    url=page.url,
+                    text_filters=self.text_filters,
+                )
+                if self.normalize_html or page.kind == "pdf"
+                else page.text
+            )
+        except Exception as e:
+            self._log(f"    ! normalize failed on {page.url}: {type(e).__name__}: {e}")
+            return _PageOutcome(requested_url=url, page=page, readable=True)
+
+        # Content-addressed cache: replay a prior run's screen verdict + link scores
+        # for this exact page content with no LLM calls. Key segments are optional so
+        # the default (both off) path keeps a stable, crawl-independent shape:
+        #  - seeddom=<sorted seed domains> when prefer_seed_domain is on (the verdict
+        #    and scores depend on the on_seed_domain signal, which depends on the
+        #    seed set);
+        #  - :direct when seed_is_content is on (screen is forced to a match and no
+        #    links are scored, so it must not collide with a screened entry).
+        key_prefix = self._cache_version
+        if self.prefer_seed_domain:
+            key_prefix = f"{key_prefix}:seeddom={','.join(sorted(seed_domains))}"
+        if direct:
+            key_prefix = f"{key_prefix}:direct"
+        cache_key = f"{key_prefix}:{content_hash(page_md)}:{page.url}"
+        cached_raw = (
+            self.cache.get(PAGE_NAMESPACE, cache_key)
+            if self.cache is not None
+            else None
+        )
+        if cached_raw is not None:
+            cached = CachedPage.from_json(cached_raw)
+            self._log(f"    [cache] hit {page.url}")
+            return _PageOutcome(
+                requested_url=url,
+                page=page,
+                readable=True,
+                has_verdict=True,
+                screen_match=cached.screen_match,
+                screen_reason=cached.screen_reason,
+                page_md=page_md if cached.screen_match else None,
+                cache_key=cache_key,
+                link_scores=list(cached.link_scores),
+            )
+
+        stage_error = False  # don't cache a page whose LLM stages hit a transient error
+        if direct:
+            screen_match = True
+            screen_reason = (
+                "seed_is_content: screening skipped, page treated as a match"
             )
         else:
-            merge_key = f"{self._cache_version}:{merge_cache_key(matched_keys)}"
-        cached_raw = self.cache.get(MERGE_NAMESPACE, merge_key)
-        if cached_raw is not None:
+            screen_kwargs: dict = {}
+            if self.prefer_seed_domain:
+                screen_kwargs = {
+                    "page_url": page.url,
+                    "seed_url": seed_ref,
+                    "on_seed_domain": self._on_any_seed_domain(page.url, seed_domains),
+                }
             try:
-                data = self.schema.model_validate_json(cached_raw)
+                verdict = self.provider.screen(page_md, self.criteria, **screen_kwargs)
             except Exception as e:
-                self._log(f"    ! cached merge invalid: {type(e).__name__}: {e}")
-            else:
-                self._log("    [cache] merge hit")
-                return data
+                self._log(f"    ! screen failed on {page.url}: {type(e).__name__}: {e}")
+                # Readable (counts budget) but no verdict and nothing to cache.
+                return _PageOutcome(requested_url=url, page=page, readable=True)
+            screen_match = verdict.match
+            screen_reason = verdict.reason
 
-        data = self._merge(merge, matches)
-        try:
-            self.cache.put(MERGE_NAMESPACE, merge_key, data.model_dump_json())
-        except Exception as e:  # noqa: BLE001 - caching is best-effort
-            self._log(f"    ! merge cache put failed: {type(e).__name__}: {e}")
-        return data
+        link_scores: list[list] = []
+        # Direct mode queues no links. Otherwise score the outgoing links this page
+        # introduces (filtered against the wave's snapshot of known URLs).
+        if page.kind == "html" and page.text and not direct:
+            outgoing = extract_links(page.text, base_url=page.url)
+            fresh = [
+                (text, link) for text, link in outgoing if canonical(link) not in known
+            ]
+            if fresh:
+                score_kwargs: dict = {}
+                if self.prefer_seed_domain:
+                    score_kwargs = {
+                        "seed_url": seed_ref,
+                        "on_seed_domain": {
+                            link: self._on_any_seed_domain(link, seed_domains)
+                            for _, link in fresh
+                        },
+                    }
+                try:
+                    scores = self.provider.score_links(
+                        fresh, page_md, self.criteria, **score_kwargs
+                    )
+                except Exception as e:
+                    self._log(
+                        f"    ! score_links failed on {page.url}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    stage_error = True
+                else:
+                    link_scores = [[link_url, score] for link_url, score in scores]
 
-    def _merge(
-        self,
-        merge: Callable[..., BaseModel],
-        matches: list[tuple[str, BaseModel]],
-    ) -> BaseModel:
-        """Call the schema's `merge_extractions`, passing only the optional kwargs
-        it actually declares.
-
-        Which of `provider` / `cache` a schema accepts is decided by *inspecting
-        the signature*, not by calling and catching `TypeError`. Catching
-        `TypeError` could not tell "this call has the wrong arity" apart from "a
-        `TypeError` was raised inside a correctly-matched call", so it would
-        silently re-run the merge (and any LLM calls it makes) up to two more
-        times and then surface the wrong error. Probing the signature calls the
-        merge exactly once.
-        """
-        available = {"provider": self.provider, "cache": self.cache}
-        try:
-            params = inspect.signature(merge).parameters
-        except (TypeError, ValueError):
-            # Uninspectable callable (rare); offer everything and let it choose.
-            return merge(matches, **available)
-        accepts_var_kwargs = any(
-            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
-        )
-        kwargs = {
-            name: value
-            for name, value in available.items()
-            if accepts_var_kwargs or name in params
-        }
-        return merge(matches, **kwargs)
-
-    def extract_batch(
-        self,
-        seed_urls: list[str],
-        max_fetches: int | None = None,
-        *,
-        stop_on_first_match: bool | None = None,
-        seed_is_content: bool | None = None,
-    ) -> list[ExtractionResult]:
-        return [
-            self.extract(
-                url,
-                max_fetches=max_fetches,
-                stop_on_first_match=stop_on_first_match,
-                seed_is_content=seed_is_content,
+        if self.cache is not None and not stage_error:
+            self.cache.put(
+                PAGE_NAMESPACE,
+                cache_key,
+                CachedPage(
+                    screen_match=screen_match,
+                    screen_reason=screen_reason,
+                    link_scores=link_scores,
+                ).to_json(),
             )
-            for url in seed_urls
-        ]
+
+        return _PageOutcome(
+            requested_url=url,
+            page=page,
+            readable=True,
+            has_verdict=True,
+            screen_match=screen_match,
+            screen_reason=screen_reason,
+            page_md=page_md if screen_match else None,
+            cache_key=cache_key,
+            link_scores=link_scores,
+        )
+
+    def _consolidate_and_extract(
+        self,
+        *,
+        matched_pages: list[tuple[str, str, str]],
+        pages_fetched: int,
+        path: list[str],
+        verdicts: list[PageVerdict],
+        usage_by_function_at_start: dict[str, Usage],
+    ) -> ExtractionResult:
+        """Concatenate every screened-in page, fit it to the context budget, and run
+        the single extraction (cached on the set of contributing pages)."""
+        if not matched_pages:
+            return self._result(
+                data=None,
+                stopped="budget_exhausted",
+                pages_fetched=pages_fetched,
+                path=path,
+                verdicts=verdicts,
+                usage_by_function_at_start=usage_by_function_at_start,
+            )
+
+        # Sort by canonical URL so the concatenation and cache key are deterministic
+        # regardless of the (parallel, nondeterministic) order pages were gathered.
+        matched_pages.sort(key=lambda t: canonical(t[0]))
+        pages_for_fit = [(url, md) for url, md, _ck in matched_pages]
+        page_keys = [ck for _u, _m, ck in matched_pages]
+        extract_key = (
+            f"{self._cache_version}:ctx={self.settings.max_context_tokens}"
+            f":enc={self.settings.tiktoken_encoding}:{extract_cache_key(page_keys)}"
+        )
+
+        # Extract-cache replay: hits only when the exact same set of pages (same
+        # content) recurs. The stored value wraps the object plus the context-size
+        # metadata, so a hit replays the full result with zero LLM calls.
+        if self.cache is not None:
+            cached_raw = self.cache.get(EXTRACT_NAMESPACE, extract_key)
+            if cached_raw is not None:
+                try:
+                    wrapper = json.loads(cached_raw)
+                    data = self.schema.model_validate(wrapper["data"])
+                except Exception as e:  # noqa: BLE001 - fall through to a live run
+                    self._log(
+                        f"    ! cached extraction invalid: {type(e).__name__}: {e}"
+                    )
+                else:
+                    self._log("    [cache] extraction hit")
+                    return self._result(
+                        data=data,
+                        stopped="match",
+                        pages_fetched=pages_fetched,
+                        path=path,
+                        verdicts=verdicts,
+                        usage_by_function_at_start=usage_by_function_at_start,
+                        content_tokens=int(wrapper.get("content_tokens", 0)),
+                        extraction_input_tokens=int(
+                            wrapper.get("extraction_input_tokens", 0)
+                        ),
+                        summarized=bool(wrapper.get("summarized", False)),
+                    )
+
+        final_text, summarized, content_tokens, extraction_input_tokens = fit_pages(
+            pages_for_fit,
+            criterion=self.criteria,
+            provider=self.provider,
+            max_context_tokens=self.settings.max_context_tokens,
+            model=self.provider.model_extract,
+            encoding_name=self.settings.tiktoken_encoding,
+            cache=self.cache,
+            version=self._cache_version,
+            log=self._log,
+        )
+
+        self._log(
+            f"    [extract] consolidating {len(matched_pages)} page(s), "
+            f"{extraction_input_tokens} input tokens"
+        )
+        try:
+            data = self.provider.extract(final_text, self.schema)
+        except Exception as e:
+            self._log(f"    ! extraction failed: {type(e).__name__}: {e}")
+            return self._result(
+                data=None,
+                stopped="budget_exhausted",
+                pages_fetched=pages_fetched,
+                path=path,
+                verdicts=verdicts,
+                usage_by_function_at_start=usage_by_function_at_start,
+                content_tokens=content_tokens,
+                extraction_input_tokens=extraction_input_tokens,
+                summarized=summarized,
+            )
+
+        if self.cache is not None:
+            try:
+                self.cache.put(
+                    EXTRACT_NAMESPACE,
+                    extract_key,
+                    json.dumps(
+                        {
+                            "data": data.model_dump(mode="json"),
+                            "content_tokens": content_tokens,
+                            "extraction_input_tokens": extraction_input_tokens,
+                            "summarized": summarized,
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001 - caching is best-effort
+                self._log(f"    ! extraction cache put failed: {type(e).__name__}: {e}")
+
+        return self._result(
+            data=data,
+            stopped="match",
+            pages_fetched=pages_fetched,
+            path=path,
+            verdicts=verdicts,
+            usage_by_function_at_start=usage_by_function_at_start,
+            content_tokens=content_tokens,
+            extraction_input_tokens=extraction_input_tokens,
+            summarized=summarized,
+        )
 
     def _result(
         self,
@@ -514,6 +582,9 @@ class Extractor:
         path: list[str],
         verdicts: list[PageVerdict],
         usage_by_function_at_start: dict[str, Usage],
+        content_tokens: int = 0,
+        extraction_input_tokens: int = 0,
+        summarized: bool = False,
     ) -> ExtractionResult:
         usage_by_function: dict[str, Usage] = {}
         for func, end in self.provider.usage_by_function.items():
@@ -535,4 +606,7 @@ class Extractor:
             protocol=self.provider.name,
             usage_by_function=usage_by_function,
             function_model=self.provider.function_model,
+            content_tokens=content_tokens,
+            extraction_input_tokens=extraction_input_tokens,
+            summarized=summarized,
         )
