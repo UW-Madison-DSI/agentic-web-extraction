@@ -22,6 +22,17 @@ class Settings(BaseSettings):
     # Model shared by the pre-screen and link-scorer calls (env: AWE_MODEL_SCREEN).
     # Both are cheap comparison calls, so they default to a smaller/faster model.
     model_screen: str = "gpt-5.4-mini"
+    # Send every LLM call on the "flex" service tier (env: AWE_USE_FLEX). Flex bills
+    # at Batch-API rates -- 50% off input and output -- but synchronously, so it needs
+    # no restructuring of the wave loop, and its discount still stacks with the
+    # provider-side prompt caching the screen/score prompts are shaped for. The price
+    # is latency (calls can be much slower, so the client's read timeout is raised)
+    # and capacity: flex may refuse a request outright with an uncharged 429
+    # `resource_unavailable`, in which case the provider retries that one call on the
+    # standard tier rather than lose the page's work. Off by default -- opt in for
+    # bulk/offline runs where wall-clock doesn't matter. Not part of any cache key:
+    # the tier changes price and latency, never response content.
+    use_flex: bool = False
     # Whether to convert fetched HTML to Markdown before the LLM sees it
     # (env: AWE_NORMALIZE). On by default to cut token cost; PDFs are always
     # converted regardless.

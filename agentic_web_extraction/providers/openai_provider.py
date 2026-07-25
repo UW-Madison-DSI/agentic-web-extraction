@@ -1,9 +1,11 @@
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Literal, TypeVar
 
 import httpx
-from openai import OpenAI
+from openai import OpenAI, Omit, RateLimitError, omit
 from pydantic import BaseModel, Field
 
 from .. import logsink
@@ -62,10 +64,41 @@ SCORE_DOMAIN_PREFERENCE = (
 
 PAGE_TRUNC_CHARS = 16000
 
+# Service tiers (Settings.use_flex). "flex" bills at Batch-API rates -- 50% off, and
+# stackable with prompt caching -- in exchange for latency and the possibility of
+# being refused for lack of capacity. "auto" is the account default (standard
+# pricing), used as the per-call fallback when flex has no capacity. Narrowed to the
+# two tiers this provider uses; the SDK also accepts "default"/"scale"/"priority".
+_Tier = Literal["auto", "flex"]
+_TIER_FLEX: _Tier = "flex"
+_TIER_STANDARD: _Tier = "auto"
+
+# Read timeouts: flex responses can take far longer than standard ones, so the
+# 600s that is ample for a large standard extraction is raised when flex is on.
+_TIMEOUT_STANDARD = 600.0
+_TIMEOUT_FLEX = 1800.0
+
+_T = TypeVar("_T")
+
 
 def _yn(on_seed_domain: bool | None) -> str:
     """Render the on-domain signal for the prompt (None = host unparseable)."""
     return {True: "yes", False: "no", None: "unknown"}[on_seed_domain]
+
+
+def _is_capacity_refusal(error: RateLimitError) -> bool:
+    """True for the flex-specific 429 that means "no spare capacity right now".
+
+    Flex refuses with `resource_unavailable`, which is *not* billed -- that one is
+    worth re-running on the standard tier. An ordinary rate-limit 429 is not: the
+    request is fine, the account is just over its limit, and silently escalating it
+    to full price would defeat the point of asking for flex. So match on the error
+    code, falling back to the message text when the SDK exposes no code.
+    """
+    code = getattr(error, "code", None)
+    if code:
+        return code == "resource_unavailable"
+    return "resource_unavailable" in str(error).lower()
 
 
 class _ScreenSchema(BaseModel):
@@ -99,14 +132,28 @@ class OpenAIProvider:
         # max_retries and connect timeout raised above the SDK defaults (2 retries,
         # 5s connect): the crawl fires many calls concurrently across waves and
         # summarization, so a slow-to-connect or transiently-failing endpoint should
-        # get more patience before it aborts a page. Overall/read timeout stays at
-        # the SDK default (600s), ample for a large extraction call.
+        # get more patience before it aborts a page. The read timeout is the SDK
+        # default (600s) -- ample for a large extraction call -- and longer still on
+        # flex, whose whole trade is latency for price.
+        #
+        # Note max_retries also covers 429s, so a flex capacity refusal is retried by
+        # the SDK before `_tiered` ever sees it and drops to the standard tier. That
+        # is the right order (a retry might land on free flex capacity; the fallback
+        # costs double) and it is free -- refusals aren't billed -- just slow.
         self._client = OpenAI(
             api_key=api_key,
             base_url=self.settings.openai_base_url,
             max_retries=5,
-            timeout=httpx.Timeout(600.0, connect=30.0),
+            timeout=httpx.Timeout(
+                _TIMEOUT_FLEX if self.settings.use_flex else _TIMEOUT_STANDARD,
+                connect=30.0,
+            ),
         )
+        if self.settings.use_flex:
+            logsink.emit(
+                f"[provider] service_tier={_TIER_FLEX} (Batch-API rates; falls back "
+                f"to {_TIER_STANDARD} per call when flex capacity is unavailable)"
+            )
         # Token usage bucketed by an opaque call-purpose tag ("screen",
         # "score_links", "summarize", "extract", or whatever a caller passes to
         # extract()). _function_model remembers which model each tag ran on, so cost
@@ -158,6 +205,34 @@ class OpenAIProvider:
     def function_model(self) -> dict[str, str]:
         with self._usage_lock:
             return dict(self._function_model)
+
+    def _tiered(self, send: Callable[[_Tier | Omit], _T]) -> _T:
+        """Issue one request, on the configured service tier, via `send(tier)`.
+
+        With flex off, `omit` is passed and no `service_tier` reaches the wire, so
+        the account default applies -- the pre-flex behavior, byte for byte. With
+        flex on, the request goes out at `service_tier="flex"` (Batch-API rates) and
+        a capacity refusal is retried once on the standard tier, so a run never
+        fails purely for want of flex capacity. Any other error propagates to the
+        caller's logging/handling.
+
+        Per-call rather than per-run: refusals are momentary, so one page dropping
+        to standard shouldn't push the rest of the crawl off flex. `send` takes the
+        tier (rather than this method taking **kwargs) so each call site keeps its
+        concrete, type-checked argument list.
+        """
+        if not self.settings.use_flex:
+            return send(omit)
+        try:
+            return send(_TIER_FLEX)
+        except RateLimitError as e:
+            if not _is_capacity_refusal(e):
+                raise
+            logsink.emit(
+                f"    [llm] flex capacity unavailable; retrying on "
+                f"{_TIER_STANDARD} tier (standard pricing)"
+            )
+            return send(_TIER_STANDARD)
 
     def _accumulate(self, response: object, model: str, function: str) -> Usage:
         """Add this response's tokens to the per-function running total and return the delta."""
@@ -232,11 +307,14 @@ class OpenAIProvider:
         payload = f"{domain_block}PAGE:\n{truncated}"
         t0 = time.monotonic()
         try:
-            response = self._client.responses.parse(
-                model=self.model_screen,
-                instructions=instructions,
-                input=payload,
-                text_format=_ScreenSchema,
+            response = self._tiered(
+                lambda tier: self._client.responses.parse(
+                    model=self.model_screen,
+                    instructions=instructions,
+                    input=payload,
+                    text_format=_ScreenSchema,
+                    service_tier=tier,
+                )
             )
         except BaseException as e:
             self._log_call(
@@ -296,11 +374,14 @@ class OpenAIProvider:
         )
         t0 = time.monotonic()
         try:
-            response = self._client.responses.parse(
-                model=self.model_screen,
-                instructions=instructions,
-                input=payload,
-                text_format=_LinkScores,
+            response = self._tiered(
+                lambda tier: self._client.responses.parse(
+                    model=self.model_screen,
+                    instructions=instructions,
+                    input=payload,
+                    text_format=_LinkScores,
+                    service_tier=tier,
+                )
             )
         except BaseException as e:
             self._log_call(
@@ -342,10 +423,13 @@ class OpenAIProvider:
         payload = f"CONTENT:\n{text}"
         t0 = time.monotonic()
         try:
-            response = self._client.responses.create(
-                model=self.model_screen,
-                instructions=instructions,
-                input=payload,
+            response = self._tiered(
+                lambda tier: self._client.responses.create(
+                    model=self.model_screen,
+                    instructions=instructions,
+                    input=payload,
+                    service_tier=tier,
+                )
             )
         except BaseException as e:
             self._log_call(
@@ -370,11 +454,14 @@ class OpenAIProvider:
         step = f"{usage_tag}[{schema.__name__}]"
         t0 = time.monotonic()
         try:
-            response = self._client.responses.parse(
-                model=self.model_extract,
-                instructions=self.extract_prompt,
-                input=payload,
-                text_format=schema,
+            response = self._tiered(
+                lambda tier: self._client.responses.parse(
+                    model=self.model_extract,
+                    instructions=self.extract_prompt,
+                    input=payload,
+                    text_format=schema,
+                    service_tier=tier,
+                )
             )
         except BaseException as e:
             self._log_call(
