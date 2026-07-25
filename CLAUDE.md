@@ -133,7 +133,14 @@ domain compare), [normalize.py](agentic_web_extraction/normalize.py),
   encoding (`AWE_TIKTOKEN_ENCODING`, default `o200k_base`). Counts are approximate for non-
   OpenAI models — fine, they only drive the fit-or-summarize decision, not billing.
 - `markitdown` (HTML→MD), `openai` (default provider, swappable via `AWE_PROVIDER`;
-  client tuned to `max_retries=5` / `connect=30s`), `pydantic`/`pydantic-settings`
+  client tuned to `max_retries=5` / `connect=30s`; `AWE_USE_FLEX` sends every call at
+  `service_tier="flex"` for Batch-API rates — 50% off, synchronous, stacks with prompt
+  caching — with a *per-call* fallback to `"auto"` on the uncharged
+  `429 resource_unavailable`, and a raised read timeout. Off by default. All four call
+  sites route through `_tiered(send)`, which hands the tier to a lambda so each keeps
+  its typed argument list; with flex off it passes `omit` so nothing reaches the wire.
+  The tier is deliberately **not** in any cache key — it changes price and latency, not
+  response content), `pydantic`/`pydantic-settings`
   (`AWE_*`, `OPENAI_*` env), `tenacity` (retries), `typer` (CLI; `--schema` =
   `import.path:ClassName`).
 
