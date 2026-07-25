@@ -368,6 +368,38 @@ store is [`SqliteKVCache`](agentic_web_extraction/cache.py), a single
 pass any object implementing the `KVCache` protocol (`get(namespace, key)` /
 `put(namespace, key, value)`) as `Extractor(..., cache=...)`.
 
+#### Flex service tier (off by default)
+
+Set `AWE_USE_FLEX=true` to send every LLM call on OpenAI's
+[flex service tier](https://developers.openai.com/api/docs/guides/flex-processing),
+which bills at Batch-API rates — **50% off input and output** — and whose discount
+still stacks with prompt caching. Unlike the Batch API it is *synchronous*, so
+nothing about the traversal changes: same wave loop, same best-first ordering, same
+result shape.
+
+What you trade for the halved bill:
+
+- **Latency.** Flex calls can be far slower, so the client's read timeout is raised
+  from 600s to 1800s when it's on. This is a knob for bulk/offline runs, not
+  interactive ones.
+- **Capacity.** Flex can refuse a request outright with an uncharged
+  `429 resource_unavailable`. The provider retries that *single call* on the standard
+  tier (`service_tier="auto"`) and logs `[llm] flex capacity unavailable`, so a run
+  never fails purely for want of flex capacity — it just pays standard price for the
+  calls that couldn't get flex. An ordinary rate-limit 429 is **not** escalated this
+  way; it propagates as before.
+
+The tier affects price and latency, never response content, so it's deliberately
+**not** part of any cache key — a run with flex on will happily reuse entries a
+standard run wrote, and vice versa. Availability is per-model (both default models
+support it as of writing); check the
+[pricing page](https://developers.openai.com/api/docs/pricing?latest-pricing=flex)
+for the current list.
+
+Most of a run's cost sits in the single consolidated extraction — one call on the
+stronger model with up to `AWE_MAX_CONTEXT_TOKENS` of input, against many small calls
+on the cheap screen model — so the discount lands mostly there.
+
 ### CLI
 
 ```bash
@@ -431,6 +463,7 @@ Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your pr
 | Provider             | `AWE_PROVIDER`        | `openai`               |
 | Extraction model     | `AWE_MODEL_EXTRACT`   | `gpt-5.5`              |
 | Pre-screen model     | `AWE_MODEL_SCREEN`    | `gpt-5.4-mini`         |
+| Flex service tier    | `AWE_USE_FLEX`        | `false` (true = 50% off at Batch-API rates, slower; auto-fallback to standard) |
 | HTML→MD normalize    | `AWE_NORMALIZE`       | `true`                 |
 | Follow linked PDFs   | `AWE_FOLLOW_PDF`      | `true`                 |
 | Max page fetches     | `AWE_MAX_FETCHES`     | `10` (per seed)        |
@@ -517,5 +550,6 @@ v0 done:
 - [x] Caller-supplied `text_filters` (site-specific cache-stability strippers live in `examples/`, not the library)
 - [x] Opt-in soft same-domain preference (single `prefer_seed_domain` knob, off by default; LLM is fed an on-domain signal and asked to disfavor off-domain content; PSL-based registrable domain via `tldextract`)
 - [x] Opt-in direct extraction (single `seed_is_content` knob, off by default; treats the seed pages as the content — skips the pre-screen and link-scoring, no discovery)
+- [x] Opt-in flex service tier (single `AWE_USE_FLEX` knob, off by default; Batch-API rates on synchronous calls, per-call fallback to standard when flex has no capacity)
 - [x] `examples/` directory with reference schemas and filters (`examples/grants.py`, `examples/strippers.py`, kept out of the package)
 - [x] Weekly org adoption scan (`scripts/adopters.py` + `.github/workflows/adopters.yml`; index-independent repo/tree sweep → shields badges in the [Adopters](#adopters) block, hard-fails and reports coverage rather than committing a silent undercount)
