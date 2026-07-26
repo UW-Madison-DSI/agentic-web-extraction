@@ -106,7 +106,9 @@ The agent maintains a **frontier** — every unvisited link it has seen so far, 
 
 This is best-first search, not breadth-first or depth-first. The LLM's relevance scoring is the primary navigation policy; depth and per-link thresholds are deliberately **not** tunable — the budget is the main lever. `max_workers` trades a little best-first strictness (best-first *within* a wave) for parallelism, even on a single seed; set it to `1` for strictly sequential best-first. The one opt-in navigation exception is a *soft* same-domain preference (off by default; see below): rather than re-weighting scores in code, it hands the LLM the seed/page URL and a computed on-domain signal and asks it to disfavor off-domain content — a nudge the model applies with its own judgment, never a hard exclusion.
 
-**Fit-or-summarize.** The concatenated content of all screened-in pages is measured (via tiktoken) against `max_context_tokens`. If it fits, it's extracted as-is. If not, it's compressed first with a criteria-aware map-reduce on the cheap screen model — each page is summarized (keeping everything relevant to your criterion), the summaries are concatenated, and if still over budget the combined text is summarized again until it fits. The concatenated and post-summarization sizes are logged.
+**Fit-or-summarize.** The concatenated content of all screened-in pages is measured (via tiktoken) against `max_context_tokens`. If it fits, it's extracted as-is. If not, it's compressed first with a criteria- **and schema-aware** map-reduce on the cheap screen model — each page is summarized (keeping everything relevant to your criterion), the summaries are concatenated, and if still over budget the combined text is summarized again until it fits. The concatenated and post-summarization sizes are logged.
+
+Summarization is the pipeline's only lossy step — the extraction model never sees the original text — so the summarizer is given **your target schema** alongside the criterion, rendered as a compact field outline. The criterion says what's *topically* relevant; the schema says which concrete values are actually going to be asked for. Without it a summarizer optimizing for topical relevance will happily drop the dates, amounts, identifiers, citations, and URLs that a schema field requires. The prompt frames the schema as a retention list, not a task change: it instructs the model to copy literal values verbatim and keep list-record boundaries intact, while still emitting condensed prose (never JSON) — turning the cheap model into an extractor would lock in its mistakes and discard the context the strong model uses to disambiguate.
 
 ## What you provide
 
@@ -184,10 +186,26 @@ Each stage is independently swappable.
 | Normalize      | HTML → Markdown for token reduction; pluggable converter; caller-supplied `text_filters` run here |
 | Pre-screen     | Cheap LLM call returning a binary yes/no against user-supplied criterion                    |
 | Score links    | LLM scores every outgoing link's promise against the criterion; output feeds the frontier   |
-| Summarize      | Only when the concatenation overflows `max_context_tokens`; criteria-aware map-reduce on the screen model |
+| Summarize      | Only when the concatenation overflows `max_context_tokens`; criteria- and schema-aware map-reduce on the screen model |
 | Extract        | One structured-output LLM call over the concatenated (possibly summarized) content; produces JSON conforming to user schema |
 
 By default the link-scorer and summarizer reuse the pre-screen model — all cheap, comparison/compression-style calls.
+
+**The schema outline the summarizer is shown.** Rather than the raw `model_json_schema()` — mostly `title`/`type` scaffolding, `anyOf` pairs for nullables, and `$ref` indirection the cheap model has to resolve itself — the schema is rendered as an outline, with each definition emitted once and field descriptions carried through:
+
+```
+Opportunities:
+  items: list[Opportunity] -- All distinct grant/funding opportunities described in the content.
+
+Opportunity:
+  title: string (required)
+  deadline: string? -- ISO date if stated
+  eligibility: string?
+  sponsor: string?
+  link: string (required)
+```
+
+That's 124 tokens against 405 for the equivalent JSON Schema; on a deeper schema the gap widens (a 7-field container over 3 nested models: 202 vs 1,042). Emitting each definition once — rather than flattening to dotted paths — also means nesting survives, shared sub-models aren't duplicated per referencing field, and a self-referential schema renders in finite space. It costs nothing per chunk regardless: the outline lives in the stable instruction prefix that's byte-identical across every chunk and reduce level, so the provider's prompt cache serves it. See [schema_outline.py](agentic_web_extraction/schema_outline.py).
 
 **How much of the page each LLM call sees.** The cheap traversal calls read a truncated prefix of the normalized markdown; extraction reads the full concatenated content:
 
@@ -357,7 +375,7 @@ The crawler caches its LLM work, keyed by content, at three levels:
 
 - **Per page** — each page is content-addressed by the hash of its normalized markdown (mixed with a version stamp over the criterion, schema, provider prompt templates, and models — so changing any of those, or requesting a different schema for the same URL, misses instead of serving a stale result). If a page's content is unchanged from a prior run, the crawler **replays** that page's screen verdict and link scores with **zero LLM calls** — the page is still fetched, so `pages_fetched` and the budget are unaffected.
 - **The consolidated extraction** — keyed on the *set* of contributing pages (a hash of all their per-page cache keys, plus the context/encoding settings that govern the summarize-or-not decision). It replays only when **the exact same set of pages with the same content** recurs — change, add, or drop any screened-in page and the extraction re-runs. The stored value carries the context-size metadata too, so a hit replays the full result (including `content_tokens` / `summarized`).
-- **Per summary chunk** — when summarization runs, each chunk's summary is cached by its content hash, so an unchanged page replays its summary for free.
+- **Per summary chunk** — when summarization runs, each chunk's summary is cached by its content hash, so an unchanged page replays its summary for free. The same version stamp is mixed in, so changing the schema — which changes what the summarizer was told to preserve — invalidates stored summaries too.
 
 Extracted data round-trips through your Pydantic model, so the cache is schema-agnostic.
 
@@ -498,7 +516,8 @@ agentic_web_extraction/
     config.py            # AWE_* settings (pydantic-settings)
     cache.py             # KVCache protocol + SqliteKVCache + content-hash helpers (on-by-default LLM cache)
     extractor.py         # Extractor: parallel-wave frontier loop + consolidated extraction
-    summarize.py         # criteria-aware map-reduce summarization (fit to context budget)
+    summarize.py         # criteria/schema-aware map-reduce summarization (fit to context budget)
+    schema_outline.py    # renders a caller schema as a compact field outline for the summarize prompt
     tokens.py            # tiktoken-backed token counting + token-aware splitting
     fetch.py             # httpx (plain, no HTTP cache) + tenacity retry
     logsink.py           # shared stderr + optional timestamped log-file sink
@@ -545,6 +564,7 @@ v0 done:
 - [x] Multi-seed pooling (pass a list of seeds into one shared frontier; budget is per seed; a URL reachable from several seeds is screened once; the LLM cache persists across seeds and runs)
 - [x] Consolidate-then-extract (concatenate every screened-in page and run one structured extraction over the whole thing — no per-page extraction, no merge/dedup)
 - [x] Fit-or-summarize (`max_context_tokens`; over budget, a criteria-aware map-reduce on the screen model compresses the content to fit, via tiktoken chunking)
+- [x] Schema-aware summarization (the target schema is rendered as a compact field outline and handed to the summarizer as a retention list, so compression can't drop the concrete values extraction will demand)
 - [x] Parallel-wave traversal (`max_workers`; pop the top-N frontier links and fetch/screen/score them concurrently, even on a single seed)
 - [x] On-by-default content-addressed LLM cache (`SqliteKVCache` at `AWE_LLM_CACHE`, swappable via the `KVCache` protocol; replays per-page screen/score, per-chunk summaries, and the consolidated extraction — when every contributing page is unchanged — with no LLM calls)
 - [x] Caller-supplied `text_filters` (site-specific cache-stability strippers live in `examples/`, not the library)

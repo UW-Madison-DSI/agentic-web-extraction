@@ -53,8 +53,17 @@ class Provider(Protocol):
         on_seed_domain: dict[str, bool | None] | None = None,
     ) -> list[tuple[str, float]]: ...
 
+    # `schema` is the schema the consolidated extraction will produce; passing it
+    # tells the summarizer which concrete values have to survive compression (the
+    # criterion only says what is topically relevant). Optional so `summarize`
+    # remains a generic utility, but the Extractor always supplies it.
     def summarize(
-        self, text: str, criterion: str, *, usage_tag: str = "summarize"
+        self,
+        text: str,
+        criterion: str,
+        *,
+        schema: type[BaseModel] | None = None,
+        usage_tag: str = "summarize",
     ) -> str: ...
 
     def extract(
