@@ -113,7 +113,7 @@ def fit_pages(
 
     `schema` is the schema the consolidated extraction will produce; it is passed
     through to every summarize call so the compressor knows which concrete values
-    (dates, amounts, identifiers, URLs) must survive, not just which topics are
+    (dates, numbers, identifiers, URLs) must survive, not just which topics are
     relevant. Optional, so a caller can compress criterion-only.
 
     Returns ``(text, summarized, content_tokens, extraction_input_tokens)`` where

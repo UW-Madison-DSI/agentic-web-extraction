@@ -4,7 +4,7 @@ Summarization is the only lossy step in the pipeline: once the map-reduce in
 [summarize.py](summarize.py) has compressed a page, the extraction model never
 sees the original text. The criterion tells the summarizer what is *topically*
 relevant, but not which concrete values the extraction is obliged to produce --
-so a criterion-only summarizer happily discards the dates, amounts, identifiers,
+so a criterion-only summarizer happily discards the dates, numbers, identifiers,
 and URLs that a schema field requires. Handing the summarizer the schema fixes
 that: it is a precise, field-by-field statement of what must survive.
 
@@ -158,13 +158,13 @@ def schema_outline(schema: type[BaseModel]) -> str:
 
     Example (the container-with-a-list shape the consolidated extraction expects)::
 
-        Opportunities:
-          items: list[Opportunity]
+        RecordSet:
+          items: list[Record]
 
-        Opportunity:
+        Record:
           title: string (required)
-          deadline: string?  -- ISO date if stated
-          amount: string?
+          date: string?  -- ISO date if stated
+          quantity: string?
 
     Never raises on an exotic schema: an unrenderable node degrades to its type
     name rather than aborting a crawl over a prompt detail.
