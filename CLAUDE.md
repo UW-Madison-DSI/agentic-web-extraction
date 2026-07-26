@@ -38,6 +38,7 @@ scorer, and summarizer share a cheap model; extraction uses a stronger one.
 
 Key files: [extractor.py](agentic_web_extraction/extractor.py) (wave loop + consolidate),
 [summarize.py](agentic_web_extraction/summarize.py) (fit-or-summarize),
+[schema_outline.py](agentic_web_extraction/schema_outline.py) (schema → compact prompt outline),
 [tokens.py](agentic_web_extraction/tokens.py) (tiktoken counting/splitting),
 [frontier.py](agentic_web_extraction/frontier.py) (heap + visited set + snapshot + PSL
 domain compare), [normalize.py](agentic_web_extraction/normalize.py),
@@ -72,6 +73,20 @@ domain compare), [normalize.py](agentic_web_extraction/normalize.py),
   with the criteria-aware map-reduce in [summarize.py](agentic_web_extraction/summarize.py)
   (screen model), never by silently truncating. Concatenation order and the extraction
   cache key are made deterministic by sorting contributing pages on canonical URL.
+- **Summarization is schema-aware, but must not become extraction.** It's the only lossy
+  step (the extract model never sees the original text), so `fit_pages` threads the target
+  schema into every `provider.summarize` call and the provider appends
+  `SUMMARIZE_SCHEMA_GUIDANCE` + a [schema_outline.py](agentic_web_extraction/schema_outline.py)
+  rendering to the instructions. Keep that prompt framed as a *retention list* — copy
+  literal values verbatim, keep list-record boundaries intact, output prose and never
+  JSON. A summarizer that fills the schema is doing extraction on the cheap model: it
+  locks in early mistakes and discards the context the strong model disambiguates with.
+  The outline (not the raw `model_json_schema()`) is what's sent: each `$defs` entry is
+  emitted once, so nesting survives, shared sub-models aren't duplicated, and recursive
+  schemas render in finite space — dotted-path flattening does none of that. Rendering is
+  best-effort (`schema_outline_safe` falls back to compact JSON, then to `""`); a prompt
+  detail must never abort a crawl. `schema` stays optional on the `Provider` protocol so
+  `summarize` remains a generic utility, but the Extractor always passes it.
 - **Uniform result shape.** `extract` always returns the same structure (`data`,
   `stopped_reason`, `pages_fetched`, `path`, `verdicts`, `content_tokens`,
   `extraction_input_tokens`, `summarized`, per-function token usage) whether it matched
@@ -100,7 +115,11 @@ domain compare), [normalize.py](agentic_web_extraction/normalize.py),
   screened-in pages (same content) recurs. Its value wraps the object **and** the
   context-size metadata (`content_tokens`/`extraction_input_tokens`/`summarized`) so a hit
   replays the full result. (3) `SUMMARY` — per-chunk summaries keyed on the version stamp +
-  chunk content hash. Don't reintroduce a merge namespace.
+  chunk content hash. Don't reintroduce a merge namespace. The version stamp already
+  folds in `schema_json` *and* `prompt_signature`, so schema-aware summarization needed no
+  key change — editing the schema or the retention prompt invalidates stored summaries on
+  its own. Keep the *rendered* outline out of `prompt_signature` (the schema JSON it
+  derives from is already in the stamp; adding both is redundant).
 - **Don't fork CLI vs Python logic.** The CLI wires to the same `Extractor` the Python
   API exposes. `--max-context-tokens`/`--max-workers` are settings-only knobs, so the CLI
   injects them via `settings.model_copy(update=...)`, not `extract()` args.

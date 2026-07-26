@@ -514,6 +514,7 @@ class Extractor:
         final_text, summarized, content_tokens, extraction_input_tokens = fit_pages(
             pages_for_fit,
             criterion=self.criteria,
+            schema=self.schema,
             provider=self.provider,
             max_context_tokens=self.settings.max_context_tokens,
             model=self.provider.model_extract,

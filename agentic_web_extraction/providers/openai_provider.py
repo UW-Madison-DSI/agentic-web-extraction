@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from .. import logsink
 from ..config import Settings
 from ..result import ScreenVerdict, Usage
+from ..schema_outline import schema_outline_safe
 
 DEFAULT_SCREEN_PROMPT = (
     "You are a precise relevance judge. Decide if the PAGE matches the CRITERION.\n"
@@ -40,6 +41,26 @@ DEFAULT_SUMMARIZE_PROMPT = (
     "URLs, and any concrete fact a structured extraction might need. Drop boilerplate,\n"
     "navigation, and anything irrelevant to the criterion. Do not add information that\n"
     "is not present. Output only the condensed text."
+)
+
+# Appended to the summarize instructions (followed by the rendered schema outline)
+# whenever the caller passes the extraction schema. Summarization is the pipeline's
+# only lossy step -- the extraction model never sees the original text -- and the
+# criterion alone says what is *topically* relevant, not which concrete values a
+# schema field will demand. The wording is deliberately framed as a retention list
+# rather than a task change: a summarizer that starts emitting JSON would be doing
+# the extraction on the cheap model, locking in early mistakes and throwing away the
+# context the strong model uses to disambiguate.
+SUMMARIZE_SCHEMA_GUIDANCE = (
+    "\n\nRETENTION TARGET: a downstream model will populate the schema below from your "
+    "output alone -- it never sees the original text. Any fact that could fill any of "
+    "these fields must survive in your summary, and literal values (numbers, dates, "
+    "amounts, names, identifiers, URLs, citations) must be copied exactly -- never "
+    "paraphrase, round, normalize, or abbreviate them. Where a field holds a list of "
+    "records, keep the records separated and keep each record's details attached to "
+    "it, so details from one cannot be misread as belonging to another. This tells you "
+    "what to KEEP; it does not change your task -- output condensed prose, never JSON, "
+    "and do not attempt to fill the schema yourself.\n\nTARGET SCHEMA:\n"
 )
 
 # Appended to the screen / score instructions only when the caller opts into the
@@ -180,11 +201,14 @@ class OpenAIProvider:
     def prompt_signature(self) -> str:
         """Stable fingerprint of every prompt template this provider sends.
 
-        Covers the three base instructions plus the two same-domain-preference
-        appendices, so editing any of them (whether the module defaults or a
-        per-instance override) busts the page cache. The domain appendices are
-        static constants, but including them keeps the signature complete even if
-        they change. Order is fixed so the string is deterministic.
+        Covers the four base instructions plus the conditional appendices (the two
+        same-domain-preference blocks and the summarize retention block), so editing
+        any of them (whether the module defaults or a per-instance override) busts
+        the page cache. The appendices are static constants, but including them keeps
+        the signature complete even if they change. The rendered schema outline is
+        deliberately absent: the schema's JSON already feeds the version stamp
+        directly (see `page_cache_version`), so a schema change invalidates without
+        it. Order is fixed so the string is deterministic.
         """
         parts = [
             self.screen_prompt,
@@ -193,6 +217,7 @@ class OpenAIProvider:
             self.summarize_prompt,
             SCREEN_DOMAIN_PREFERENCE,
             SCORE_DOMAIN_PREFERENCE,
+            SUMMARIZE_SCHEMA_GUIDANCE,
         ]
         return "\x00".join(parts)
 
@@ -411,15 +436,29 @@ class OpenAIProvider:
         return [(url, scored.get(url, 0.0)) for _, url in links]
 
     def summarize(
-        self, text: str, criterion: str, *, usage_tag: str = "summarize"
+        self,
+        text: str,
+        criterion: str,
+        *,
+        schema: type[BaseModel] | None = None,
+        usage_tag: str = "summarize",
     ) -> str:
-        """Condense `text` (criterion-aware) using the cheap screen model.
+        """Condense `text` (criterion- and schema-aware) using the cheap screen model.
 
-        The criterion goes in `instructions` (stable, cacheable prefix); the text
-        to compress goes in `input`. Callers pre-chunk `text` to fit the model's
+        The criterion and the schema outline go in `instructions` (a stable prefix
+        that is byte-identical across every chunk and every reduce level, so the
+        provider's prompt cache serves it instead of re-billing it per chunk); the
+        text to compress goes in `input`. Callers pre-chunk `text` to fit the model's
         window (see summarize.py), so nothing is truncated here.
+
+        `schema` is the schema the consolidated extraction will be parsed into. It is
+        optional so `summarize` stays a generic provider utility, but the Extractor
+        always passes it -- without it the summarizer only knows what is *relevant*,
+        not what will be *asked for*.
         """
         instructions = f"{self.summarize_prompt}\n\nCRITERION:\n{criterion}"
+        if schema is not None:
+            instructions += SUMMARIZE_SCHEMA_GUIDANCE + schema_outline_safe(schema)
         payload = f"CONTENT:\n{text}"
         t0 = time.monotonic()
         try:
