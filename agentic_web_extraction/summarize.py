@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 
+from pydantic import BaseModel
+
 from .cache import SUMMARY_NAMESPACE, KVCache, content_hash
 from .providers import Provider
 from .tokens import count_tokens, split_by_tokens
@@ -39,22 +41,25 @@ def _summarize_chunk(
     chunk: str,
     *,
     criterion: str,
+    schema: type[BaseModel] | None,
     provider: Provider,
     cache: KVCache | None,
     version: str,
 ) -> str:
     """Summarize one chunk, replaying from the summary cache when unchanged.
 
-    Keyed on the version stamp (which already folds in the criterion, screen
-    model, and summarize prompt) plus the chunk's content hash, so the same chunk
-    text under the same crawl config replays for free.
+    Keyed on the version stamp (which already folds in the criterion, the schema's
+    JSON, the screen model, and the summarize prompt) plus the chunk's content
+    hash, so the same chunk text under the same crawl config replays for free --
+    and editing the schema, which changes what the summarizer is told to keep,
+    invalidates every stored summary without a key change here.
     """
     key = f"{version}:{content_hash(chunk)}"
     if cache is not None:
         hit = cache.get(SUMMARY_NAMESPACE, key)
         if hit is not None:
             return hit
-    summary = provider.summarize(chunk, criterion)
+    summary = provider.summarize(chunk, criterion, schema=schema)
     if cache is not None:
         try:
             cache.put(SUMMARY_NAMESPACE, key, summary)
@@ -68,6 +73,7 @@ def _summarize_text(
     *,
     budget: int,
     criterion: str,
+    schema: type[BaseModel] | None,
     provider: Provider,
     model: str,
     encoding_name: str,
@@ -80,6 +86,7 @@ def _summarize_text(
         _summarize_chunk(
             chunk,
             criterion=criterion,
+            schema=schema,
             provider=provider,
             cache=cache,
             version=version,
@@ -93,6 +100,7 @@ def fit_pages(
     pages: Sequence[Page],
     *,
     criterion: str,
+    schema: type[BaseModel] | None = None,
     provider: Provider,
     max_context_tokens: int,
     model: str,
@@ -102,6 +110,11 @@ def fit_pages(
     log: Callable[[str], None],
 ) -> tuple[str, bool, int, int]:
     """Concatenate `pages` and shrink them to fit `max_context_tokens`.
+
+    `schema` is the schema the consolidated extraction will produce; it is passed
+    through to every summarize call so the compressor knows which concrete values
+    (dates, amounts, identifiers, URLs) must survive, not just which topics are
+    relevant. Optional, so a caller can compress criterion-only.
 
     Returns ``(text, summarized, content_tokens, extraction_input_tokens)`` where
     ``content_tokens`` is the raw concatenation's size and
@@ -128,6 +141,7 @@ def fit_pages(
                 md,
                 budget=budget,
                 criterion=criterion,
+                schema=schema,
                 provider=provider,
                 model=model,
                 encoding_name=encoding_name,
@@ -148,6 +162,7 @@ def fit_pages(
             current,
             budget=budget,
             criterion=criterion,
+            schema=schema,
             provider=provider,
             model=model,
             encoding_name=encoding_name,
