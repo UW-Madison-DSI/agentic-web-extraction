@@ -37,8 +37,8 @@ DEFAULT_EXTRACT_PROMPT = (
 DEFAULT_SUMMARIZE_PROMPT = (
     "You are compressing web page content so it fits a downstream extraction model's\n"
     "context window. Rewrite the CONTENT far more concisely while preserving every "
-    "detail relevant to the CRITERION -- names, dates, deadlines, amounts, eligibility,\n"
-    "URLs, and any concrete fact a structured extraction might need. Drop boilerplate,\n"
+    "detail relevant to the CRITERION -- every name, date, number, identifier, URL,\n"
+    "and any other concrete fact a structured extraction might need. Drop boilerplate,\n"
     "navigation, and anything irrelevant to the criterion. Do not add information that\n"
     "is not present. Output only the condensed text."
 )
@@ -55,7 +55,7 @@ SUMMARIZE_SCHEMA_GUIDANCE = (
     "\n\nRETENTION TARGET: a downstream model will populate the schema below from your "
     "output alone -- it never sees the original text. Any fact that could fill any of "
     "these fields must survive in your summary, and literal values (numbers, dates, "
-    "amounts, names, identifiers, URLs, citations) must be copied exactly -- never "
+    "quantities, names, identifiers, codes, URLs) must be copied exactly -- never "
     "paraphrase, round, normalize, or abbreviate them. Where a field holds a list of "
     "records, keep the records separated and keep each record's details attached to "
     "it, so details from one cannot be misread as belonging to another. This tells you "
