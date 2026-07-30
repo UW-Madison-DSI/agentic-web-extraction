@@ -195,6 +195,9 @@ class Extractor:
         path: list[str] = []
         pages_fetched = 0
         verdicts: list[PageVerdict] = []
+        # Pages the origin refused that a fallback route recovered (see fetch.py /
+        # fallback.py), url -> route. Empty on a crawl that got everything first-hand.
+        fallbacks_used: dict[str, str] = {}
         usage_by_function_at_start = self.provider.usage_by_function
         # Screened-in pages feeding the one extraction: (resolved_url, markdown,
         # page_cache_key). Deduped on resolved URL via `resolved_seen`.
@@ -236,6 +239,8 @@ class Extractor:
                     resolved_seen.add(rurl)
                     frontier.mark_visited(page.url)
                     path.append(page.url)
+                    if page.via:
+                        fallbacks_used[page.url] = page.via
                     if not outcome.readable:
                         continue
                     pages_fetched += 1
@@ -259,6 +264,7 @@ class Extractor:
             pages_fetched=pages_fetched,
             path=path,
             verdicts=verdicts,
+            fallbacks_used=fallbacks_used,
             usage_by_function_at_start=usage_by_function_at_start,
         )
 
@@ -459,6 +465,7 @@ class Extractor:
         pages_fetched: int,
         path: list[str],
         verdicts: list[PageVerdict],
+        fallbacks_used: dict[str, str],
         usage_by_function_at_start: dict[str, Usage],
     ) -> ExtractionResult:
         """Concatenate every screened-in page, fit it to the context budget, and run
@@ -470,6 +477,7 @@ class Extractor:
                 pages_fetched=pages_fetched,
                 path=path,
                 verdicts=verdicts,
+                fallbacks_used=fallbacks_used,
                 usage_by_function_at_start=usage_by_function_at_start,
             )
 
@@ -509,6 +517,7 @@ class Extractor:
                         pages_fetched=pages_fetched,
                         path=path,
                         verdicts=verdicts,
+                        fallbacks_used=fallbacks_used,
                         usage_by_function_at_start=usage_by_function_at_start,
                         content_tokens=int(wrapper.get("content_tokens", 0)),
                         extraction_input_tokens=int(
@@ -545,6 +554,7 @@ class Extractor:
                 pages_fetched=pages_fetched,
                 path=path,
                 verdicts=verdicts,
+                fallbacks_used=fallbacks_used,
                 usage_by_function_at_start=usage_by_function_at_start,
                 content_tokens=content_tokens,
                 extraction_input_tokens=extraction_input_tokens,
@@ -575,6 +585,7 @@ class Extractor:
             pages_fetched=pages_fetched,
             path=path,
             verdicts=verdicts,
+            fallbacks_used=fallbacks_used,
             usage_by_function_at_start=usage_by_function_at_start,
             content_tokens=content_tokens,
             extraction_input_tokens=extraction_input_tokens,
@@ -589,6 +600,7 @@ class Extractor:
         pages_fetched: int,
         path: list[str],
         verdicts: list[PageVerdict],
+        fallbacks_used: dict[str, str],
         usage_by_function_at_start: dict[str, Usage],
         content_tokens: int = 0,
         extraction_input_tokens: int = 0,
@@ -617,4 +629,5 @@ class Extractor:
             content_tokens=content_tokens,
             extraction_input_tokens=extraction_input_tokens,
             summarized=summarized,
+            fallbacks_used=dict(fallbacks_used),
         )

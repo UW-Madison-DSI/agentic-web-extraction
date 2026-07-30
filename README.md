@@ -144,6 +144,7 @@ A typed object conforming to your schema (or `None` if nothing screened in), plu
 - `content_tokens` — estimated token size of the raw concatenation of all screened-in pages
 - `extraction_input_tokens` — token size of what actually fed the extraction (smaller than `content_tokens` when `summarized`)
 - `summarized` — `True` when the concatenation was summarized down first (because it exceeded `max_context_tokens`, or because `always_summarize` is on)
+- `fallbacks_used` — URL → route for any page the origin refused that was recovered elsewhere (`"jina"` / `"wayback:<timestamp>"`); empty on a clean crawl. Non-empty means some content did not come from the site itself — see [Blocked-page recovery](#blocked-page-recovery-jina--wayback)
 - provider and token usage across all calls, split by call purpose (each with the model it ran on)
 
 Whether the agent succeeded or gave up, the result is structured the same way — easy to audit.
@@ -187,7 +188,7 @@ Each stage is independently swappable.
 
 | Stage          | Notes                                                                                       |
 |----------------|---------------------------------------------------------------------------------------------|
-| Fetch          | Handles HTML; optionally follows linked PDFs that are part of the page                      |
+| Fetch          | Handles HTML; optionally follows linked PDFs that are part of the page. A non-2xx response is never content — recover it via a fallback route, else drop the page |
 | Normalize      | HTML → Markdown for token reduction; pluggable converter; caller-supplied `text_filters` run here |
 | Pre-screen     | Cheap LLM call returning a binary yes/no against user-supplied criterion                    |
 | Score links    | LLM scores every outgoing link's promise against the criterion; output feeds the frontier   |
@@ -323,6 +324,8 @@ result = extractor.extract(
 # result.content_tokens: int  -- raw concatenation size (tokens)
 # result.extraction_input_tokens: int  -- what fed extraction (< content_tokens if summarized)
 # result.summarized:     bool -- whether the concatenation was summarized down to fit
+# result.fallbacks_used: dict[str, str]  -- url -> "jina" | "wayback:<timestamp>" for
+#   pages the origin refused that were recovered elsewhere; empty on a clean crawl.
 # result.protocol:       str  -- provider adapter / wire protocol that ran the
 #   crawl (e.g. "openai"); names the SDK/billing surface, not the model vendor.
 # result.usage_by_function: dict[str, Usage]  -- token usage by call purpose
@@ -373,6 +376,44 @@ specific real-world sites (Cloudflare, Foundant, Gravity Forms, EREF,
 CyberGrants) — copy the ones you need or write your own. They live in `examples/`,
 not the library, precisely so the core stays domain-agnostic; each filter is
 built to remove only content-free/invisible markup, never text an LLM would use.
+
+#### Blocked-page recovery (jina → wayback)
+
+Fetch classifies on Content-Type, so an HTTP error page served as `text/html` —
+an edge-CDN "Access Denied" interstitial, a themed 404 — used to look exactly like
+the page. It would be normalized, screened, pooled into the concatenation, and
+extracted from. Under `seed_is_content` that is worse than losing the page:
+screening is skipped, so the error text is *guaranteed* into the extraction and the
+URL becomes a citable source.
+
+So **a non-2xx response is never content**. Before dropping it, the fetcher tries
+the routes in `AWE_FETCH_FALLBACKS`, in order:
+
+| Route | What it does | Trade-off |
+|-------|--------------|-----------|
+| `jina` | `r.jina.ai` renders the URL server-side and returns it — also reads PDFs, so a blocked document comes back as text | Live content, but a third party sees the URL; anonymous requests are rate-limited (set `JINA_API_KEY`) |
+| `wayback` | The Internet Archive's newest successful capture, served with the `id_` modifier so bytes come back unrewritten | Free and stable, but as stale as the capture — bound it with `AWE_WAYBACK_MAX_AGE_DAYS` |
+
+The first route that returns content wins; if all decline, the page becomes
+`kind="error"` and the traversal skips it at no LLM cost and no budget slot.
+
+Recovered content is always returned **under the original URL**, never the
+reader/archive address — `page.url` is what lands in `path`, what the extraction
+prompt sees in its `--- SOURCE:` markers, and what any citation a caller builds
+derives from. The route is recorded per page (`FetchedPage.via`) and surfaced as
+`result.fallbacks_used`, so a caller can disclose which findings didn't come from
+the site itself.
+
+By default Jina is asked for the full DOM (`AWE_JINA_RETURN_FORMAT=html`), so
+normalization, link extraction and the frontier behave exactly as on a direct
+fetch. Set it empty for Jina's readability pass instead — markdown with the nav
+chrome stripped, roughly 3× fewer tokens, but only the links its extraction kept.
+That markdown is escaped and its links promoted to real anchors before it enters
+the pipeline; handing raw markdown to the HTML normalizer would *silently delete*
+angle-bracketed text (`a <threshold> of 5` → `a  of 5`) and surface no links at all.
+
+Both routes disclose the crawled URL to a third party. Set `AWE_FETCH_FALLBACKS=`
+empty to keep only the status guard and never make an outbound call.
 
 #### LLM-response cache (on by default)
 
@@ -489,6 +530,10 @@ Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your pr
 | Flex service tier    | `AWE_USE_FLEX`        | `false` (true = 50% off at Batch-API rates, slower; auto-fallback to standard) |
 | HTML→MD normalize    | `AWE_NORMALIZE`       | `true`                 |
 | Follow linked PDFs   | `AWE_FOLLOW_PDF`      | `true`                 |
+| Blocked-page recovery | `AWE_FETCH_FALLBACKS` | `jina,wayback` (ordered; empty = drop blocked pages, no outbound call) |
+| Jina API key         | `JINA_API_KEY`        | unset (anonymous, rate-limited) |
+| Jina return format   | `AWE_JINA_RETURN_FORMAT` | `html` (empty = readability markdown) |
+| Archive staleness cap | `AWE_WAYBACK_MAX_AGE_DAYS` | `0` (any age) |
 | Max page fetches     | `AWE_MAX_FETCHES`     | `10` (per seed)        |
 | Extraction context budget | `AWE_MAX_CONTEXT_TOKENS` | `128000` (over it → summarize to fit) |
 | Always summarize     | `AWE_ALWAYS_SUMMARIZE` | `false` (true = summarize even when the content already fits) |
@@ -526,7 +571,8 @@ agentic_web_extraction/
     summarize.py         # criteria/schema-aware map-reduce summarization (fit to context budget)
     schema_outline.py    # renders a caller schema as a compact field outline for the summarize prompt
     tokens.py            # tiktoken-backed token counting + token-aware splitting
-    fetch.py             # httpx (plain, no HTTP cache) + tenacity retry
+    fallback.py          # blocked-page recovery routes (jina, wayback)
+    fetch.py             # httpx (plain, no HTTP cache) + tenacity retry + status guard
     logsink.py           # shared stderr + optional timestamped log-file sink
     frontier.py          # best-first heap + visited set + PSL registrable-domain (tldextract)
     normalize.py         # HTML→Markdown + raw-HTML link extraction + caller text_filters hook
