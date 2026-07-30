@@ -40,6 +40,30 @@ class Settings(BaseSettings):
     # Whether to fetch and read linked PDFs as page content (env: AWE_FOLLOW_PDF).
     # When False, PDF responses are treated as skipped (no LLM work, no budget cost).
     follow_pdf: bool = True
+    # Ordered, comma-separated recovery routes tried when a fetch comes back
+    # non-2xx (env: AWE_FETCH_FALLBACKS). Empty disables recovery, leaving only
+    # the status guard: an error body is dropped rather than mistaken for the
+    # page. Known routes are "jina" (r.jina.ai renders the URL live and reads
+    # PDFs) and "wayback" (the Internet Archive's newest capture); unknown names
+    # are ignored with a log line. Recovered content is returned under the
+    # original URL, so paths and citations stay canonical, and the route is
+    # recorded in FetchedPage.via / ExtractionResult.fallbacks_used.
+    #
+    # NOTE both routes send the URL being crawled to a third party. Set this
+    # empty if that is unacceptable for your deployment.
+    fetch_fallbacks: str = "jina,wayback"
+    # What the Jina reader should return (env: AWE_JINA_RETURN_FORMAT), sent as
+    # its X-Return-Format header. "html" (the default) yields the full DOM, so
+    # normalization, link extraction, and the frontier behave exactly as they do
+    # on a direct fetch. Empty selects Jina's readability pass instead: markdown
+    # with the nav chrome stripped -- markedly fewer tokens, but only the links
+    # its extraction kept, so the crawl has less to expand into.
+    jina_return_format: str = "html"
+    # Refuse Internet Archive captures older than this many days (env:
+    # AWE_WAYBACK_MAX_AGE_DAYS). 0 (the default) accepts any age. Raise it above
+    # zero when the criterion is time-sensitive and a years-old capture would be
+    # worse than no page at all.
+    wayback_max_age_days: int = 0
     # Fetch budget PER SEED: the max number of readable pages the traversal will
     # spend LLM calls on for each seed URL (env: AWE_MAX_FETCHES). With N seeds the
     # single shared frontier gets a total budget of max_fetches * N. Errored and
@@ -143,6 +167,15 @@ class Settings(BaseSettings):
     openai_base_url: str | None = Field(
         default=None,
         validation_alias="OPENAI_BASE_URL",
+    )
+
+    # Jina reader credential, read from the un-prefixed JINA_API_KEY (same
+    # rationale as OPENAI_*: a standard environment works as-is). Optional --
+    # r.jina.ai serves anonymous requests, just at a tighter per-IP rate limit,
+    # which a wave of blocked pages can trip. SecretStr so it stays out of logs.
+    jina_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias="JINA_API_KEY",
     )
 
 

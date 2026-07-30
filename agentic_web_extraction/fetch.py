@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Literal
+from urllib.parse import urlsplit
 
 import httpx
 from tenacity import (
@@ -9,6 +10,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from . import fallback, logsink
 from .config import get_settings
 
 USER_AGENT = "agentic-web-extraction/0.1 (+https://github.com/)"
@@ -22,6 +24,9 @@ class FetchedPage:
     raw_bytes: bytes
     text: str
     kind: Literal["html", "pdf", "skipped", "error"]
+    via: str = ""
+    """Which recovery route supplied this body, empty when the origin did.
+    ``"jina"`` or ``"wayback:<capture timestamp>"`` — see [fallback.py](fallback.py)."""
 
 
 _client: httpx.Client | None = None
@@ -72,6 +77,44 @@ def _send(url: str) -> httpx.Response:
     return response
 
 
+def content_type_of(response: httpx.Response) -> str:
+    return response.headers.get("content-type", "")
+
+
+def _recover(url: str, follow_pdf: bool) -> FetchedPage | None:
+    """Ask [fallback.py](fallback.py) for a body the origin wouldn't serve.
+
+    Returned under ``url`` itself -- never the reader/archive address -- so the
+    crawl path, and any citation a caller derives from it, names the real page.
+    """
+    # The refusing origin told us nothing about the type, so honour follow_pdf on
+    # the only evidence available before spending a recovery request. Recovered
+    # bodies are classified normally below, which catches the rest.
+    if not follow_pdf and urlsplit(url).path.lower().endswith(".pdf"):
+        logsink.emit(f"    [fallback] skipping {url} — follow_pdf is off")
+        return None
+
+    recovered = fallback.recover(url)
+    if recovered is None:
+        return None
+    kind = _classify(recovered.content_type)
+    if kind == "skipped" or (kind == "pdf" and not follow_pdf):
+        logsink.emit(
+            f"    [fallback] discarding {recovered.via} body for {url} "
+            f"(content-type {recovered.content_type!r})"
+        )
+        return None
+    return FetchedPage(
+        url=url,
+        status=200,
+        content_type=recovered.content_type,
+        raw_bytes=recovered.raw_bytes,
+        text=recovered.text,
+        kind=kind,
+        via=recovered.via,
+    )
+
+
 def fetch(url: str) -> FetchedPage:
     settings = get_settings()
     try:
@@ -94,11 +137,36 @@ def fetch(url: str) -> FetchedPage:
             kind="error",
         )
 
-    content_type = response.headers.get("content-type", "")
+    resolved_url = str(response.url)
+    # Status guard. An error page is routinely served as text/html -- an edge-CDN
+    # "Access Denied" interstitial, a themed 404 -- and classifying on
+    # Content-Type alone would hand that body to the screener and the extraction
+    # call as though it were the page. Worse under seed_is_content, where
+    # screening is skipped and the error text is guaranteed into the extraction.
+    # So: anything outside 2xx is not content. Try to recover the page from
+    # elsewhere, and failing that report kind="error", which the traversal
+    # already skips at no LLM cost and no budget slot.
+    if not 200 <= response.status_code < 300:
+        logsink.emit(
+            f"    [status] {response.status_code} on {resolved_url} — not content"
+        )
+        recovered = _recover(resolved_url, settings.follow_pdf)
+        if recovered is not None:
+            return recovered
+        return FetchedPage(
+            url=resolved_url,
+            status=response.status_code,
+            content_type=content_type_of(response),
+            raw_bytes=b"",
+            text=f"http error: status {response.status_code}",
+            kind="error",
+        )
+
+    content_type = content_type_of(response)
     kind = _classify(content_type)
     if kind == "skipped":
         return FetchedPage(
-            url=str(response.url),
+            url=resolved_url,
             status=response.status_code,
             content_type=content_type,
             raw_bytes=b"",
@@ -107,7 +175,7 @@ def fetch(url: str) -> FetchedPage:
         )
     if kind == "pdf" and not settings.follow_pdf:
         return FetchedPage(
-            url=str(response.url),
+            url=resolved_url,
             status=response.status_code,
             content_type=content_type,
             raw_bytes=b"",
@@ -118,7 +186,7 @@ def fetch(url: str) -> FetchedPage:
     raw = response.content
     text = "" if kind == "pdf" else response.text
     return FetchedPage(
-        url=str(response.url),
+        url=resolved_url,
         status=response.status_code,
         content_type=content_type,
         raw_bytes=raw,

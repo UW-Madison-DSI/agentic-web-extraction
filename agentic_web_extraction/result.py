@@ -96,6 +96,13 @@ class ExtractionResult:
     — either because it exceeded ``max_context_tokens`` or because
     ``always_summarize`` is on."""
 
+    fallbacks_used: dict[str, str] = field(default_factory=dict)
+    """Pages the origin refused (non-2xx) that were recovered elsewhere, as URL →
+    route (``"jina"`` or ``"wayback:<capture timestamp>"``). Empty on a clean
+    crawl. Non-empty means some content did not come from the site itself: read
+    through a third-party renderer, or read from an archived capture that is as
+    old as its timestamp. Worth surfacing wherever the extraction is reported."""
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "data": self.data.model_dump(mode="json")
@@ -112,6 +119,7 @@ class ExtractionResult:
             "content_tokens": self.content_tokens,
             "extraction_input_tokens": self.extraction_input_tokens,
             "summarized": self.summarized,
+            "fallbacks_used": dict(self.fallbacks_used),
             "usage_by_function": {
                 func: {
                     "model": self.function_model.get(func),
