@@ -64,6 +64,28 @@ class Settings(BaseSettings):
     # model context window (e.g. gpt-5.5) while leaving room for the schema,
     # instructions, and output; lower it for models with smaller windows.
     max_context_tokens: int = 128000
+    # Output-token cap for the structured-extraction call (env:
+    # AWE_MAX_OUTPUT_TOKENS). 0 (the default) sends no cap, leaving the endpoint's
+    # own limit in charge -- the historical behavior, byte for byte on the wire.
+    #
+    # Set it when the extract model is prone to degenerate generation. A JSON
+    # grammar permits arbitrary whitespace between tokens, so `\n  ` is always a
+    # legal next token and schema-guided decoding cannot break a repetition loop
+    # the way it would for a malformed key: a model that falls into one emits blank
+    # indentation until *something* stops it. Uncapped, that something is the
+    # endpoint's output limit, which can exceed the client read timeout -- the call
+    # then surfaces as a timeout, gets silently re-sent by the SDK's own retries,
+    # and one extraction burns many minutes without the caller ever seeing a
+    # recoverable error. Capping converts that into a prompt failure the caller can
+    # catch and re-roll cheaply -- a pydantic ValidationError when the truncated
+    # document still parses as text (the usual case), or the AssertionError raised
+    # in extract() when the SDK yields no parsed object at all. Note this is the
+    # Responses API: unlike the chat-completions helper, it does not raise
+    # LengthFinishReasonError on a length cutoff.
+    #
+    # Size it above the largest legitimate extraction for the schema in use; a cap
+    # below that truncates good output, turning a working call into a failing one.
+    max_output_tokens: int = 0
     # Wave concurrency / beam width (env: AWE_MAX_WORKERS). The traversal processes
     # the frontier in waves: it pops up to this many top-scored links at once and
     # fetches/screens/scores them concurrently in a thread pool, then folds the
