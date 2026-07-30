@@ -527,7 +527,9 @@ class OpenAIProvider:
             # None -- so the failure is surfaced explicitly, and logged as a failure
             # rather than as the "ok" the usage delta alone would suggest.
             reason = getattr(response.incomplete_details, "reason", None)
-            detail = f"status={response.status}" + (f" reason={reason}" if reason else "")
+            detail = f"status={response.status}" + (
+                f" reason={reason}" if reason else ""
+            )
             error = AssertionError(f"extraction returned no parsed object ({detail})")
             self._log_call(
                 step, self.model_extract, len(payload), elapsed, delta, error
