@@ -169,9 +169,8 @@ def markdown_to_html(markdown: str) -> str:
     return _MARKDOWN_LINK.sub(anchor, escaped)
 
 
-def _via_jina(url: str) -> Recovered | None:
-    """Read ``url`` through the Jina reader."""
-    fmt = get_settings().jina_return_format.strip()
+def _jina_get(url: str, fmt: str) -> str | None:
+    """One reader call; the body, or None if it wasn't usable."""
     headers = {"X-Return-Format": fmt} if fmt else {}
     try:
         response = _get(f"{JINA_ENDPOINT}{url}", headers=headers)
@@ -184,12 +183,50 @@ def _via_jina(url: str) -> Recovered | None:
     if not response.text.strip():
         logsink.emit(f"    [fallback:jina] returned an empty body for {url}")
         return None
+    return response.text
 
-    # "html" hands back a real DOM the normal path already handles; every other
-    # mode returns markdown, which needs the wrapper above.
-    body = response.text if fmt.lower() == "html" else markdown_to_html(response.text)
+
+def _has_dom(body: str) -> bool:
+    """Whether an ``X-Return-Format: html`` body actually carries markup.
+
+    A PDF (or anything else with no DOM to serialize) comes back from html mode
+    as a stub whose entire content is the literal word ``undefined`` -- 162 bytes
+    where the 32-page document should be. Nothing rejects it downstream: it is a
+    200, it is text, and it normalizes to a short line of prose, so it lands in
+    the extraction as if the document simply had nothing to say. Checking for any
+    tag at all catches that without depending on the reader's exact wording.
+    """
+    return "<" in body[:2000]
+
+
+def _via_jina(url: str) -> Recovered | None:
+    """Read ``url`` through the Jina reader.
+
+    In html mode a target with no DOM (a PDF, an Office document) yields a stub,
+    so that case falls back to the reader's default extraction -- which does read
+    PDFs -- rather than passing the stub off as the page.
+    """
+    fmt = get_settings().jina_return_format.strip()
+    body = _jina_get(url, fmt)
+    if body is None:
+        return None
+
+    used = fmt
+    if fmt.lower() == "html" and not _has_dom(body):
+        logsink.emit(
+            f"    [fallback:jina] html mode returned no markup for {url} "
+            f"({len(body)}B) — retrying with the default reader"
+        )
+        retried = _jina_get(url, "")
+        if retried is None:
+            return None
+        body, used = retried, ""
+
+    # A real DOM is what the normal path already handles; every other mode
+    # returns markdown, which needs the wrapper above.
+    body = body if used.lower() == "html" else markdown_to_html(body)
     logsink.emit(
-        f"    [fallback:jina] recovered {url} ({len(body)}B, format={fmt or 'default'})"
+        f"    [fallback:jina] recovered {url} ({len(body)}B, format={used or 'default'})"
     )
     return Recovered(
         raw_bytes=body.encode("utf-8"),
