@@ -108,6 +108,8 @@ This is best-first search, not breadth-first or depth-first. The LLM's relevance
 
 **Fit-or-summarize.** The concatenated content of all screened-in pages is measured (via tiktoken) against `max_context_tokens`. If it fits, it's extracted as-is. If not, it's compressed first with a criteria- **and schema-aware** map-reduce on the cheap screen model — each page is summarized (keeping everything relevant to your criterion), the summaries are concatenated, and if still over budget the combined text is summarized again until it fits. The concatenated and post-summarization sizes are logged.
 
+`always_summarize` (default `False`) turns the overflow check off as a *gate*: the map pass runs on every run, whether or not the content fits. Use it when you want the compression for its own sake — boilerplate, navigation chrome, and off-criterion prose reduced to a retention list before the strong model reads it, and a cheaper extraction call — rather than only as a last resort before overflow. The reduce passes are unchanged: they still only run while the text is over budget, so a corpus that already fits costs exactly one summarize call per page. Since summarization is lossy, leave it off unless you've checked that what your schema needs survives it.
+
 Summarization is the pipeline's only lossy step — the extraction model never sees the original text — so the summarizer is given **your target schema** alongside the criterion, rendered as a compact field outline. The criterion says what's *topically* relevant; the schema says which concrete values are actually going to be asked for. Without it a summarizer optimizing for topical relevance will happily drop the dates, amounts, identifiers, citations, and URLs that a schema field requires. The prompt frames the schema as a retention list, not a task change: it instructs the model to copy literal values verbatim and keep list-record boundaries intact, while still emitting condensed prose (never JSON) — turning the cheap model into an extractor would lock in its mistakes and discard the context the strong model uses to disambiguate.
 
 ## What you provide
@@ -120,6 +122,7 @@ Optional:
 
 - **Fetch budget** — `max_fetches` (default `10`), applied *per seed* (total budget is `max_fetches × number of seeds`).
 - **Context budget** — `max_context_tokens` (default `128000`). The input-token budget for the single extraction; if the concatenated pages exceed it, they're summarized down first.
+- **Always summarize** — `always_summarize` (default `False`). Run the map-reduce summarization even when the concatenated pages already fit the context budget, to compress boilerplate into a criteria/schema-aware retention list and shrink the extraction call. Costs one summarize call per page and makes the pipeline's lossy step unconditional.
 - **Output cap** — `max_output_tokens` (default `0`, meaning no cap: the endpoint's own limit applies). A backstop for degenerate generation on the extract model. A JSON grammar permits arbitrary whitespace between tokens, so schema-guided decoding can't break a repetition loop the way it would for a malformed key — a model that falls into one emits blank indentation until something stops it. Uncapped, that's the endpoint's limit, which can outlast the client read timeout; the call then surfaces as a timeout and is silently re-sent by the SDK's own retries, so a single extraction can burn many minutes without a recoverable error ever reaching you. Setting a cap converts that into a prompt failure you can catch and re-roll. Size it above the largest legitimate extraction for your schema — a cap below that truncates good output.
 - **Wave concurrency** — `max_workers` (default `8`). How many top-scored links are fetched/screened/scored at once. `1` = strictly sequential best-first.
 - **Direct extraction** — `seed_is_content` (default `False`). When `True`, every seed URL is taken to *be* the content: the pre-screen is skipped (seeds are treated as guaranteed matches) and link-scoring is skipped (no links are queued), so the agent fetches just the seeds, consolidates them, extracts once, and stops. Use it when every seed is already a known target page and you only want the structured extraction — it skips the discovery machinery and the screen/score LLM calls entirely.
@@ -140,7 +143,7 @@ A typed object conforming to your schema (or `None` if nothing screened in), plu
 - `verdicts` — one pre-screen verdict (`url`, `match`, `reason`) per screened page
 - `content_tokens` — estimated token size of the raw concatenation of all screened-in pages
 - `extraction_input_tokens` — token size of what actually fed the extraction (smaller than `content_tokens` when `summarized`)
-- `summarized` — `True` when the concatenation exceeded `max_context_tokens` and was summarized down first
+- `summarized` — `True` when the concatenation was summarized down first (because it exceeded `max_context_tokens`, or because `always_summarize` is on)
 - provider and token usage across all calls, split by call purpose (each with the model it ran on)
 
 Whether the agent succeeded or gave up, the result is structured the same way — easy to audit.
@@ -169,6 +172,7 @@ seed URL(s)
                                   ▼
                         concatenate all collected pages
                         ──▶ fits max_context_tokens?
+                            (always_summarize forces "no")
                               │              │
                              yes             no ──▶ summarize (map-reduce,
                               │                        screen model)
@@ -187,7 +191,7 @@ Each stage is independently swappable.
 | Normalize      | HTML → Markdown for token reduction; pluggable converter; caller-supplied `text_filters` run here |
 | Pre-screen     | Cheap LLM call returning a binary yes/no against user-supplied criterion                    |
 | Score links    | LLM scores every outgoing link's promise against the criterion; output feeds the frontier   |
-| Summarize      | Only when the concatenation overflows `max_context_tokens`; criteria- and schema-aware map-reduce on the screen model |
+| Summarize      | When the concatenation overflows `max_context_tokens` (or on every run, with `always_summarize`); criteria- and schema-aware map-reduce on the screen model |
 | Extract        | One structured-output LLM call over the concatenated (possibly summarized) content; produces JSON conforming to user schema |
 
 By default the link-scorer and summarizer reuse the pre-screen model — all cheap, comparison/compression-style calls.
@@ -215,7 +219,7 @@ That's 124 tokens against 405 for the equivalent JSON Schema; on a deeper schema
 | Pre-screen  | First 16,000 characters of the page                       |
 | Score links | First 4,000 characters (links themselves are never truncated — every link is sent with its full URL and anchor text) |
 | Summarize   | Full chunk (input is pre-chunked to fit the model window) |
-| Extract     | Full concatenated content of all screened-in pages, untruncated (summarized first if over `max_context_tokens`) |
+| Extract     | Full concatenated content of all screened-in pages, untruncated (summarized first if over `max_context_tokens`, or always under `always_summarize`) |
 
 Consequence: a page whose relevant content sits entirely beyond the first 16k characters of markdown will fail the pre-screen and never reach extraction, and the link scorer judges links with context from only the top of the page. Caller-supplied `text_filters` interact with this — stripping boilerplate moves real content earlier in the document, effectively widening what the screen and scoring calls see.
 
@@ -429,7 +433,7 @@ uv run awe extract \
   --max-fetches 10
 ```
 
-The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunities`) or a path to a Python file (`./schemas.py:Opportunities`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Repeat `--seed-url` to pool several seeds into one extraction (`--seed-url URL1 --seed-url URL2`); the fetch budget applies per seed. Add `--max-context-tokens N` to change the extraction input budget (over it, pages are summarized down; defaults to `AWE_MAX_CONTEXT_TOKENS`), and `--max-workers N` to change wave concurrency (defaults to `AWE_MAX_WORKERS`). Add `--seed-is-content` to treat the seeds as the content directly — skip the pre-screen and link-scoring, consolidate the seeds, and extract (`--no-seed-is-content` forces it off, the default; omit to use `AWE_SEED_IS_CONTENT`). Add `--prefer-seed-domain` to softly disfavor off-domain pages/links (the LLM is told the seed/page URL and an on-domain signal; `--no-prefer-seed-domain` forces it off, the default; omit to use `AWE_PREFER_SEED_DOMAIN`). Add `--log-file run.log` to also write a timestamped log file (off by default — no path, no file; see [Logging](#logging)). Add `--no-cache` to disable the on-by-default LLM-response cache (equivalently `AWE_LLM_CACHE=`). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
+The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunities`) or a path to a Python file (`./schemas.py:Opportunities`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Repeat `--seed-url` to pool several seeds into one extraction (`--seed-url URL1 --seed-url URL2`); the fetch budget applies per seed. Add `--max-context-tokens N` to change the extraction input budget (over it, pages are summarized down; defaults to `AWE_MAX_CONTEXT_TOKENS`), `--always-summarize` to summarize even when the pages already fit that budget (`--no-always-summarize` forces it off, the default; omit to use `AWE_ALWAYS_SUMMARIZE`), and `--max-workers N` to change wave concurrency (defaults to `AWE_MAX_WORKERS`). Add `--seed-is-content` to treat the seeds as the content directly — skip the pre-screen and link-scoring, consolidate the seeds, and extract (`--no-seed-is-content` forces it off, the default; omit to use `AWE_SEED_IS_CONTENT`). Add `--prefer-seed-domain` to softly disfavor off-domain pages/links (the LLM is told the seed/page URL and an on-domain signal; `--no-prefer-seed-domain` forces it off, the default; omit to use `AWE_PREFER_SEED_DOMAIN`). Add `--log-file run.log` to also write a timestamped log file (off by default — no path, no file; see [Logging](#logging)). Add `--no-cache` to disable the on-by-default LLM-response cache (equivalently `AWE_LLM_CACHE=`). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
 
 ### Runnable example
 
@@ -487,6 +491,7 @@ Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your pr
 | Follow linked PDFs   | `AWE_FOLLOW_PDF`      | `true`                 |
 | Max page fetches     | `AWE_MAX_FETCHES`     | `10` (per seed)        |
 | Extraction context budget | `AWE_MAX_CONTEXT_TOKENS` | `128000` (over it → summarize to fit) |
+| Always summarize     | `AWE_ALWAYS_SUMMARIZE` | `false` (true = summarize even when the content already fits) |
 | Extraction output cap | `AWE_MAX_OUTPUT_TOKENS` | `0` (no cap; set it to bound degenerate generation on the extract model) |
 | Wave concurrency / beam width | `AWE_MAX_WORKERS` | `8` (1 = sequential best-first) |
 | Token-count encoding | `AWE_TIKTOKEN_ENCODING` | `o200k_base` (fallback for models tiktoken doesn't know) |
@@ -565,7 +570,7 @@ v0 done:
 - [x] Path recording in result metadata
 - [x] Multi-seed pooling (pass a list of seeds into one shared frontier; budget is per seed; a URL reachable from several seeds is screened once; the LLM cache persists across seeds and runs)
 - [x] Consolidate-then-extract (concatenate every screened-in page and run one structured extraction over the whole thing — no per-page extraction, no merge/dedup)
-- [x] Fit-or-summarize (`max_context_tokens`; over budget, a criteria-aware map-reduce on the screen model compresses the content to fit, via tiktoken chunking)
+- [x] Fit-or-summarize (`max_context_tokens`; over budget, a criteria-aware map-reduce on the screen model compresses the content to fit, via tiktoken chunking) — plus an opt-in `always_summarize` that runs the map pass even when the content fits
 - [x] Schema-aware summarization (the target schema is rendered as a compact field outline and handed to the summarizer as a retention list, so compression can't drop the concrete values extraction will demand)
 - [x] Parallel-wave traversal (`max_workers`; pop the top-N frontier links and fetch/screen/score them concurrently, even on a single seed)
 - [x] On-by-default content-addressed LLM cache (`SqliteKVCache` at `AWE_LLM_CACHE`, swappable via the `KVCache` protocol; replays per-page screen/score, per-chunk summaries, and the consolidated extraction — when every contributing page is unchanged — with no LLM calls)

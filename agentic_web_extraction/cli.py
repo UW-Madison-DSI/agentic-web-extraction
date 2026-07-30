@@ -99,6 +99,20 @@ def extract(
             ),
         ),
     ] = None,
+    always_summarize: Annotated[
+        bool | None,
+        typer.Option(
+            "--always-summarize/--no-always-summarize",
+            help=(
+                "Summarize the concatenated pages even when they already fit "
+                "--max-context-tokens (normally summarization only kicks in on "
+                "overflow). Compresses boilerplate down to a criteria-relevant "
+                "retention list and cuts extraction input cost, at the price of "
+                "one summarize call per page and a lossy step the strong model "
+                "cannot see past. Defaults to AWE_ALWAYS_SUMMARIZE (off)."
+            ),
+        ),
+    ] = None,
     max_workers: Annotated[
         int | None,
         typer.Option(
@@ -161,12 +175,14 @@ def extract(
 ) -> None:
     model = load_schema(schema)
     criterion = load_criteria(criteria)
-    # Apply the two settings-only knobs from the CLI via a copy of the base
-    # settings (leaving the cached singleton untouched); everything else keeps its
+    # Apply the settings-only knobs from the CLI via a copy of the base settings
+    # (leaving the cached singleton untouched); everything else keeps its
     # AWE_* / env default.
-    overrides: dict[str, int] = {}
+    overrides: dict[str, int | bool] = {}
     if max_context_tokens is not None:
         overrides["max_context_tokens"] = max_context_tokens
+    if always_summarize is not None:
+        overrides["always_summarize"] = always_summarize
     if max_workers is not None:
         overrides["max_workers"] = max_workers
     settings = get_settings().model_copy(update=overrides) if overrides else None

@@ -64,6 +64,18 @@ class Settings(BaseSettings):
     # model context window (e.g. gpt-5.5) while leaving room for the schema,
     # instructions, and output; lower it for models with smaller windows.
     max_context_tokens: int = 128000
+    # Summarize the concatenated pages unconditionally, not just when they overflow
+    # `max_context_tokens` (env: AWE_ALWAYS_SUMMARIZE). Off by default: summarization
+    # is the only lossy step in the pipeline (the extract model never sees the
+    # original text), so it is normally reserved for content that cannot otherwise
+    # fit. Turn it on when the compression is wanted for its own sake -- to strip
+    # boilerplate/navigation chrome down to a criteria-relevant retention list before
+    # the strong model reads it, or to cut extraction cost on a long-but-fitting
+    # concatenation. The map pass always runs; the reduce passes still only trigger
+    # while the result is over budget, so a small corpus costs exactly one summarize
+    # call per page. Part of the extraction cache key (it changes the extraction
+    # input), and per-chunk summaries stay shared with overflow-triggered runs.
+    always_summarize: bool = False
     # Output-token cap for the structured-extraction call (env:
     # AWE_MAX_OUTPUT_TOKENS). 0 (the default) sends no cap, leaving the endpoint's
     # own limit in charge -- the historical behavior, byte for byte on the wire.

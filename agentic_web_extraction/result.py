@@ -92,8 +92,9 @@ class ExtractionResult:
     ``summarized`` is True."""
 
     summarized: bool = False
-    """True when the concatenation exceeded ``max_context_tokens`` and was
-    map-reduce summarized down before extraction."""
+    """True when the concatenation was map-reduce summarized down before extraction
+    — either because it exceeded ``max_context_tokens`` or because
+    ``always_summarize`` is on."""
 
     def to_dict(self) -> dict[str, Any]:
         return {

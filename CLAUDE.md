@@ -31,7 +31,8 @@ seed*. The loop processes the frontier in **parallel waves** — pop the top-N l
 score outgoing links per page — folding results back on the main thread (which owns
 the frontier; workers never mutate it). Pages that pass screening have their markdown
 **collected**, not extracted per-page. When the frontier empties or the budget is
-spent, the collected pages are concatenated and — if over `max_context_tokens` —
+spent, the collected pages are concatenated and — if over `max_context_tokens`, or
+always under `always_summarize` —
 summarized down (criteria-aware map-reduce on the screen model), then a **single**
 extraction runs over the whole thing. No `merge_extractions`, no dedup. Screen, link-
 scorer, and summarizer share a cheap model; extraction uses a stronger one.
@@ -73,6 +74,13 @@ domain compare), [normalize.py](agentic_web_extraction/normalize.py),
   with the criteria-aware map-reduce in [summarize.py](agentic_web_extraction/summarize.py)
   (screen model), never by silently truncating. Concatenation order and the extraction
   cache key are made deterministic by sorting contributing pages on canonical URL.
+  `always_summarize` (env `AWE_ALWAYS_SUMMARIZE`, default off) makes the overflow check
+  non-gating: `fit_pages(always=True)` runs the map pass unconditionally, for callers who
+  want the compression itself (boilerplate → retention list, cheaper extraction input).
+  It only affects the *map* pass — the reduce loop and the hard-truncate guard stay
+  keyed on being over budget — and it joins `ctx`/`enc` in the extraction cache key
+  since it changes the extraction input. `SUMMARY` entries are keyed on content alone,
+  so they stay shared between always-on and overflow-triggered runs.
 - **Summarization is schema-aware, but must not become extraction.** It's the only lossy
   step (the extract model never sees the original text), so `fit_pages` threads the target
   schema into every `provider.summarize` call and the provider appends
@@ -121,8 +129,9 @@ domain compare), [normalize.py](agentic_web_extraction/normalize.py),
   its own. Keep the *rendered* outline out of `prompt_signature` (the schema JSON it
   derives from is already in the stamp; adding both is redundant).
 - **Don't fork CLI vs Python logic.** The CLI wires to the same `Extractor` the Python
-  API exposes. `--max-context-tokens`/`--max-workers` are settings-only knobs, so the CLI
-  injects them via `settings.model_copy(update=...)`, not `extract()` args.
+  API exposes. `--max-context-tokens`/`--always-summarize`/`--max-workers` are
+  settings-only knobs, so the CLI injects them via `settings.model_copy(update=...)`,
+  not `extract()` args.
 - **The README `<!-- adopters:start -->` block is generated.** Never hand-edit it;
   [scripts/adopters.py](scripts/adopters.py) (weekly, via
   [.github/workflows/adopters.yml](.github/workflows/adopters.yml)) overwrites it. That
@@ -169,6 +178,7 @@ domain compare), [normalize.py](agentic_web_extraction/normalize.py),
 awe extract --schema ./schemas.py:Opportunities --criteria "..." \
   --seed-url https://... [--seed-url https://... ...] \
   [--max-fetches 10] [--max-context-tokens 128000] [--max-workers 8] \
+  [--always-summarize | --no-always-summarize] \
   [--seed-is-content | --no-seed-is-content] \
   [--prefer-seed-domain | --no-prefer-seed-domain] [--log-file log.txt] [--no-cache]
 ```
