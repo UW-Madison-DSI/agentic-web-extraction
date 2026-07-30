@@ -491,6 +491,11 @@ class OpenAIProvider:
     ) -> BaseModel:
         payload = f"CONTENT:\n{page_md}"
         step = f"{usage_tag}[{schema.__name__}]"
+        # Unset (0) sends no cap, so the wire is unchanged from before this knob
+        # existed. When set, it bounds a degenerate generation -- see
+        # Settings.max_output_tokens for why schema-guided decoding needs the
+        # backstop and how to size it.
+        cap = self.settings.max_output_tokens or omit
         t0 = time.monotonic()
         try:
             response = self._tiered(
@@ -499,6 +504,7 @@ class OpenAIProvider:
                     instructions=self.extract_prompt,
                     input=payload,
                     text_format=schema,
+                    max_output_tokens=cap,
                     service_tier=tier,
                 )
             )
@@ -507,10 +513,25 @@ class OpenAIProvider:
                 step, self.model_extract, len(payload), time.monotonic() - t0, None, e
             )
             raise
+        # Accumulated before the outcome is known: a truncated or refused response
+        # is billed like any other, so leaving it out would under-report what a run
+        # actually cost -- and the capped case below is exactly the one a caller
+        # re-rolls, making those tokens easy to lose track of.
         delta = self._accumulate(response, self.model_extract, usage_tag)
-        self._log_call(
-            step, self.model_extract, len(payload), time.monotonic() - t0, delta
-        )
+        elapsed = time.monotonic() - t0
         parsed = response.output_parsed
-        assert parsed is not None
+        if parsed is None:
+            # No parsed object: the model hit max_output_tokens mid-document, or the
+            # response is otherwise unusable. Unlike the chat-completions helper, the
+            # Responses parser raises nothing here -- it just leaves output_parsed
+            # None -- so the failure is surfaced explicitly, and logged as a failure
+            # rather than as the "ok" the usage delta alone would suggest.
+            reason = getattr(response.incomplete_details, "reason", None)
+            detail = f"status={response.status}" + (f" reason={reason}" if reason else "")
+            error = AssertionError(f"extraction returned no parsed object ({detail})")
+            self._log_call(
+                step, self.model_extract, len(payload), elapsed, delta, error
+            )
+            raise error
+        self._log_call(step, self.model_extract, len(payload), elapsed, delta)
         return parsed
