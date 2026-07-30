@@ -2,8 +2,9 @@
 
 The consolidate-then-extract flow feeds one extraction call the concatenated
 markdown of every page that passed screening. When that concatenation exceeds
-``max_context_tokens`` it has to be compressed first. This module does that with
-a criteria-aware map-reduce on the cheap *screen* model:
+``max_context_tokens`` it has to be compressed first -- or, with ``always=True``,
+whenever the caller wants it compressed regardless. This module does that with a
+criteria-aware map-reduce on the cheap *screen* model:
 
 * **map** — summarize each page independently (a page is the natural, cache-
   stable unit; a page larger than the chunk budget is token-sliced first);
@@ -103,6 +104,7 @@ def fit_pages(
     schema: type[BaseModel] | None = None,
     provider: Provider,
     max_context_tokens: int,
+    always: bool = False,
     model: str,
     encoding_name: str,
     cache: KVCache | None,
@@ -116,6 +118,12 @@ def fit_pages(
     (dates, numbers, identifiers, URLs) must survive, not just which topics are
     relevant. Optional, so a caller can compress criterion-only.
 
+    `always` runs the map pass even when the concatenation already fits, for a
+    caller that wants the compression for its own sake (boilerplate stripped to a
+    criteria-relevant retention list, cheaper extraction input) rather than only as
+    an overflow remedy. It does not change the reduce loop: those passes still only
+    run while the text is over budget.
+
     Returns ``(text, summarized, content_tokens, extraction_input_tokens)`` where
     ``content_tokens`` is the raw concatenation's size and
     ``extraction_input_tokens`` is the size of what actually feeds extraction
@@ -123,14 +131,21 @@ def fit_pages(
     """
     concat = _concat(pages)
     content_tokens = count_tokens(concat, model, encoding_name)
-    if content_tokens <= max_context_tokens:
+    over_budget = content_tokens > max_context_tokens
+    if not over_budget and not always:
         log(f"    [context] {content_tokens} tokens (<= budget {max_context_tokens})")
         return concat, False, content_tokens, content_tokens
 
-    log(
-        f"    [summarize] concatenated {content_tokens} tokens exceeds budget "
-        f"{max_context_tokens}; summarizing on {provider.model_screen}"
-    )
+    if over_budget:
+        log(
+            f"    [summarize] concatenated {content_tokens} tokens exceeds budget "
+            f"{max_context_tokens}; summarizing on {provider.model_screen}"
+        )
+    else:
+        log(
+            f"    [summarize] always_summarize on: compressing {content_tokens} "
+            f"tokens (within budget {max_context_tokens}) on {provider.model_screen}"
+        )
     budget = max(1, max_context_tokens)
 
     # Map: summarize each page independently (cache-stable unit), then reduce.

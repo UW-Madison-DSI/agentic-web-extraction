@@ -156,8 +156,9 @@ class Extractor:
         ``max_fetches`` *per seed* (so ``max_fetches * len(seeds)`` total). The
         frontier is processed in parallel waves. The normalized markdown of every
         page that passes screening (across all seeds) is concatenated and, if it
-        exceeds ``max_context_tokens``, summarized down; then one extraction runs
-        over the whole thing. `seeds` accepts a single URL string or a sequence.
+        exceeds ``max_context_tokens`` (or always, under ``always_summarize``),
+        summarized down; then one extraction runs over the whole thing. `seeds`
+        accepts a single URL string or a sequence.
         """
         seed_list = [seeds] if isinstance(seeds, str) else list(seeds)
         if not seed_list:
@@ -477,8 +478,13 @@ class Extractor:
         matched_pages.sort(key=lambda t: canonical(t[0]))
         pages_for_fit = [(url, md) for url, md, _ck in matched_pages]
         page_keys = [ck for _u, _m, ck in matched_pages]
+        # `always` joins ctx/enc in the key: like them it decides what text reaches
+        # the extraction call, so a run with it flipped must not replay the other's
+        # object. (Per-chunk SUMMARY entries are keyed on content alone and stay
+        # shared between always-on and overflow-triggered runs.)
         extract_key = (
             f"{self._cache_version}:ctx={self.settings.max_context_tokens}"
+            f":always={'1' if self.settings.always_summarize else '0'}"
             f":enc={self.settings.tiktoken_encoding}:{extract_cache_key(page_keys)}"
         )
 
@@ -517,6 +523,7 @@ class Extractor:
             schema=self.schema,
             provider=self.provider,
             max_context_tokens=self.settings.max_context_tokens,
+            always=self.settings.always_summarize,
             model=self.provider.model_extract,
             encoding_name=self.settings.tiktoken_encoding,
             cache=self.cache,
