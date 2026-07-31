@@ -1,0 +1,34 @@
+name: adopters
+
+on:
+  schedule:
+    # Off the hour: on-the-hour crons queue behind everyone else's.
+    - cron: "17 8 * * 1"
+  workflow_dispatch:
+
+# Two concurrent runs would race on one README block.
+concurrency:
+  group: adopters
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6 # its GITHUB_TOKEN pushes the commit
+      - uses: astral-sh/setup-uv@v7
+      - id: scan
+        env:
+          # Scoped to this step only, never persisted to git.
+          GH_TOKEN: ${{ secrets.ADOPTER_SCAN_TOKEN }}
+        # --no-project: the script is stdlib-only PEP 723, it needs no venv or lockfile.
+        run: uv run --no-project scripts/adopters.py --write
+      - if: steps.scan.outputs.changed == 'true'
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add README.md
+          git commit -m 'chore: refresh adopter badges (${{ steps.scan.outputs.count }} deploying repos) [skip ci]'
+          git push

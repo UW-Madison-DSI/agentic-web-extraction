@@ -85,6 +85,15 @@ compare), [normalize.py](agentic_web_extraction/normalize.py),
   keep that mechanism, but the reference example no longer takes `cache`.
 - **Don't fork CLI vs Python logic.** The CLI wires to the same `Extractor` the Python
   API exposes.
+- **The README `<!-- adopters:start -->` block is generated.** Never hand-edit it;
+  [scripts/adopters.py](scripts/adopters.py) (weekly, via
+  [.github/workflows/adopters.yml](.github/workflows/adopters.yml)) overwrites it. That
+  script is deliberately stdlib-only PEP 723 and must hard-fail — a missing/under-scoped
+  token or any API error exits non-zero with the README untouched, because a silent zero
+  is indistinguishable from real disadoption. No public-only fallback, and don't go
+  looking for a download metric to "improve" it: GitHub Packages exposes none, and PyPI
+  counts can't attribute to a repo. Only a *dependency manifest* declaration counts;
+  imports and `awe extract` invocations are reported in the job summary, never counted.
 
 ## Dependency gotchas
 

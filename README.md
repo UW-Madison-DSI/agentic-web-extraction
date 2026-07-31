@@ -388,7 +388,64 @@ examples/
     grants.py            # reference Opportunity + Opportunities schema (merge_extractions demo)
     strippers.py         # example cache-stability text_filters (site-specific; kept out of the package)
 pyproject.toml           # uv project, Python ≥3.13
+scripts/
+    adopters.py          # weekly org adoption scan (stdlib-only PEP 723)
+.github/workflows/
+    adopters.yml         # cron: refresh the adopter badges below
 ```
+
+## Adopters
+
+Repos in the `UW-Madison-DSI` org that declare a dependency on this package.
+Refreshed weekly by [`.github/workflows/adopters.yml`](.github/workflows/adopters.yml) —
+green = pinned to a concrete release, orange = floating (a git ref or no version
+constraint at all).
+
+<!-- adopters:start -->
+[![UW-Madison-DSI/rabbit-platform](https://img.shields.io/badge/rabbit--platform-8e8f674-orange)](https://github.com/UW-Madison-DSI/rabbit-platform)
+<!-- adopters:end -->
+
+Don't hand-edit the block between those markers — the next scan overwrites it.
+
+<details><summary>How the scan works</summary>
+
+GitHub Packages exposes no pull or download metric, and PyPI download counts
+can't say *which* org repo installed us, so the only available adoption signal
+is the org's own source via the Code Search API.
+[`scripts/adopters.py`](scripts/adopters.py) runs two searches (`"agentic-web-extraction"`
+and `"agentic_web_extraction"`), then fetches each hit and applies one counting
+rule:
+
+- **Counted** — a dependency manifest (`pyproject.toml`, `requirements*.txt`,
+  `uv.lock`, …) declares the distribution on a non-comment line. Comments are
+  stripped first, so a repo that mentions the package in a comment while running
+  something else isn't reported as an adopter.
+- **Reported, not counted** — a repo that only imports `agentic_web_extraction`
+  or shells out to `awe extract`. That's necessary but not sufficient: a vendored
+  copy, a sibling checkout, or a notebook that pip-installs from a branch all
+  produce it, and none pin a version. These land in the run's job summary, which
+  is the difference between a known gap and an invisible one.
+
+The scan **hard-fails** rather than degrade. It needs a token that can read
+private repos (the default `GITHUB_TOKEN` is scoped to one repo and would find
+nothing), and an under-scoped token is the dangerous case: it authenticates
+fine, answers HTTP 200 to everything, and returns empty results from every code
+search — rendering "none yet" over real adopters. So `preflight` checks the org
+object for `total_private_repos` *before* searching, and any missing token,
+rejected token, or API error exits non-zero with the README untouched.
+
+Run it locally (dry run — prints the table and badge block, writes nothing):
+
+```bash
+GH_TOKEN=$(gh auth token) uv run --no-project scripts/adopters.py
+```
+
+CI needs a secret `ADOPTER_SCAN_TOKEN`: a classic PAT with `repo` scope, or a
+fine-grained PAT whose **resource owner is the org** (not a person) with all
+repositories + Contents: read + Metadata: read. Code Search indexes default
+branches only, so an adopter on an unmerged branch is invisible by design.
+
+</details>
 
 ## Development
 
@@ -420,3 +477,4 @@ v0 done:
 - [x] Caller-supplied `text_filters` (site-specific cache-stability strippers live in `examples/`, not the library)
 - [x] Opt-in soft same-domain preference (single `prefer_seed_domain` knob, off by default; LLM is fed an on-domain signal and asked to disfavor off-domain content; PSL-based registrable domain via `tldextract`)
 - [x] `examples/` directory with reference schemas and filters (`examples/grants.py`, `examples/strippers.py`, kept out of the package)
+- [x] Weekly org adoption scan (`scripts/adopters.py` + `.github/workflows/adopters.yml`; Code Search → shields badges in the [Adopters](#adopters) block, hard-fails on an under-scoped token rather than committing a silent zero)
