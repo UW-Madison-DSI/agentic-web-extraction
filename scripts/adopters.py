@@ -547,6 +547,13 @@ def render_badges(adopters: list[Adopter]) -> str:
 
 
 def replace_block(readme: str, body: str) -> str:
+    """Rewrite only the text between the markers, leaving the rest byte-identical.
+
+    Position is therefore a property of the README, never of this script: the
+    block stays wherever the markers are put, and everything outside them —
+    including the section heading and prose around it — is preserved exactly.
+    Move the markers to move the badges.
+    """
     start = readme.find(MARKER_START)
     end = readme.find(MARKER_END)
     if start < 0 or end < 0 or end < start:
