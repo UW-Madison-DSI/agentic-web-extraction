@@ -94,6 +94,12 @@ compare), [normalize.py](agentic_web_extraction/normalize.py),
   looking for a download metric to "improve" it: GitHub Packages exposes none, and PyPI
   counts can't attribute to a repo. Only a *dependency manifest* declaration counts;
   imports and `awe extract` invocations are reported in the job summary, never counted.
+  **Counting must not go back through the Code Search API** — code search had only 23 of
+  the org's 55 Python repos indexed and missed a real adopter, so discovery enumerates
+  `GET /orgs/{org}/repos` and walks each repo's `git/trees/{branch}?recursive=1`.
+  Code search is retained *only* for the never-counted weak signal. Anything meaning the
+  count is a floor (truncated tree, unexhausted repo pages) is a hard error, and every
+  run prints `Examined N/M org repos` so an incomplete sweep is visible.
 
 ## Dependency gotchas
 

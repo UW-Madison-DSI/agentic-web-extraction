@@ -402,6 +402,7 @@ green = pinned to a concrete release, orange = floating (a git ref or no version
 constraint at all).
 
 <!-- adopters:start -->
+[![UW-Madison-DSI/foundation-opportunity-extraction](https://img.shields.io/badge/foundation--opportunity--extraction-batch--extraction-orange)](https://github.com/UW-Madison-DSI/foundation-opportunity-extraction)
 [![UW-Madison-DSI/rabbit-platform](https://img.shields.io/badge/rabbit--platform-8e8f674-orange)](https://github.com/UW-Madison-DSI/rabbit-platform)
 <!-- adopters:end -->
 
@@ -410,11 +411,19 @@ Don't hand-edit the block between those markers — the next scan overwrites it.
 <details><summary>How the scan works</summary>
 
 GitHub Packages exposes no pull or download metric, and PyPI download counts
-can't say *which* org repo installed us, so the only available adoption signal
-is the org's own source via the Code Search API.
-[`scripts/adopters.py`](scripts/adopters.py) runs two searches (`"agentic-web-extraction"`
-and `"agentic_web_extraction"`), then fetches each hit and applies one counting
-rule:
+can't say *which* org repo installed us, so the signal has to come from the org's
+own source.
+
+It does **not** come from the Code Search API. Code search had only 23 of this
+org's 55 Python repos indexed — repos whose `pyproject.toml` contains
+`requires-python` returned zero hits for it, while the token had full private
+visibility — so a search-driven count is a floor wearing the costume of a total.
+It missed a real adopter. Instead,
+[`scripts/adopters.py`](scripts/adopters.py) enumerates every repo from
+`GET /orgs/{org}/repos` and reads each one's file tree directly
+(`git/trees/{branch}?recursive=1`), which is complete by construction, sees
+manifests in subdirectories, and doesn't care whether a repo is indexed. Then one
+counting rule:
 
 - **Counted** — a dependency manifest (`pyproject.toml`, `requirements*.txt`,
   `uv.lock`, …) declares the distribution on a non-comment line. Comments are
@@ -423,16 +432,28 @@ rule:
 - **Reported, not counted** — a repo that only imports `agentic_web_extraction`
   or shells out to `awe extract`. That's necessary but not sufficient: a vendored
   copy, a sibling checkout, or a notebook that pip-installs from a branch all
-  produce it, and none pin a version. These land in the run's job summary, which
-  is the difference between a known gap and an invisible one.
+  produce it, and none pin a version. This is the one signal still gathered by
+  code search, so it inherits the index gap — but since it is only ever reported,
+  never counted, that understates a gap already labelled as one.
 
-The scan **hard-fails** rather than degrade. It needs a token that can read
-private repos (the default `GITHUB_TOKEN` is scoped to one repo and would find
-nothing), and an under-scoped token is the dangerous case: it authenticates
-fine, answers HTTP 200 to everything, and returns empty results from every code
-search — rendering "none yet" over real adopters. So `preflight` checks the org
-object for `total_private_repos` *before* searching, and any missing token,
-rejected token, or API error exits non-zero with the README untouched.
+Colour is about *what the repo tracks*, not whether a version string exists:
+green only if every detected ref is a concrete release. A `uv.lock` entry with a
+git source is deliberately labelled with its branch/tag/sha rather than the
+`version` field next to it, because that field is just whatever this package's
+own `pyproject.toml` said at that commit — reading it as a release pin would
+paint a branch-tracking repo green.
+
+The scan **hard-fails** rather than degrade, and reports what it examined:
+
+- A missing token, rejected token, or any API error exits non-zero with the
+  README untouched. `preflight` additionally proves private visibility *before*
+  scanning, because an under-scoped token authenticates fine, answers HTTP 200 to
+  everything, and returns empty results — rendering "none yet" over real
+  adopters.
+- A truncated file tree or an unexhausted page of repos is a hard error too, not
+  a shrug: both mean the count is a floor being presented as a total.
+- Every run prints `Examined N/M org repos`, so an incomplete scan is visible
+  rather than implied.
 
 Run it locally (dry run — prints the table and badge block, writes nothing):
 
@@ -440,10 +461,13 @@ Run it locally (dry run — prints the table and badge block, writes nothing):
 GH_TOKEN=$(gh auth token) uv run --no-project scripts/adopters.py
 ```
 
+The full org sweep is ~400 API calls and takes about 2½ minutes — all on the
+5000/hour core bucket, so it fits a weekly job comfortably.
+
 CI needs a secret `ADOPTER_SCAN_TOKEN`: a classic PAT with `repo` scope, or a
 fine-grained PAT whose **resource owner is the org** (not a person) with all
-repositories + Contents: read + Metadata: read. Code Search indexes default
-branches only, so an adopter on an unmerged branch is invisible by design.
+repositories + Contents: read + Metadata: read. Only default branches are read,
+so an adopter on an unmerged branch is invisible by design.
 
 </details>
 
@@ -477,4 +501,4 @@ v0 done:
 - [x] Caller-supplied `text_filters` (site-specific cache-stability strippers live in `examples/`, not the library)
 - [x] Opt-in soft same-domain preference (single `prefer_seed_domain` knob, off by default; LLM is fed an on-domain signal and asked to disfavor off-domain content; PSL-based registrable domain via `tldextract`)
 - [x] `examples/` directory with reference schemas and filters (`examples/grants.py`, `examples/strippers.py`, kept out of the package)
-- [x] Weekly org adoption scan (`scripts/adopters.py` + `.github/workflows/adopters.yml`; Code Search → shields badges in the [Adopters](#adopters) block, hard-fails on an under-scoped token rather than committing a silent zero)
+- [x] Weekly org adoption scan (`scripts/adopters.py` + `.github/workflows/adopters.yml`; index-independent repo/tree sweep → shields badges in the [Adopters](#adopters) block, hard-fails and reports coverage rather than committing a silent undercount)

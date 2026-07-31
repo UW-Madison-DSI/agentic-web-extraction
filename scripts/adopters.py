@@ -4,16 +4,24 @@
 # ///
 """Scan the org for repos that actually depend on this package, render badges.
 
-GHCR / GitHub Packages exposes no pull or download metric, and PyPI download
-stats say nothing about *which* org repos adopted us. The only available
-adoption signal is the org's own source, via the Code Search API.
+GitHub Packages exposes no pull or download metric, and PyPI download stats say
+nothing about *which* org repos adopted us, so the signal has to come from the
+org's own source.
 
-Counting rule (see the invariants below): a repo counts as an adopter only when a
-*dependency manifest* declares this distribution on a non-comment line. An import
-of the module, or an `awe extract` invocation, is necessary but not sufficient —
-a vendored copy, a sibling checkout, or a notebook that pip-installs from a
-branch all produce it, and none of them pin a version. Those are reported in the
-job summary, never counted.
+It does NOT come from the Code Search API. Code search only had 23 of this org's
+55 Python repos indexed — repos containing `requires-python` returned zero hits
+for it while the token had full private visibility — so a search-driven count is
+a floor wearing the costume of a total. Instead, every repo is enumerated from
+`GET /orgs/{org}/repos` and its file tree read directly, which is complete by
+construction and indifferent to indexing.
+
+Counting rule: a repo counts as an adopter only when a *dependency manifest*
+declares this distribution on a non-comment line. An import of the module, or an
+`awe extract` invocation, is necessary but not sufficient — a vendored copy, a
+sibling checkout, or a notebook that pip-installs from a branch all produce it,
+and none of them pin a version. Those are still found via code search and
+reported in the job summary, never counted, so the index gap only understates a
+gap that was already labelled as one.
 
 Hard-fails on any API error or under-scoped token: a silent zero is
 indistinguishable from real disadoption, so a wrong badge is worse than a failed
@@ -34,7 +42,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -53,7 +61,7 @@ README = Path(__file__).resolve().parent.parent / "README.md"
 
 API_ROOT = "https://api.github.com"
 MAX_PAGES = 10  # 1000 hits; a backstop, not an expected limit
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 4  # tree calls on multi-gigabyte repos need more than one go
 SEARCH_PAUSE = 2.0  # Code Search allows 30 req/min
 
 # PEP 503 name normalization: `agentic_web_extraction>=0.1` in a requirements
@@ -85,9 +93,18 @@ SOURCE_REF_RE = re.compile(
     rf"{_PKG}\s*=\s*\{{[^}}]*?\b(?:rev|tag|branch)\s*=\s*\"([^\"]+)\"",
     re.IGNORECASE,
 )
-# uv.lock / poetry.lock pin the exact resolved version on the next line.
-LOCK_VERSION_RE = re.compile(
-    rf'name\s*=\s*"{_PKG}"\s*\n\s*version\s*=\s*"([^"]+)"', re.IGNORECASE
+# uv.lock / poetry.lock record the resolved version on the next line, and often a
+# `source` after it. The source matters: for a git source the `version` is just
+# whatever our own pyproject said at that commit, so treating it as a release pin
+# would paint a branch-tracking repo green.
+LOCK_BLOCK_RE = re.compile(
+    rf'name\s*=\s*"{_PKG}"\s*\nversion\s*=\s*"([^"]+)"'
+    rf"(?:\s*\nsource\s*=\s*\{{([^}}]*)\}})?",
+    re.IGNORECASE,
+)
+# `{ git = "https://…/repo?branch=batch-extraction#8246a1e…" }`
+GIT_SOURCE_REF_RE = re.compile(
+    r"[?&]tag=([^#&\"\s]+)|[?&]branch=([^#&\"\s]+)|#([0-9a-f]{7,40})", re.IGNORECASE
 )
 # Necessary but not sufficient: reported, never counted.
 WEAK_RE = re.compile(rf"(?:\bimport\s+{_MOD}\b|\bfrom\s+{_MOD}[\s.]|\bawe\s+extract\b)")
@@ -109,6 +126,19 @@ MANIFEST_NAMES = frozenset(
     }
 )
 
+VENDOR_DIRS = frozenset(
+    {
+        ".git",
+        ".tox",
+        ".venv",
+        "dist-packages",
+        "node_modules",
+        "site-packages",
+        "venv",
+        "vendor",
+    }
+)
+
 
 class ScanError(Exception):
     """Any condition that must abort the run and leave the README untouched."""
@@ -123,8 +153,14 @@ def log(message: str) -> None:
     print(message, file=sys.stderr)
 
 
-def api(path: str, token: str) -> dict | list:
-    """GET one GitHub API path. Raises ScanError on anything but success."""
+def api(path: str, token: str, tolerate: tuple[int, ...] = ()) -> dict | list | None:
+    """GET one GitHub API path.
+
+    Raises ScanError on anything but success, except for status codes in
+    `tolerate`, which return None — used for the handful of conditions that are
+    genuinely "nothing here" rather than "the scan is broken" (an empty repo has
+    no tree).
+    """
     url = path if path.startswith("http") else f"{API_ROOT}/{path.lstrip('/')}"
     request = urllib.request.Request(
         url,
@@ -137,21 +173,60 @@ def api(path: str, token: str) -> dict | list:
     )
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.urlopen(request, timeout=60) as response:
                 return json.loads(response.read().decode())
         except urllib.error.HTTPError as error:
-            retryable = error.code in (403, 429) and attempt < MAX_ATTEMPTS
-            if not retryable:
-                body = error.read().decode(errors="replace")[:400]
-                raise ScanError(f"GET {url} -> HTTP {error.code}: {body}") from error
+            body = error.read().decode(errors="replace")
+            if error.code in tolerate:
+                return None
+            # A 403 is both "rate limited" and "forbidden"; only the former is
+            # worth retrying, and only the body distinguishes them. A 5xx is
+            # transient — a recursive tree call on a multi-gigabyte repo flakes
+            # and then succeeds on the next attempt.
+            rate_limited = error.code == 429 or (
+                error.code == 403 and "rate limit" in body.lower()
+            )
+            if not (rate_limited or error.code >= 500) or attempt >= MAX_ATTEMPTS:
+                raise ScanError(
+                    f"GET {url} -> HTTP {error.code}: {body[:400]}"
+                ) from error
             delay = float(error.headers.get("Retry-After") or 2**attempt)
-            log(f"  rate limited on {url} (attempt {attempt}); sleeping {delay:.0f}s")
+            log(
+                f"  HTTP {error.code} on {url} (attempt {attempt}); sleeping {delay:.0f}s"
+            )
             time.sleep(delay)
         except urllib.error.URLError as error:
             if attempt >= MAX_ATTEMPTS:
                 raise ScanError(f"GET {url} failed: {error.reason}") from error
             time.sleep(2**attempt)
+        except json.JSONDecodeError as error:
+            # A response body cut off mid-stream; same flakiness as the 5xx above.
+            if attempt >= MAX_ATTEMPTS:
+                raise ScanError(
+                    f"GET {url} returned malformed JSON: {error}"
+                ) from error
+            log(f"  truncated body from {url} (attempt {attempt}); retrying")
+            time.sleep(2**attempt)
     raise ScanError(f"GET {url} exhausted {MAX_ATTEMPTS} attempts")
+
+
+def api_paged(path: str, token: str) -> list:
+    """GET every page of a list endpoint."""
+    joiner = "&" if "?" in path else "?"
+    items: list = []
+    for page in range(1, MAX_PAGES + 1):
+        payload = api(f"{path}{joiner}per_page=100&page={page}", token)
+        if not isinstance(payload, list):
+            raise ScanError(f"{path} page {page} did not return a list")
+        items.extend(payload)
+        if len(payload) < 100:
+            return items
+    # Silently keeping the first MAX_PAGES pages would drop repos from the scan
+    # and report the remainder as the whole org.
+    raise ScanError(
+        f"{path} still had pages after {MAX_PAGES}; raise MAX_PAGES rather than "
+        "scan part of the org"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -188,8 +263,49 @@ def preflight(token: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Search + fetch
+# Discovery — enumerate repos and their manifests without the search index
 # --------------------------------------------------------------------------- #
+
+
+def list_repos(token: str) -> list[dict]:
+    """Every repo in the org. Complete by construction, unlike a code search."""
+    repos = api_paged(f"orgs/{ORG}/repos?type=all", token)
+    keep = [r for r in repos if r["full_name"].casefold() != SELF.casefold()]
+    log(f"org has {len(repos)} repos ({len(keep)} after excluding self)")
+    return sorted(keep, key=lambda r: r["full_name"].casefold())
+
+
+def list_manifests(repo: dict, token: str) -> tuple[list[str], bool]:
+    """Manifest paths in one repo's default branch, via a single tree call.
+
+    Returns (paths, complete). This is the fix for the code-search index: the
+    tree is authoritative for what the repo actually contains, and it sees
+    manifests in subdirectories, which is how a monorepo declares dependencies.
+    """
+    branch = repo.get("default_branch")
+    if not branch:
+        return [], True  # no commits yet
+    name = repo["full_name"]
+    # 404/409: empty repo or a branch that vanished mid-run — genuinely nothing,
+    # not a broken scan.
+    payload = api(
+        f"repos/{name}/git/trees/{urllib.parse.quote(branch)}?recursive=1",
+        token,
+        tolerate=(404, 409),
+    )
+    if payload is None:
+        return [], True
+    if not isinstance(payload, dict):
+        raise ScanError(f"tree for {name} is not an object")
+    paths = [
+        entry["path"]
+        for entry in payload.get("tree", [])
+        if entry.get("type") == "blob" and is_manifest(entry["path"])
+    ]
+    # A truncated tree means files were omitted, so a manifest may have been
+    # missed. That is exactly the silent undercount this rewrite exists to kill,
+    # so it is not tolerated — see `Coverage`.
+    return paths, not payload.get("truncated", False)
 
 
 def search_code(query: str, token: str) -> dict[str, set[str]]:
@@ -253,8 +369,15 @@ def strip_comments(text: str) -> str:
 
 
 def is_manifest(path: str) -> bool:
-    """Only a dependency manifest can prove adoption."""
-    base = path.rsplit("/", 1)[-1].casefold()
+    """Only a dependency manifest can prove adoption.
+
+    Vendored trees are excluded: a committed `.venv` or `site-packages` contains
+    *our own* metadata, which would badge a repo for checking in a virtualenv.
+    """
+    lowered = path.casefold()
+    if any(part in VENDOR_DIRS for part in lowered.split("/")[:-1]):
+        return False
+    base = lowered.rsplit("/", 1)[-1]
     if base in MANIFEST_NAMES:
         return True
     return base.endswith(".txt") and "requirement" in base
@@ -290,51 +413,105 @@ class Adopter:
         return f"https://github.com/{self.repo}"
 
 
+@dataclass
+class Coverage:
+    """What the scan actually looked at.
+
+    `preflight` proves the *token* can see the org; it cannot prove GitHub has
+    *indexed* it. Coverage is the same idea one layer down: a number is only
+    trustworthy if the scan can say what it examined.
+    """
+
+    total: int = 0
+    examined: int = 0
+    empty: int = 0
+    manifests: int = 0
+    truncated: list[str] = field(default_factory=list)
+
+
 def short_ref(ref: str) -> str:
     """A full commit SHA is 40 badge characters of noise; 7 is the git default."""
     return ref[:7] if re.fullmatch(r"[0-9a-f]{40}", ref) else ref
 
 
-def classify(
-    repo: str, paths: set[str], token: str
-) -> tuple[Adopter | None, tuple[str, ...]]:
-    """Decide whether `repo` counts, and collect its weak (config-only) paths."""
+def declares(text: str) -> tuple[bool, set[str]]:
+    """Does this comment-stripped manifest declare the package, and at what version?"""
+    declared = False
+    versions: set[str] = set()
+    for line in text.splitlines():
+        if not DEP_RE.search(line) or NAME_DECL_RE.match(line):
+            continue
+        declared = True
+        match = (
+            SPEC_VERSION_RE.search(line)
+            or GITREF_RE.search(line)
+            or SOURCE_REF_RE.search(line)
+        )
+        if match:
+            versions.add(short_ref(match.group(1)))
+    for match in LOCK_BLOCK_RE.finditer(text):
+        declared = True
+        version, source = match.group(1), match.group(2) or ""
+        if "git" in source.lower():
+            # Label what it actually tracks. If no ref is discernible, add
+            # nothing: an unlabelled adopter renders "unpinned" / orange, which
+            # is the honest answer for a floating git source.
+            ref = GIT_SOURCE_REF_RE.search(source)
+            if ref:
+                versions.add(short_ref(next(g for g in ref.groups() if g)))
+        else:
+            versions.add(short_ref(version))
+    return declared, versions
+
+
+def classify(repo: str, manifests: list[str], token: str) -> Adopter | None:
+    """Count `repo` iff one of its manifests declares the package."""
     versions: set[str] = set()
     evidence: set[str] = set()
-    weak: set[str] = set()
+    for path in sorted(manifests):
+        declared, found = declares(strip_comments(fetch_text(repo, path, token)))
+        if declared:
+            evidence.add(path)
+            versions |= found
+    if not evidence:
+        return None
+    return Adopter(repo, tuple(sorted(versions)), tuple(sorted(evidence)))
 
-    for path in sorted(paths):
-        text = strip_comments(fetch_text(repo, path, token))
 
-        if is_manifest(path):
-            declared = False
-            for line in text.splitlines():
-                if not DEP_RE.search(line) or NAME_DECL_RE.match(line):
-                    continue
-                declared = True
-                match = (
-                    SPEC_VERSION_RE.search(line)
-                    or GITREF_RE.search(line)
-                    or SOURCE_REF_RE.search(line)
-                )
-                if match:
-                    versions.add(short_ref(match.group(1)))
-            for match in LOCK_VERSION_RE.finditer(text):
-                declared = True
-                versions.add(match.group(1))
-            if declared:
-                evidence.add(path)
+def find_module_users(
+    token: str, counted: set[str]
+) -> tuple[dict[str, tuple[str, ...]], list[str]]:
+    """Weak signal, via code search: repos that use the module but declare nothing.
+
+    Still search-driven, and therefore still limited by the index — but this
+    signal is only ever *reported*, never counted, so an index gap here
+    understates a known gap rather than the badge count.
+
+    Also cross-checks the tree walk: a manifest hit here for a repo the walk did
+    not count would mean the walk has a bug, so it is surfaced, not swallowed.
+    """
+    hits: dict[str, set[str]] = {}
+    for query in QUERIES:
+        for repo, paths in search_code(query, token).items():
+            hits.setdefault(repo, set()).update(paths)
+
+    weak: dict[str, tuple[str, ...]] = {}
+    discrepancies: list[str] = []
+    for repo in sorted(hits, key=str.casefold):
+        found: set[str] = set()
+        for path in sorted(hits[repo]):
+            text = strip_comments(fetch_text(repo, path, token))
+            if is_manifest(path) and declares(text)[0]:
+                if repo.casefold() not in counted:
+                    discrepancies.append(
+                        f"{repo} declares in `{path}` but was not counted"
+                    )
                 continue
-
-        if WEAK_RE.search(text):
-            weak.add(path)
-
-    adopter = (
-        Adopter(repo, tuple(sorted(versions)), tuple(sorted(evidence)))
-        if evidence
-        else None
-    )
-    return adopter, tuple(sorted(weak))
+            if WEAK_RE.search(text):
+                found.add(path)
+        if found and repo.casefold() not in counted:
+            weak[repo] = tuple(sorted(found))
+    return weak, discrepancies
 
 
 # --------------------------------------------------------------------------- #
@@ -406,6 +583,15 @@ def render_config_only(config_only: dict[str, tuple[str, ...]]) -> str:
     return "\n".join(lines)
 
 
+def render_coverage(coverage: Coverage) -> str:
+    return (
+        f"Examined **{coverage.examined}/{coverage.total}** org repos "
+        f"({coverage.empty} empty, {coverage.manifests} manifests read). "
+        "Counting is index-independent — every repo's file tree is read directly, "
+        "so an unindexed repo can still be counted."
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -427,31 +613,50 @@ def emit_summary(text: str) -> None:
         handle.write(text + "\n")
 
 
-def scan(token: str) -> tuple[list[Adopter], dict[str, tuple[str, ...]]]:
+def scan(
+    token: str,
+) -> tuple[list[Adopter], dict[str, tuple[str, ...]], Coverage, list[str]]:
     preflight(token)
 
-    candidates: dict[str, set[str]] = {}
-    for query in QUERIES:
-        for repo, paths in search_code(query, token).items():
-            candidates.setdefault(repo, set()).update(paths)
-
+    repos = list_repos(token)
+    coverage = Coverage(total=len(repos))
     adopters: list[Adopter] = []
-    config_only: dict[str, tuple[str, ...]] = {}
-    for repo in sorted(candidates, key=str.casefold):
-        adopter, weak = classify(repo, candidates[repo], token)
+
+    for repo in repos:
+        name = repo["full_name"]
+        manifests, complete = list_manifests(repo, token)
+        coverage.examined += 1
+        if not complete:
+            coverage.truncated.append(name)
+        if not manifests:
+            coverage.empty += 1
+            continue
+        coverage.manifests += len(manifests)
+        adopter = classify(name, manifests, token)
         if adopter:
             adopters.append(adopter)
-            log(f"  {repo}: adopter ({adopter.version_label})")
-        elif weak:
-            config_only[repo] = weak
-            log(f"  {repo}: module use only, not counted")
-        else:
-            log(f"  {repo}: mention only, not counted")
+            log(f"  {name}: adopter ({adopter.version_label})")
+
+    # A truncated tree means manifests were omitted, so the count would be a
+    # floor presented as a total — the exact failure this replaced.
+    if coverage.truncated:
+        raise ScanError(
+            "file tree truncated for "
+            + ", ".join(coverage.truncated)
+            + "; a manifest may have been missed, so the count cannot be trusted"
+        )
+
+    counted = {a.repo.casefold() for a in adopters}
+    config_only, discrepancies = find_module_users(token, counted)
+    for repo in config_only:
+        log(f"  {repo}: module use only, not counted")
+    for note in discrepancies:
+        log(f"  DISCREPANCY: {note}")
 
     # Pinned first, then repo name casefolded. Stable order => unchanged org
     # produces a byte-identical block => no weekly commit noise.
     adopters.sort(key=lambda a: (not a.pinned, a.repo.casefold()))
-    return adopters, config_only
+    return adopters, config_only, coverage, discrepancies
 
 
 def main(argv: list[str]) -> int:
@@ -471,7 +676,7 @@ def main(argv: list[str]) -> int:
         return 1
 
     try:
-        adopters, config_only = scan(token)
+        adopters, config_only, coverage, discrepancies = scan(token)
         block = render_badges(adopters)
         original = README.read_text(encoding="utf-8")
         updated = replace_block(original, block)
@@ -482,14 +687,19 @@ def main(argv: list[str]) -> int:
     changed = updated != original
     table = render_table(adopters)
     details = render_config_only(config_only)
+    coverage_note = render_coverage(coverage)
 
     print(table)
+    print()
+    print(coverage_note)
     print()
     print(block)
     print()
     if details:
         print(details)
         print()
+    for note in discrepancies:
+        print(f"DISCREPANCY: {note}")
     if write and changed:
         README.write_text(updated, encoding="utf-8")
         print(f"README.md updated ({len(adopters)} adopters).")
@@ -504,15 +714,17 @@ def main(argv: list[str]) -> int:
     emit_outputs(changed="true" if changed else "false", count=str(len(adopters)))
     emit_summary(
         "\n".join(
-            part
-            for part in (
+            (
                 f"## Adoption scan — {len(adopters)} deploying repos",
+                "",
+                coverage_note,
                 "",
                 table,
                 "",
                 details,
+                "",
+                *(f"> **Discrepancy:** {n}" for n in discrepancies),
             )
-            if part is not None
         )
     )
     return 0
