@@ -57,7 +57,10 @@ def _summarize_chunk(
     """
     key = f"{version}:{content_hash(chunk)}"
     if cache is not None:
-        hit = cache.get(SUMMARY_NAMESPACE, key)
+        try:
+            hit = cache.get(SUMMARY_NAMESPACE, key)
+        except Exception:  # noqa: BLE001 - a store failure is just a miss
+            hit = None
         if hit is not None:
             return hit
     summary = provider.summarize(chunk, criterion, schema=schema)

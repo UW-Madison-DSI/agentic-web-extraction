@@ -1,3 +1,4 @@
+import threading
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlsplit
@@ -29,30 +30,40 @@ class FetchedPage:
     ``"jina"`` or ``"wayback:<capture timestamp>"`` — see [fallback.py](fallback.py)."""
 
 
+_client_lock = threading.Lock()
 _client: httpx.Client | None = None
 
 
 def get_client() -> httpx.Client:
+    """Shared client for origin fetches.
+
+    Lock-guarded: the traversal fetches a whole wave of pages concurrently, so an
+    unguarded lazy init would let several worker threads each build a client and
+    leak all but the last one's connection pool.
+    """
     global _client
-    if _client is None:
-        # Plain httpx client, no HTTP-response cache of any kind. Fetching is cheap
-        # relative to the LLM stages, and the frontier's visited set already stops a
-        # URL from being fetched twice in one crawl, so an HTTP cache saved too
-        # little to justify the memory/disk it took. The expensive work is memoized
-        # by the content-addressed LLM cache instead (see cache.py / extractor.py).
-        _client = httpx.Client(
-            headers={"User-Agent": USER_AGENT},
-            follow_redirects=True,
-            timeout=httpx.Timeout(30.0, connect=10.0),
-        )
-    return _client
+    with _client_lock:
+        if _client is None:
+            # Plain httpx client, no HTTP-response cache of any kind. Fetching is
+            # cheap relative to the LLM stages, and the frontier's visited set
+            # already stops a URL from being fetched twice in one crawl, so an HTTP
+            # cache saved too little to justify the memory/disk it took. The
+            # expensive work is memoized by the content-addressed LLM cache instead
+            # (see cache.py / extractor.py).
+            _client = httpx.Client(
+                headers={"User-Agent": USER_AGENT},
+                follow_redirects=True,
+                timeout=httpx.Timeout(30.0, connect=10.0),
+            )
+        return _client
 
 
 def close_client() -> None:
     global _client
-    if _client is not None:
-        _client.close()
-        _client = None
+    with _client_lock:
+        if _client is not None:
+            _client.close()
+            _client = None
 
 
 def _classify(content_type: str) -> Literal["html", "pdf", "skipped"]:
@@ -119,6 +130,13 @@ def fetch(url: str) -> FetchedPage:
     settings = get_settings()
     try:
         response = _send(url)
+    except httpx.HTTPStatusError as exc:
+        # `_send` raises this for a 5xx it gave up retrying. That is still a
+        # *response* whose status is outside 2xx -- exactly the hole the status
+        # guard below exists for -- so it goes through the same guard (and the
+        # same recovery attempt) rather than short-circuiting to kind="error".
+        # A 503 from an edge CDN refusing a non-browser client is the common case.
+        response = exc.response
     except Exception as exc:
         # Degrade ANY fetch-level failure to a uniform kind="error" page instead
         # of throwing, so a single bad URL is skipped like any other error page

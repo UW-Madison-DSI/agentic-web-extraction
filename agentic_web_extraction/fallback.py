@@ -163,7 +163,12 @@ def markdown_to_html(markdown: str) -> str:
     escaped = html_module.escape(markdown, quote=False)
 
     def anchor(match: re.Match[str]) -> str:
-        text, url = match.group(1), html_module.escape(match.group(2), quote=True)
+        # Both groups come out of the *already escaped* text, so `&`, `<` and `>`
+        # are entities by now. Escaping the href a second time would turn a query
+        # string's `&amp;` into `&amp;amp;`, which the HTML parser hands back as a
+        # literal `&amp;` -- a corrupted URL in both the frontier and the markdown
+        # the extraction reads. Only the attribute delimiter still needs escaping.
+        text, url = match.group(1), match.group(2).replace('"', "&quot;")
         return f'<a href="{url}">{text}</a>'
 
     return _MARKDOWN_LINK.sub(anchor, escaped)

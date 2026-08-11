@@ -143,6 +143,31 @@ class Extractor:
         """
         logsink.emit(message)
 
+    def _cache_get(self, namespace: str, key: str) -> str | None:
+        """Read from the cache, treating any store failure as a miss.
+
+        Caching is an optimization, never a correctness input: a locked/corrupt
+        SQLite file (or a caller-supplied `KVCache` that throws) must not abort a
+        crawl -- and `_process_page` runs on pool threads, where an escaping
+        exception would surface out of `pool.map` and discard the whole run.
+        """
+        if self.cache is None:
+            return None
+        try:
+            return self.cache.get(namespace, key)
+        except Exception as e:  # noqa: BLE001 - caching is best-effort
+            self._log(f"    ! cache get failed ({namespace}): {type(e).__name__}: {e}")
+            return None
+
+    def _cache_put(self, namespace: str, key: str, value: str) -> None:
+        """Write to the cache, swallowing any store failure (see `_cache_get`)."""
+        if self.cache is None:
+            return
+        try:
+            self.cache.put(namespace, key, value)
+        except Exception as e:  # noqa: BLE001 - caching is best-effort
+            self._log(f"    ! cache put failed ({namespace}): {type(e).__name__}: {e}")
+
     def extract(
         self,
         seeds: str | Sequence[str],
@@ -187,9 +212,15 @@ class Extractor:
         for seed in seed_list:
             frontier.push(seed, score=SEED_SCORE, source="seed")
 
+        # Clamped once and used for BOTH the pool size and the wave's pop count: a
+        # non-positive setting must not silently turn the crawl into a no-op (a 0
+        # pop count pops nothing, breaks out of the loop, and returns an empty
+        # result as though the frontier had run dry).
+        workers = max(1, self.settings.max_workers)
+
         self._log(
             f"[traverse] {len(seed_list)} seed(s), budget={budget} "
-            f"({per_seed}/seed), workers={self.settings.max_workers}"
+            f"({per_seed}/seed), workers={workers}"
         )
 
         path: list[str] = []
@@ -213,11 +244,9 @@ class Extractor:
             direct=direct,
         )
 
-        with ThreadPoolExecutor(max_workers=max(1, self.settings.max_workers)) as pool:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
             while pages_fetched < budget:
-                batch = self._pop_batch(
-                    frontier, min(self.settings.max_workers, budget - pages_fetched)
-                )
+                batch = self._pop_batch(frontier, min(workers, budget - pages_fetched))
                 if not batch:
                     break
                 # Reserve every popped URL against re-popping, then snapshot the
@@ -361,25 +390,25 @@ class Extractor:
         if direct:
             key_prefix = f"{key_prefix}:direct"
         cache_key = f"{key_prefix}:{content_hash(page_md)}:{page.url}"
-        cached_raw = (
-            self.cache.get(PAGE_NAMESPACE, cache_key)
-            if self.cache is not None
-            else None
-        )
+        cached_raw = self._cache_get(PAGE_NAMESPACE, cache_key)
         if cached_raw is not None:
-            cached = CachedPage.from_json(cached_raw)
-            self._log(f"    [cache] hit {page.url}")
-            return _PageOutcome(
-                requested_url=url,
-                page=page,
-                readable=True,
-                has_verdict=True,
-                screen_match=cached.screen_match,
-                screen_reason=cached.screen_reason,
-                page_md=page_md if cached.screen_match else None,
-                cache_key=cache_key,
-                link_scores=list(cached.link_scores),
-            )
+            try:
+                cached = CachedPage.from_json(cached_raw)
+            except Exception as e:  # noqa: BLE001 - fall through to a live run
+                self._log(f"    ! cached page invalid: {type(e).__name__}: {e}")
+            else:
+                self._log(f"    [cache] hit {page.url}")
+                return _PageOutcome(
+                    requested_url=url,
+                    page=page,
+                    readable=True,
+                    has_verdict=True,
+                    screen_match=cached.screen_match,
+                    screen_reason=cached.screen_reason,
+                    page_md=page_md if cached.screen_match else None,
+                    cache_key=cache_key,
+                    link_scores=list(cached.link_scores),
+                )
 
         stage_error = False  # don't cache a page whose LLM stages hit a transient error
         if direct:
@@ -435,8 +464,8 @@ class Extractor:
                 else:
                     link_scores = [[link_url, score] for link_url, score in scores]
 
-        if self.cache is not None and not stage_error:
-            self.cache.put(
+        if not stage_error:
+            self._cache_put(
                 PAGE_NAMESPACE,
                 cache_key,
                 CachedPage(
@@ -499,46 +528,58 @@ class Extractor:
         # Extract-cache replay: hits only when the exact same set of pages (same
         # content) recurs. The stored value wraps the object plus the context-size
         # metadata, so a hit replays the full result with zero LLM calls.
-        if self.cache is not None:
-            cached_raw = self.cache.get(EXTRACT_NAMESPACE, extract_key)
-            if cached_raw is not None:
-                try:
-                    wrapper = json.loads(cached_raw)
-                    data = self.schema.model_validate(wrapper["data"])
-                except Exception as e:  # noqa: BLE001 - fall through to a live run
-                    self._log(
-                        f"    ! cached extraction invalid: {type(e).__name__}: {e}"
-                    )
-                else:
-                    self._log("    [cache] extraction hit")
-                    return self._result(
-                        data=data,
-                        stopped="match",
-                        pages_fetched=pages_fetched,
-                        path=path,
-                        verdicts=verdicts,
-                        fallbacks_used=fallbacks_used,
-                        usage_by_function_at_start=usage_by_function_at_start,
-                        content_tokens=int(wrapper.get("content_tokens", 0)),
-                        extraction_input_tokens=int(
-                            wrapper.get("extraction_input_tokens", 0)
-                        ),
-                        summarized=bool(wrapper.get("summarized", False)),
-                    )
+        cached_raw = self._cache_get(EXTRACT_NAMESPACE, extract_key)
+        if cached_raw is not None:
+            try:
+                wrapper = json.loads(cached_raw)
+                data = self.schema.model_validate(wrapper["data"])
+            except Exception as e:  # noqa: BLE001 - fall through to a live run
+                self._log(f"    ! cached extraction invalid: {type(e).__name__}: {e}")
+            else:
+                self._log("    [cache] extraction hit")
+                return self._result(
+                    data=data,
+                    stopped="match",
+                    pages_fetched=pages_fetched,
+                    path=path,
+                    verdicts=verdicts,
+                    fallbacks_used=fallbacks_used,
+                    usage_by_function_at_start=usage_by_function_at_start,
+                    content_tokens=int(wrapper.get("content_tokens", 0)),
+                    extraction_input_tokens=int(
+                        wrapper.get("extraction_input_tokens", 0)
+                    ),
+                    summarized=bool(wrapper.get("summarized", False)),
+                )
 
-        final_text, summarized, content_tokens, extraction_input_tokens = fit_pages(
-            pages_for_fit,
-            criterion=self.criteria,
-            schema=self.schema,
-            provider=self.provider,
-            max_context_tokens=self.settings.max_context_tokens,
-            always=self.settings.always_summarize,
-            model=self.provider.model_extract,
-            encoding_name=self.settings.tiktoken_encoding,
-            cache=self.cache,
-            version=self._cache_version,
-            log=self._log,
-        )
+        try:
+            final_text, summarized, content_tokens, extraction_input_tokens = fit_pages(
+                pages_for_fit,
+                criterion=self.criteria,
+                schema=self.schema,
+                provider=self.provider,
+                max_context_tokens=self.settings.max_context_tokens,
+                always=self.settings.always_summarize,
+                model=self.provider.model_extract,
+                encoding_name=self.settings.tiktoken_encoding,
+                cache=self.cache,
+                version=self._cache_version,
+                log=self._log,
+            )
+        except Exception as e:
+            # A summarize call that fails (or a chunk the screen model refuses) must
+            # degrade to the uniform result like any other stage, not raise out of
+            # `extract` and throw away the whole traversal.
+            self._log(f"    ! fitting content failed: {type(e).__name__}: {e}")
+            return self._result(
+                data=None,
+                stopped="budget_exhausted",
+                pages_fetched=pages_fetched,
+                path=path,
+                verdicts=verdicts,
+                fallbacks_used=fallbacks_used,
+                usage_by_function_at_start=usage_by_function_at_start,
+            )
 
         self._log(
             f"    [extract] consolidating {len(matched_pages)} page(s), "
@@ -561,23 +602,23 @@ class Extractor:
                 summarized=summarized,
             )
 
-        if self.cache is not None:
-            try:
-                self.cache.put(
-                    EXTRACT_NAMESPACE,
-                    extract_key,
-                    json.dumps(
-                        {
-                            "data": data.model_dump(mode="json"),
-                            "content_tokens": content_tokens,
-                            "extraction_input_tokens": extraction_input_tokens,
-                            "summarized": summarized,
-                        },
-                        ensure_ascii=False,
-                    ),
-                )
-            except Exception as e:  # noqa: BLE001 - caching is best-effort
-                self._log(f"    ! extraction cache put failed: {type(e).__name__}: {e}")
+        # Serializing is part of the best-effort write: a schema that won't
+        # round-trip through JSON must cost the caller a cache entry, not the
+        # extraction they already paid for.
+        try:
+            wrapper_json = json.dumps(
+                {
+                    "data": data.model_dump(mode="json"),
+                    "content_tokens": content_tokens,
+                    "extraction_input_tokens": extraction_input_tokens,
+                    "summarized": summarized,
+                },
+                ensure_ascii=False,
+            )
+        except Exception as e:  # noqa: BLE001 - caching is best-effort
+            self._log(f"    ! extraction cache encode failed: {type(e).__name__}: {e}")
+        else:
+            self._cache_put(EXTRACT_NAMESPACE, extract_key, wrapper_json)
 
         return self._result(
             data=data,
