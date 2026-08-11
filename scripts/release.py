@@ -33,8 +33,10 @@ app = typer.Typer(help="Safe release manager for agentic-web-extraction.")
 
 DEFAULT_BRANCH = "main"
 PYPROJECT = Path("pyproject.toml")
-# uv records the project version in its lockfile too; if we bump pyproject
-# without refreshing this, any `uv sync --locked` rejects the lockfile.
+# uv records the project version in its lockfile too, so a tracked lockfile has
+# to be refreshed alongside the bump or every `uv sync --locked` rejects it.
+# This repo currently gitignores uv.lock, hence `lockfile_is_tracked` — the
+# release must not depend on which choice the repo made.
 LOCKFILE = Path("uv.lock")
 # Used only when pyproject.toml has no version at all (no previous release).
 INITIAL_VERSION = (0, 1, 0)
@@ -70,6 +72,22 @@ def best_effort(cmd: list[str], description: str) -> None:
         console.print(f"[yellow]⚠️ {description} failed:[/yellow]")
         if result.stderr:
             console.print(f"[yellow]{result.stderr.strip()}[/yellow]")
+
+
+def lockfile_is_tracked() -> bool:
+    """True when the lockfile is under version control (not gitignored/absent).
+
+    An untracked lockfile can't be part of the release commit, and `git add`
+    on an ignored path is a hard error — so its refresh is skipped entirely
+    rather than gambling on the repo's choice.
+    """
+    result = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", str(LOCKFILE)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result.returncode == 0
 
 
 def get_repo_root() -> Path:
@@ -207,31 +225,51 @@ def main(
             f"🚀 [blue]Bumping {increment.value}: "
             f"{'.'.join(map(str, current))} → {version_str}[/blue]"
         )
+        # Everything from here on is undone if any step fails: a bumped version
+        # left on disk would silently become the base of the next run, so the
+        # skipped number could never be released.
+        original_pyproject = PYPROJECT.read_text()
+        tracked_lock = lockfile_is_tracked()
+        committed = False
+        tagged = False
         write_version(new_version)
 
-        # Keep uv.lock's recorded project version in sync with pyproject, or a
-        # `uv sync --locked` (CI, or a consumer pinning this repo) fails.
-        console.print("🔒 [blue]Refreshing uv.lock...[/blue]")
-        run(["uv", "lock"])
-
-        # Phase 3: Commit and Tag
-        console.print(f"📦 [blue]Creating tag {tag_name}...[/blue]")
-        run(["git", "add", str(PYPROJECT), str(LOCKFILE)])
-        run(["git", "commit", "-m", f"chore: release {tag_name}"], capture=False)
-        run(["git", "tag", "-a", tag_name, "-m", tag_name], capture=False)
-
-        # Phase 4: Push (atomic — branch and tag succeed or fail together)
-        console.print(f"⬆️  [blue]Pushing to {remote}/{branch}...[/blue]")
         try:
+            paths = [str(PYPROJECT)]
+            if tracked_lock:
+                # Keep the lockfile's recorded project version in sync with
+                # pyproject, or a `uv sync --locked` fails on the release.
+                console.print("🔒 [blue]Refreshing uv.lock...[/blue]")
+                run(["uv", "lock"])
+                paths.append(str(LOCKFILE))
+            else:
+                console.print(
+                    f"[yellow]ℹ️ {LOCKFILE} is not tracked — "
+                    f"leaving it out of the release.[/yellow]"
+                )
+
+            # Phase 3: Commit and Tag
+            console.print(f"📦 [blue]Creating tag {tag_name}...[/blue]")
+            run(["git", "add", *paths])
+            run(["git", "commit", "-m", f"chore: release {tag_name}"], capture=False)
+            committed = True
+            run(["git", "tag", "-a", tag_name, "-m", tag_name], capture=False)
+            tagged = True
+
+            # Phase 4: Push (atomic — branch and tag succeed or fail together)
+            console.print(f"⬆️  [blue]Pushing to {remote}/{branch}...[/blue]")
             run(["git", "push", "--atomic", remote, branch, tag_name], capture=False)
         except ReleaseError:
-            console.print(
-                "[yellow]⚠️ Push failed — rolling back local commit and tag...[/yellow]"
-            )
-            best_effort(["git", "tag", "-d", tag_name], "Deleting local tag")
-            best_effort(
-                ["git", "reset", "--mixed", "HEAD~1"], "Reverting release commit"
-            )
+            console.print("[yellow]⚠️ Release failed — rolling back...[/yellow]")
+            if tagged:
+                best_effort(["git", "tag", "-d", tag_name], "Deleting local tag")
+            if committed:
+                best_effort(
+                    ["git", "reset", "--mixed", "HEAD~1"], "Reverting release commit"
+                )
+            PYPROJECT.write_text(original_pyproject)
+            if tracked_lock:
+                best_effort(["git", "restore", str(LOCKFILE)], "Restoring uv.lock")
             raise
 
         console.print(

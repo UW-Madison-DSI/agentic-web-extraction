@@ -156,13 +156,17 @@ domain compare), [fetch.py](agentic_web_extraction/fetch.py) (httpx + status gua
 - **The git tag is the release; nothing else sets the version.**
   [scripts/release.py](scripts/release.py) is the only thing that writes
   `version` in `pyproject.toml` — never hand-edit it, because the value has to
-  match the `vX.Y.Z` tag, and `uv.lock` records the project version too (bump one
-  without the other and every `uv sync --locked` breaks). The script is
-  precondition-heavy on purpose: `main` only, clean tree, exactly level with the
-  remote — the point is that a release can't be cut from a state you can't
-  reconstruct from the tag. Branch and tag go up with `git push --atomic` so a
-  half-push can't leave a tag pointing at an unpushed commit; on failure the
-  commit and tag are rolled back locally. It's PEP 723 like
+  match the `vX.Y.Z` tag. The script is precondition-heavy on purpose: `main`
+  only, clean tree, exactly level with the remote — the point is that a release
+  can't be cut from a state you can't reconstruct from the tag. Branch and tag go
+  up with `git push --atomic` so a half-push can't leave a tag pointing at an
+  unpushed commit, and **any** failure after the bump rolls back the version, the
+  commit and the tag together — a bumped `pyproject.toml` left on disk would
+  silently become the base of the next run, permanently skipping that number.
+  Lockfile handling is conditional on `git ls-files`, not assumed: `uv.lock` is
+  gitignored here, and `git add` on an ignored path is a hard error, so the
+  refresh is skipped unless the lockfile is actually tracked (where it must be
+  refreshed in the same commit, since uv records the project version in it too). It's PEP 723 like
   [scripts/adopters.py](scripts/adopters.py), but *not* stdlib-only — `typer`/`rich`
   come from its own header, so it stays out of the project's dependency surface.
   No tag-triggered workflow exists yet; the tag is currently just the pin
