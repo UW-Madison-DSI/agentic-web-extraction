@@ -586,6 +586,7 @@ examples/
 pyproject.toml           # uv project, Python ≥3.13
 scripts/
     adopters.py          # weekly org adoption scan (stdlib-only PEP 723)
+    release.py           # version bump + tag + atomic push (PEP 723; typer/rich)
 .github/workflows/
     adopters.yml         # cron: refresh the adopter badges at the top of this file
 ```
@@ -601,6 +602,27 @@ uv run ty check                         # type-check
 ```
 
 Python ≥3.13. Build backend: `uv_build`. The package lives at the repo root (`agentic_web_extraction/`), not under `src/` — `[tool.uv.build-backend].module-root = ""` enforces this.
+
+### Releasing
+
+```bash
+uv run scripts/release.py [major|minor|patch]   # default: patch
+```
+
+Takes the version in `pyproject.toml` as the base, bumps the chosen component,
+refreshes `uv.lock`, then commits `chore: release vX.Y.Z` and pushes the branch
+and a matching `vX.Y.Z` tag **atomically** — the pyproject version and the git
+tag can never drift apart. Consumers pin a release with:
+
+```bash
+uv add "agentic-web-extraction @ git+https://github.com/UW-Madison-DSI/agentic-web-extraction@v0.1.1"
+```
+
+The script refuses to do anything unless the release is safe: it must run from
+`main`, the working tree must be clean, and the branch must be exactly level
+with its remote (neither ahead nor behind). If the push fails, the local commit
+and tag are rolled back so a retry starts from a clean slate. It's a PEP 723
+script — `typer`/`rich` come from its own header, not the project deps.
 
 ## Roadmap
 
@@ -626,3 +648,4 @@ v0 done:
 - [x] Opt-in flex service tier (single `AWE_USE_FLEX` knob, off by default; Batch-API rates on synchronous calls, per-call fallback to standard when flex has no capacity)
 - [x] `examples/` directory with reference schemas and filters (`examples/grants.py`, `examples/strippers.py`, kept out of the package)
 - [x] Weekly org adoption scan (`scripts/adopters.py` + `.github/workflows/adopters.yml`; index-independent repo/tree sweep → shields badges in the [Adopters](#adopters) block, hard-fails and reports coverage rather than committing a silent undercount)
+- [x] Guarded release script (`scripts/release.py`; main-only, clean-and-synced preconditions, pyproject/`uv.lock`/git-tag kept in sync, atomic branch+tag push with rollback — see [Releasing](#releasing))

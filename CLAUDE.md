@@ -16,6 +16,8 @@ uv run awe         # CLI entry point (`awe extract ...`)
 uv run ruff check  # lint
 uv run ruff format # format
 uv run ty check    # type-check (Astral's ty, not mypy)
+
+uv run scripts/release.py [major|minor|patch]   # cut a release (default: patch)
 ```
 
 No test suite yet; if you add one it'll be `uv run pytest`.
@@ -151,6 +153,21 @@ domain compare), [fetch.py](agentic_web_extraction/fetch.py) (httpx + status gua
   API exposes. `--max-context-tokens`/`--always-summarize`/`--max-workers` are
   settings-only knobs, so the CLI injects them via `settings.model_copy(update=...)`,
   not `extract()` args.
+- **The git tag is the release; nothing else sets the version.**
+  [scripts/release.py](scripts/release.py) is the only thing that writes
+  `version` in `pyproject.toml` — never hand-edit it, because the value has to
+  match the `vX.Y.Z` tag, and `uv.lock` records the project version too (bump one
+  without the other and every `uv sync --locked` breaks). The script is
+  precondition-heavy on purpose: `main` only, clean tree, exactly level with the
+  remote — the point is that a release can't be cut from a state you can't
+  reconstruct from the tag. Branch and tag go up with `git push --atomic` so a
+  half-push can't leave a tag pointing at an unpushed commit; on failure the
+  commit and tag are rolled back locally. It's PEP 723 like
+  [scripts/adopters.py](scripts/adopters.py), but *not* stdlib-only — `typer`/`rich`
+  come from its own header, so it stays out of the project's dependency surface.
+  No tag-triggered workflow exists yet; the tag is currently just the pin
+  consumers install from (`git+https://...@vX.Y.Z`). If one is added, it hangs off
+  `push: tags: ["v*"]` and needs no change here.
 - **The README `<!-- adopters:start -->` block is generated.** Never hand-edit it;
   [scripts/adopters.py](scripts/adopters.py) (weekly, via
   [.github/workflows/adopters.yml](.github/workflows/adopters.yml)) overwrites it. That
