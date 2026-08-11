@@ -27,13 +27,13 @@ of unvisited links where the LLM's relevance scoring is the *only* navigation po
 One or more seed URLs are pushed into a single shared frontier at a sentinel score
 (`float("inf")`) so every seed is fetched first; the budget is `max_fetches` *per
 seed*. The loop processes the frontier in **parallel waves** — pop the top-N links
-(`max_workers`), then concurrently fetch → normalize (HTML→Markdown) → pre-screen →
-score outgoing links per page — folding results back on the main thread (which owns
-the frontier; workers never mutate it). Pages that pass screening have their markdown
-**collected**, not extracted per-page. When the frontier empties or the budget is
-spent, the collected pages are concatenated and — if over `max_context_tokens`, or
-always under `always_summarize` —
-summarized down (criteria-aware map-reduce on the screen model), then a **single**
+(`max_workers`), then concurrently fetch (with non-2xx recovery via
+[fallback.py](agentic_web_extraction/fallback.py)) → normalize (HTML→Markdown) →
+pre-screen → score outgoing links per page — folding results back on the main thread
+(which owns the frontier; workers never mutate it). Pages that pass screening have
+their markdown **collected**, not extracted per-page. When the frontier empties or the
+budget is spent, the collected pages are concatenated and — if over
+`max_context_tokens`, or always under `always_summarize` — summarized down (criteria-aware map-reduce on the screen model), then a **single**
 extraction runs over the whole thing. No `merge_extractions`, no dedup. Screen, link-
 scorer, and summarizer share a cheap model; extraction uses a stronger one.
 
@@ -42,7 +42,9 @@ Key files: [extractor.py](agentic_web_extraction/extractor.py) (wave loop + cons
 [schema_outline.py](agentic_web_extraction/schema_outline.py) (schema → compact prompt outline),
 [tokens.py](agentic_web_extraction/tokens.py) (tiktoken counting/splitting),
 [frontier.py](agentic_web_extraction/frontier.py) (heap + visited set + snapshot + PSL
-domain compare), [normalize.py](agentic_web_extraction/normalize.py),
+domain compare), [fetch.py](agentic_web_extraction/fetch.py) (httpx + status guard),
+[fallback.py](agentic_web_extraction/fallback.py) (jina/wayback recovery),
+[normalize.py](agentic_web_extraction/normalize.py),
 [providers/](agentic_web_extraction/providers/),
 [result.py](agentic_web_extraction/result.py),
 [config.py](agentic_web_extraction/config.py) (`AWE_*` settings).
@@ -97,14 +99,31 @@ domain compare), [normalize.py](agentic_web_extraction/normalize.py),
   `summarize` remains a generic utility, but the Extractor always passes it.
 - **Uniform result shape.** `extract` always returns the same structure (`data`,
   `stopped_reason`, `pages_fetched`, `path`, `verdicts`, `content_tokens`,
-  `extraction_input_tokens`, `summarized`, per-function token usage) whether it matched
-  or exhausted budget. Plumbing this metadata is non-optional. See
+  `extraction_input_tokens`, `summarized`, `fallbacks_used`, per-function token usage)
+  whether it matched or exhausted budget. Plumbing this metadata is non-optional. See
   [result.py](agentic_web_extraction/result.py).
 - **Frontier is single-threaded; workers are pure.** Only the main thread pops/pushes/
   marks the `Frontier`. `_process_page` runs on pool threads and returns a `_PageOutcome`;
   it reads a `frontier.snapshot()` (frozen set) to pre-filter links but never mutates
   shared state. Provider usage accumulation is lock-guarded for the same reason. Keep
   new per-page work inside the worker and new frontier work in the fold loop.
+- **Non-2xx is never content; recovery is retrieval-only.** [fetch.py](agentic_web_extraction/fetch.py)
+  classifies on Content-Type, so an edge-CDN "Access Denied" interstitial or a themed
+  404 would otherwise be screened and extracted as if it were the page (guaranteed into
+  the extraction under `seed_is_content`). The status guard drops anything outside 2xx;
+  [fallback.py](agentic_web_extraction/fallback.py) then tries to turn the hole back into
+  content over the routes named by `AWE_FETCH_FALLBACKS` (`jina` — `r.jina.ai` renders
+  live and reads PDFs, requesting the full DOM by default so link extraction behaves as
+  on a direct fetch; `wayback` — newest Archive capture, `id_`-unrewritten, staleness
+  bounded by `AWE_WAYBACK_MAX_AGE_DAYS`). Keep that module opinionated about *retrieval
+  only* — content selection, normalization, and link policy stay where they live, and
+  nothing there may know about a particular site; the chain is driven by response status
+  alone. Recovered bytes are returned under the **caller's** URL, never the proxy/archive
+  address, so `path`, the `--- SOURCE:` markers, and caller citations stay canonical;
+  the route lands in `FetchedPage.via` → `ExtractionResult.fallbacks_used`. `fallback.py`
+  must not import `fetch.py` (fetch imports it, and classification/PDF policy belong to
+  the fetch path). Both routes disclose the crawled URL to a third party — empty
+  `AWE_FETCH_FALLBACKS` keeps the guard and disables recovery.
 - **Logging: never a bare `print`.** All diagnostics go through `logsink.emit` → stderr
   (stdout is reserved for result JSON). A `log_file` path (env `AWE_LOG_FILE`, empty =
   off) also appends timestamped lines. See [logsink.py](agentic_web_extraction/logsink.py).
