@@ -362,6 +362,16 @@ class Extractor:
                     resolved_seen.add(rurl)
                     frontier.mark_visited(page.url)
                     path.append(page.url)
+                    if page.via:
+                        fallbacks_used[page.url] = page.via
+                    if not outcome.readable:
+                        continue
+                    pages_fetched += 1
+                    # Widen the boundary to where a seed landed -- but only for a seed
+                    # that came back with readable content. A parked or lapsed domain
+                    # answers a redirect chain with an error or a non-page body, and
+                    # letting *that* into the boundary would hand the set to whoever
+                    # now owns the name: the exact failure the boundary exists to stop.
                     if (
                         allowed is not None
                         and self.allow_seed_redirect_domains
@@ -374,11 +384,6 @@ class Extractor:
                                 f"    [boundary] seed {outcome.requested_url} resolved "
                                 f"to {landed} — added to the allowed domains"
                             )
-                    if page.via:
-                        fallbacks_used[page.url] = page.via
-                    if not outcome.readable:
-                        continue
-                    pages_fetched += 1
                     if outcome.has_verdict:
                         verdicts.append(
                             PageVerdict(
@@ -438,6 +443,23 @@ class Extractor:
             return None
         return dom in seed_domains
 
+    @staticmethod
+    def _policy_skip(url: str) -> _PageOutcome:
+        """Outcome for a URL policy refused: no content, no budget slot, no `path`
+        entry. Carries a placeholder page so the fold loop's shape is unchanged."""
+        return _PageOutcome(
+            requested_url=url,
+            page=FetchedPage(
+                url=url,
+                status=0,
+                content_type="",
+                raw_bytes=b"",
+                text="",
+                kind="skipped",
+            ),
+            policy_skipped=True,
+        )
+
     def _process_page(
         self,
         item: tuple[str, float, str],
@@ -460,19 +482,10 @@ class Extractor:
         # costs no fetch, no budget slot and no LLM call. Safe from a worker thread:
         # the policy owns its cache and lock, and touches no traversal state.
         if self.robots is not None and not self.robots.allows(url):
-            self._log(f"    [robots] disallowed for {self.user_agent!r} — skipping")
-            return _PageOutcome(
-                requested_url=url,
-                page=FetchedPage(
-                    url=url,
-                    status=0,
-                    content_type="",
-                    raw_bytes=b"",
-                    text="",
-                    kind="skipped",
-                ),
-                policy_skipped=True,
+            self._log(
+                f"    [robots] {url} disallowed for {self.user_agent!r} — skipping"
             )
+            return self._policy_skip(url)
         fetch_t0 = time.monotonic()
         try:
             page = fetch_module.fetch(url)
@@ -496,6 +509,20 @@ class Extractor:
         # consumes no budget slot. The main thread still records it in `path`.
         if page.kind in ("skipped", "error"):
             return _PageOutcome(requested_url=url, page=page)
+
+        # The fetch follows redirects internally, so the URL checked above is not
+        # necessarily the one that answered. Re-check where it landed: the request is
+        # already spent (httpx followed it inside a single call, and refusing to
+        # follow redirects would break the rebrand case the boundary depends on), but
+        # a body from a path the origin disallows must not be read, screened, or
+        # pooled into the extraction.
+        if self.robots is not None and canonical(page.url) != canonical(url):
+            if not self.robots.allows(page.url):
+                self._log(
+                    f"    [robots] {url} redirected to {page.url}, disallowed for "
+                    f"{self.user_agent!r} — discarding unread"
+                )
+                return self._policy_skip(url)
 
         try:
             page_md = (
@@ -573,10 +600,24 @@ class Extractor:
         # Direct mode queues no links. Otherwise score the outgoing links this page
         # introduces (filtered against the wave's snapshot of known URLs).
         if page.kind == "html" and page.text and not direct:
-            outgoing = extract_links(page.text, base_url=page.url)
-            fresh = [
-                (text, link) for text, link in outgoing if canonical(link) not in known
-            ]
+            try:
+                fresh = [
+                    (text, link)
+                    for text, link in extract_links(page.text, base_url=page.url)
+                    if canonical(link) not in known
+                ]
+            except Exception as e:
+                # A single malformed href must not cost the whole crawl. `urlsplit`
+                # raises ValueError on a bracketed-host URL (`http://a[b]c.com/`),
+                # and both extract_links and the `canonical` filter go through it --
+                # unguarded, that escapes the worker, surfaces out of pool.map in the
+                # fold loop, and discards every page already collected. Losing one
+                # page's links is the cheap failure; losing the crawl is not.
+                self._log(
+                    f"    ! link extraction failed on {page.url}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                fresh = []
             if fresh:
                 score_kwargs: dict = {}
                 if self.prefer_seed_domain:

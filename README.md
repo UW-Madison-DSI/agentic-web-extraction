@@ -444,7 +444,13 @@ adds no network dependency to the fetch path.
 **robots.txt** (`respect_robots`, off by default) is checked per origin *before* the
 fetch, against the configured User-Agent, using the stdlib parser; one request per
 origin for the life of the Extractor. A disallowed URL costs no request, no budget
-slot and no LLM call, and is logged rather than reported as a visited page.
+slot and no LLM call, and is logged rather than reported as a visited page. A URL
+that *redirects* is checked twice — once as requested, once where it landed, since a
+redirector on an allowed path would otherwise be a hole straight through the check
+(including across origins). The second request is already spent, because httpx
+follows redirects inside a single call and refusing to follow them would break the
+rebrand case the boundary depends on; what the second check buys is that the body is
+discarded unread rather than screened and pooled into the extraction.
 Failures — 404, 401/403, 5xx, timeouts — **fail open**: a missing robots.txt has
 never meant "stay out", and treating an origin's brief 500 as a site-wide `Disallow`
 would silently empty an authorized crawl. `robots_overrides` exempts named domains

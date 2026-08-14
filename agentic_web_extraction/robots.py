@@ -7,7 +7,13 @@ life of the policy object, so an origin is asked once however many of its pages
 the traversal visits.
 
 Evaluated *before* the fetch, so a disallowed URL costs no request, no budget
-slot and no LLM call. This is a politeness/permission control, not a security
+slot and no LLM call. A URL that *redirects* is checked twice -- once as requested,
+once where it landed. That second request is already spent (httpx follows redirects
+inside a single call, and refusing to follow them would break the rebrand case the
+crawl boundary depends on), but a body from a disallowed path is discarded unread
+rather than screened and pooled into the extraction; a redirector on an allowed path
+is otherwise a hole straight through this check, including across origins.
+This is a politeness/permission control, not a security
 boundary -- for that, see the hard crawl boundary in
 [extractor.py](extractor.py) (``allowed_domains``), which decides which domains
 may be queued at all. The two compose: the boundary says *where* the crawl may

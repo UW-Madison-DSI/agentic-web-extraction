@@ -159,6 +159,23 @@ def test_redirect_rule_applies_to_seeds_only(make_extractor):
     assert "https://algae-test.com/deeper" not in web.fetched
 
 
+def test_a_dead_seed_does_not_widen_the_boundary(make_extractor):
+    """A lapsed seed domain that now parks on somebody else's host must not hand
+    that host the boundary -- widening requires readable content."""
+    parked = "https://parked-test.com/lp"
+    hub = "https://hub-test.org/links"
+    web = StubWeb(
+        # `parked` is absent from `pages`, so the stub answers it as a 404 error page.
+        pages={hub: page("https://parked-test.com/deeper")},
+        redirects={OLD_SEED: parked},
+    )
+    extractor = make_extractor(web, allowed_domains=["hub-test.org"])
+
+    extractor.extract([OLD_SEED, hub])
+
+    assert "https://parked-test.com/deeper" not in web.fetched
+
+
 # --- domain keys -----------------------------------------------------------
 
 

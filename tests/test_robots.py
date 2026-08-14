@@ -143,6 +143,62 @@ def test_traversal_override_ignores_robots(make_extractor, monkeypatch):
     assert CLOSED_LINK in web.fetched
 
 
+def test_redirect_to_a_disallowed_path_is_discarded(make_extractor, monkeypatch):
+    """A redirector on an allowed path must not smuggle a disallowed page in.
+
+    The request is unavoidable -- httpx follows the redirect inside one call -- but
+    the body must not be read, screened, or pooled into the extraction.
+    """
+    monkeypatch.setattr(robots, "_http_get", serving(ROBOTS))
+    hop = "https://site-test.org/public/go"
+    web = StubWeb(
+        pages={SEED: page(hop), CLOSED_LINK: page()},
+        redirects={hop: CLOSED_LINK},
+    )
+    extractor = make_extractor(web, respect_robots=True)
+
+    result = extractor.extract(SEED)
+
+    assert hop in web.fetched  # the redirect itself could not be prevented
+    assert CLOSED_LINK not in result.path
+    assert [v.url for v in result.verdicts] == [SEED]
+
+
+def test_redirect_within_allowed_paths_is_kept(make_extractor, monkeypatch):
+    monkeypatch.setattr(robots, "_http_get", serving(ROBOTS))
+    hop = "https://site-test.org/public/go"
+    web = StubWeb(
+        pages={SEED: page(hop), OPEN_LINK: page()},
+        redirects={hop: OPEN_LINK},
+    )
+    extractor = make_extractor(web, respect_robots=True)
+
+    result = extractor.extract(SEED)
+
+    assert OPEN_LINK in result.path
+
+
+def test_a_malformed_url_never_aborts_the_crawl(make_extractor):
+    """`urlsplit` raises on a bracketed host, and every URL helper goes through it.
+
+    Unguarded, one such href escapes the worker, surfaces out of `pool.map`, and
+    discards every page already collected.
+    """
+    good = "https://site-test.org/public/more"
+    web = StubWeb(
+        {
+            SEED: page("http://a[b]c.example.com/x", good),
+            good: page(),
+        }
+    )
+    extractor = make_extractor(web)
+
+    result = extractor.extract(SEED)
+
+    assert result.stopped_reason == "match"
+    assert SEED in result.path
+
+
 def test_robots_off_by_default(make_extractor, monkeypatch):
     def unexpected(url: str) -> tuple[int, str]:
         raise AssertionError("robots.txt must not be fetched when the check is off")
