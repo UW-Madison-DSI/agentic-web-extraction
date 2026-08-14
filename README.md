@@ -715,6 +715,8 @@ Python ≥3.13. Build backend: `uv_build`. The package lives at the repo root (`
 
 ### Releasing
 
+Per-release notes live in [CHANGELOG.md](CHANGELOG.md).
+
 ```bash
 uv run scripts/release.py [major|minor|patch]   # default: patch
 ```
