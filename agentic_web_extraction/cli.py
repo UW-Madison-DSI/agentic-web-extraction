@@ -170,11 +170,12 @@ def extract(
             help=(
                 "When a seed redirects to a different registrable domain (a rebrand, "
                 "a moved host), add where it landed to the boundary so the crawl can "
-                "continue there. On by default; only meaningful with "
-                "--allowed-domain."
+                "continue there. OFF by default: whoever controls the seed's DNS then "
+                "decides where it lands, so this is the one way a party other than "
+                "you can widen the boundary. Only meaningful with --allowed-domain."
             ),
         ),
-    ] = True,
+    ] = False,
     user_agent: Annotated[
         str | None,
         typer.Option(

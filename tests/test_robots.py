@@ -22,7 +22,7 @@ Disallow: /secret/
 def serving(body: str, status: int = 200):
     """A robots fetcher returning a fixed body for any origin."""
 
-    def fetcher(url: str) -> tuple[int, str]:
+    def fetcher(url: str, user_agent: str = "") -> tuple[int, str]:
         assert url.endswith("/robots.txt")
         return status, body
 
@@ -64,7 +64,7 @@ def test_override_domain_bypasses_the_check():
 
 
 def test_fetch_failure_fails_open():
-    def exploding(url: str) -> tuple[int, str]:
+    def exploding(url: str, user_agent: str = "") -> tuple[int, str]:
         raise httpx.ConnectError("no route to host")
 
     policy = RobotsPolicy(user_agent=UA, fetcher=exploding)
@@ -82,10 +82,10 @@ def test_non_2xx_robots_fails_open(status):
 
 
 def test_robots_is_fetched_once_per_origin():
-    calls: list[str] = []
+    calls: list[tuple[str, str]] = []
 
-    def counting(url: str) -> tuple[int, str]:
-        calls.append(url)
+    def counting(url: str, user_agent: str = "") -> tuple[int, str]:
+        calls.append((url, user_agent))
         return 200, ROBOTS
 
     policy = RobotsPolicy(user_agent=UA, fetcher=counting)
@@ -94,8 +94,8 @@ def test_robots_is_fetched_once_per_origin():
     policy.allows("https://other-test.com/a")
 
     assert calls == [
-        "https://site-test.org/robots.txt",
-        "https://other-test.com/robots.txt",
+        ("https://site-test.org/robots.txt", UA),
+        ("https://other-test.com/robots.txt", UA),
     ]
 
 
@@ -200,7 +200,7 @@ def test_a_malformed_url_never_aborts_the_crawl(make_extractor):
 
 
 def test_robots_off_by_default(make_extractor, monkeypatch):
-    def unexpected(url: str) -> tuple[int, str]:
+    def unexpected(url: str, user_agent: str = "") -> tuple[int, str]:
         raise AssertionError("robots.txt must not be fetched when the check is off")
 
     monkeypatch.setattr(robots, "_http_get", unexpected)

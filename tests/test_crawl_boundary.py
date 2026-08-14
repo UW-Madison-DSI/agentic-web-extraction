@@ -110,9 +110,13 @@ def redirecting_web() -> StubWeb:
     )
 
 
-def test_seed_redirect_widens_the_boundary(make_extractor):
+def test_seed_redirect_widens_the_boundary_when_opted_in(make_extractor):
     web = redirecting_web()
-    extractor = make_extractor(web, allowed_domains=["openphil-test.org"])
+    extractor = make_extractor(
+        web,
+        allowed_domains=["openphil-test.org"],
+        allow_seed_redirect_domains=True,
+    )
 
     result = extractor.extract(OLD_SEED)
 
@@ -120,13 +124,11 @@ def test_seed_redirect_widens_the_boundary(make_extractor):
     assert NEW_LINK in web.fetched  # ...and its links stay crawlable
 
 
-def test_seed_redirect_can_be_refused(make_extractor):
+def test_seed_redirect_does_not_widen_by_default(make_extractor):
+    """Off by default: whoever controls the seed's DNS decides where it lands, so
+    widening is the one path by which someone else could grow the boundary."""
     web = redirecting_web()
-    extractor = make_extractor(
-        web,
-        allowed_domains=["openphil-test.org"],
-        allow_seed_redirect_domains=False,
-    )
+    extractor = make_extractor(web, allowed_domains=["openphil-test.org"])
 
     result = extractor.extract(OLD_SEED)
 
@@ -169,11 +171,59 @@ def test_a_dead_seed_does_not_widen_the_boundary(make_extractor):
         pages={hub: page("https://parked-test.com/deeper")},
         redirects={OLD_SEED: parked},
     )
-    extractor = make_extractor(web, allowed_domains=["hub-test.org"])
+    extractor = make_extractor(
+        web,
+        allowed_domains=["hub-test.org"],
+        allow_seed_redirect_domains=True,
+    )
 
     extractor.extract([OLD_SEED, hub])
 
     assert "https://parked-test.com/deeper" not in web.fetched
+
+
+def test_widening_is_independent_of_fold_order(make_extractor, settings):
+    """All seeds share SEED_SCORE, so they arrive in one wave. A link scored on one
+    seed's page must not be dropped for a domain another seed in the same wave
+    legitimizes — otherwise the boundary depends on which worker finished first."""
+    hub = "https://hub-test.org/links"
+    landing = "https://coefficient-test.org/grants"
+    deeper = "https://coefficient-test.org/opportunity/1"
+    web = StubWeb(
+        # `hub` links to the domain the other seed is about to legitimize.
+        pages={hub: page(deeper), landing: page(), deeper: page()},
+        redirects={OLD_SEED: landing},
+    )
+    extractor = make_extractor(
+        web,
+        # 2 workers puts both seeds in a single wave, where the race lived.
+        settings=settings.model_copy(update={"max_workers": 2}),
+        allowed_domains=["hub-test.org"],
+        allow_seed_redirect_domains=True,
+    )
+
+    extractor.extract([hub, OLD_SEED])
+
+    assert deeper in web.fetched
+
+
+def test_a_blocked_link_is_logged_once_per_crawl(make_extractor, capsys):
+    """A site-wide footer link is re-offered by every page; repeating the line per
+    page buries the log without adding a fact."""
+    other = "https://glpf-test.org/about"
+    web = StubWeb(
+        {
+            SEED: page(other, OFF_SITE),
+            other: page(OFF_SITE),
+        }
+    )
+    extractor = make_extractor(web, allowed_domains=["glpf-test.org"])
+
+    extractor.extract(SEED)
+
+    stderr = capsys.readouterr().err
+    assert other in web.fetched  # both pages offered the same off-boundary link
+    assert stderr.count(f"[blocked] {OFF_SITE}") == 1
 
 
 # --- domain keys -----------------------------------------------------------

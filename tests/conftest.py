@@ -60,9 +60,12 @@ class StubWeb:
         self.pages = pages
         self.redirects = redirects or {}
         self.fetched: list[str] = []
+        # (url, user_agent) per request, so a test can assert what went on the wire.
+        self.requests: list[tuple[str, str]] = []
 
-    def fetch(self, url: str) -> FetchedPage:
+    def fetch(self, url: str, *, user_agent: str = "") -> FetchedPage:
         self.fetched.append(url)
+        self.requests.append((url, user_agent))
         resolved = self.redirects.get(url, url)
         html = self.pages.get(resolved)
         if html is None:

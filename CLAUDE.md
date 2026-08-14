@@ -91,38 +91,64 @@ domain compare + `domain_of` allow keys), [fetch.py](agentic_web_extraction/fetc
   fold loop and nowhere else. Do **not** move it into `_process_page`: worker-side
   filtering would bake the current allowed set into the `PAGE` cache's stored
   `link_scores`, so a later run with a different boundary would replay the old one.
-  Do **not** move it into `fetch.py` either: httpx follows redirects inside a single
-  fetch, and filtering requests would break every site that has rebranded or moved
-  host (the reason `allow_seed_redirect_domains`, default on, adds a *seed's* landing
-  domain to the set — a non-seed link that redirects off-boundary is read but expands
-  no further). Matching goes through `frontier.domain_of` (PSL via tldextract, bare
-  host as the fallback key for `localhost`/IPs) — don't write new host matching, and
-  don't add a blocklist or threat-intel feed: default-deny already covers everything
-  a feed would name, with no feed to keep fresh and no network dependency. Every
-  dropped link gets a `[blocked]` line so "why didn't we fetch X" is a grep. Seed
-  domains join the set automatically (a caller passing a seed is asking for that
-  domain), so `[]` means "the seeds' sites only" and callers list only the extras.
-  Deliberately **not** an `AWE_*` setting: the in-scope domains depend on a given
-  crawl's seeds, not on the environment.
+  That is *also* the answer to "off-boundary links are re-scored on every page, which
+  costs tokens" — true, and the fix is not free: skipping them means filtering the
+  scorer's input, which is what gets cached. Buying it back properly needs the
+  boundary in the `PAGE` key (the `seeddom=` segment is the precedent), which costs
+  cross-crawl sharing precisely where it pays most — the same portal page reached from
+  55 different seeds would no longer share one entry. Left as-is deliberately; only
+  the *log* is deduped (see below). Do **not** move it into `fetch.py` either: httpx
+  follows redirects inside a single fetch, and filtering requests would break every
+  site that has rebranded or moved host — that is what `allow_seed_redirect_domains`
+  is for, and it is **off** by default: whoever controls a seed's DNS decides where it
+  lands, so it is the one path by which someone other than the caller can widen the
+  set. Opted in, it fires only for a *seed* (a non-seed link that redirects
+  off-boundary is read but expands no further) and only when the landing page returned
+  readable content, so a parked domain's error page can't nominate itself. Widening
+  runs as a pre-pass over the whole wave (`_widen_for_seed_redirects`) before any link
+  is gated: all seeds share `SEED_SCORE` and arrive together, so folding them one at a
+  time made the boundary depend on which worker finished first. Matching goes through
+  `frontier.domain_of` (PSL via tldextract, bare host as the fallback key for
+  `localhost`/IPs) — don't write new host matching, and don't add a blocklist or
+  threat-intel feed: default-deny already covers everything a feed would name, with no
+  feed to keep fresh and no network dependency. Every dropped link gets a `[blocked]`
+  line — once per crawl per URL, since a site-wide footer link is re-offered by every
+  page and one line per page buries the log without adding a fact; the dedup set is
+  never consulted as policy, so a mid-crawl widening still takes effect. Seed domains
+  join the set automatically (a caller passing a seed is asking for that domain), so
+  `[]` means "the seeds' sites only" and callers list only the extras. Deliberately
+  **not** an `AWE_*` setting: the in-scope domains depend on a given crawl's seeds,
+  not on the environment.
 - **robots.txt is opt-in, per-origin, and fails open.**
   [robots.py](agentic_web_extraction/robots.py) is checked inside the worker before
   the fetch (so a disallowed URL costs no request, no budget slot, no LLM call) and
-  is safe there because it owns its cache + lock and touches no traversal state — the
+  again on the *resolved* URL when the fetch redirected — httpx follows redirects
+  inside one call, so a redirector on an allowed path is otherwise a hole straight
+  through the check, cross-origin included; the second request is already spent, but
+  the body is discarded unread rather than screened and pooled. Running in the worker
+  is safe because the policy owns its cache + lock and touches no traversal state — the
   frontier rule still holds. A skip returns `_PageOutcome(policy_skipped=True)`, which
-  the fold loop keeps out of `path` (nothing was retrieved); the log line is the
-  record. Failure to *obtain* robots.txt — 404, 401/403, 5xx, timeout — is treated as
+  the fold loop keeps out of `path` (nothing was retrieved); the log line is the record,
+  so it must name the URL — eight workers interleave their output, and a line that
+  identifies only the agent is unattributable. Failure to *obtain* robots.txt — 404, 401/403, 5xx, timeout — is treated as
   unrestricted, the opposite of RFC 9309's suggestion, because an origin's brief 500
   (or an edge rule that blocks the crawler's robots.txt too) would otherwise empty an
   authorized crawl behind a line that reads like the site's own policy. Keep that
   documented wherever it moves. `AWE_ROBOTS_OVERRIDES` exempts domains; it is *not* a
   boundary — the two compose (boundary = where, robots = what).
-- **Attribution is a setting, applied module-globally.** `AWE_USER_AGENT` /
+- **Attribution: a process default, overridden per request.** `AWE_USER_AGENT` /
   `Extractor(user_agent=...)` feeds `fetch.configure()` and `fallback.configure()`
-  from `Extractor.__init__`, following the `logsink.configure` precedent: both http
-  clients are process-wide singletons, so the last Extractor constructed wins for the
-  process. Recovery requests carry the *same* string as origin ones (which route
-  served a page is already in `FetchedPage.via`). The UA is also the agent name the
-  robots check is evaluated against, so keep the two reading one value.
+  from `Extractor.__init__`, following the `logsink.configure` precedent — but that
+  sets only the *default*, because both http clients are process-wide singletons and
+  `settings.user_agent` has a non-empty default: a second Extractor built without
+  `user_agent=` would otherwise revert the first one's in-flight traffic to the generic
+  library string, and leave the agent sent diverging from the agent its robots rules
+  are evaluated against. So every request also carries the initiating Extractor's own
+  string — `fetch(url, user_agent=...)` → `_send`, `fallback.recover(url,
+  user_agent=...)` → both routes, and `RobotsPolicy`'s own `robots.txt` fetch. Keep new
+  outbound calls on that path; a request that falls back to the client default is one
+  whose attribution depends on construction order. Recovery requests carry the *same*
+  string as origin ones (which route served a page is already in `FetchedPage.via`).
 - **Consolidate, don't merge.** Extraction is a *single* call over the concatenated
   markdown of all screened-in pages — there is no per-page extraction and no
   `merge_extractions`/dedup. If the concatenation exceeds `max_context_tokens`, fit it
@@ -272,7 +298,7 @@ awe extract --schema ./schemas.py:Opportunities --criteria "..." \
   [--always-summarize | --no-always-summarize] \
   [--seed-is-content | --no-seed-is-content] \
   [--prefer-seed-domain | --no-prefer-seed-domain] \
-  [--allowed-domain example.org ...] [--no-allow-seed-redirect-domains] \
+  [--allowed-domain example.org ...] [--allow-seed-redirect-domains] \
   [--user-agent "name/1.0 (+contact-url)"] \
   [--respect-robots | --no-respect-robots] [--robots-override example.org ...] \
   [--log-file log.txt] [--no-cache]

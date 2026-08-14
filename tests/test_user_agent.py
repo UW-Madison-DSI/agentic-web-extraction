@@ -68,6 +68,38 @@ def test_explicit_kwarg_beats_the_setting(make_extractor, settings):
     assert fetch.user_agent() == "explicit/1.0"
 
 
+def test_each_fetch_carries_its_own_extractors_user_agent(make_extractor, settings):
+    """A second Extractor must not rename the first one's traffic.
+
+    `configure` sets one string for the whole process, so without a per-request
+    override, building any second Extractor without `user_agent=` reverts every
+    crawl in flight to the generic library string — and leaves the agent sent
+    diverging from the agent the robots rules are evaluated against.
+    """
+    ua = "first-pipeline/1.0 (+https://a.edu/)"
+    first = make_extractor(StubWeb({SEED: page()}), user_agent=ua)
+
+    # A second Extractor with no user_agent= resets the shared process default...
+    web = StubWeb({SEED: page()})
+    make_extractor(web, settings=settings)
+    assert fetch.user_agent() != ua
+
+    first.extract(SEED)
+
+    # ...but the first crawl's own requests still name the first operator.
+    assert web.requests == [(SEED, ua)]
+
+
+def test_the_request_user_agent_reaches_the_wire(make_extractor):
+    ua = "wire-test/2.0 (+https://example.edu/crawler)"
+    web = StubWeb({SEED: page()})
+    extractor = make_extractor(web, user_agent=ua)
+
+    extractor.extract(SEED)
+
+    assert web.requests == [(SEED, ua)]
+
+
 def test_blank_user_agent_falls_back_to_the_constant(make_extractor):
     web = StubWeb({SEED: page()})
     extractor = make_extractor(

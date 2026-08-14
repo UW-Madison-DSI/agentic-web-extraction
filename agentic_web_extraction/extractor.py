@@ -82,7 +82,7 @@ class Extractor:
         normalize_html: bool | None = None,
         prefer_seed_domain: bool | None = None,
         allowed_domains: Iterable[str] | None = None,
-        allow_seed_redirect_domains: bool = True,
+        allow_seed_redirect_domains: bool = False,
         user_agent: str | None = None,
         respect_robots: bool | None = None,
         robots_overrides: str | None = None,
@@ -133,10 +133,18 @@ class Extractor:
         )
         # When a seed redirects to a different registrable domain (a rebrand, an
         # org that moved host), add where it landed to the boundary for this call.
-        # Without it, restricting to the domain you seeded would break the crawl the
-        # moment the site moves -- the seed itself resolves fine (httpx follows
-        # redirects inside one fetch; the boundary governs queuing, not requests),
-        # but every link on the page it lands on is off-boundary.
+        # Without it, restricting to the domain you seeded stops the crawl the moment
+        # the site moves -- the seed itself still resolves (httpx follows redirects
+        # inside one fetch; the boundary governs queuing, not requests), but every
+        # link on the page it lands on is off-boundary.
+        #
+        # OFF by default, because it is the one way a party other than the caller can
+        # widen the boundary: whoever controls the seed's DNS decides where it lands,
+        # so a lapsed domain now parked by someone else could nominate its own host.
+        # Widening additionally requires readable content (see extract), which rules
+        # out the error-page and interstitial cases, but "a third party can grow the
+        # allowed set" is not a property a default should have. Turn it on where a
+        # rebrand is expected and the seed is still under known control.
         self.allow_seed_redirect_domains = allow_seed_redirect_domains
         # Identify the crawler to the sites it fetches. Module-level configuration
         # (the fetch/fallback clients are process-wide singletons), following the
@@ -291,6 +299,9 @@ class Extractor:
             )
         # Canonical seed URLs, so the redirect rule above applies to seeds only.
         seed_keys = {canonical(u) for u in seed_list}
+        # Off-boundary links already logged, so a nav/footer link re-offered by every
+        # page on the site produces one [blocked] line rather than one per page.
+        blocked: set[str] = set()
 
         frontier = Frontier()
         for seed in seed_list:
@@ -341,7 +352,15 @@ class Extractor:
                 for url, _score, _source in batch:
                     frontier.mark_visited(url)
                 known = frontier.snapshot()
-                outcomes = pool.map(partial(worker, known=known), batch)
+                outcomes = list(pool.map(partial(worker, known=known), batch))
+                # Apply every seed's redirect widening BEFORE any of this wave's links
+                # are gated. All seeds share SEED_SCORE, so they arrive in one wave:
+                # folding them one at a time would let a link scored on seed A's page
+                # be dropped for a domain seed B is about to legitimize, making the
+                # boundary depend on which worker happened to finish first.
+                self._widen_for_seed_redirects(
+                    outcomes, allowed=allowed, seed_keys=seed_keys
+                )
 
                 for outcome in outcomes:
                     page = outcome.page
@@ -367,23 +386,6 @@ class Extractor:
                     if not outcome.readable:
                         continue
                     pages_fetched += 1
-                    # Widen the boundary to where a seed landed -- but only for a seed
-                    # that came back with readable content. A parked or lapsed domain
-                    # answers a redirect chain with an error or a non-page body, and
-                    # letting *that* into the boundary would hand the set to whoever
-                    # now owns the name: the exact failure the boundary exists to stop.
-                    if (
-                        allowed is not None
-                        and self.allow_seed_redirect_domains
-                        and canonical(outcome.requested_url) in seed_keys
-                    ):
-                        landed = domain_of(page.url)
-                        if landed and landed not in allowed:
-                            allowed.add(landed)
-                            self._log(
-                                f"    [boundary] seed {outcome.requested_url} resolved "
-                                f"to {landed} — added to the allowed domains"
-                            )
                     if outcome.has_verdict:
                         verdicts.append(
                             PageVerdict(
@@ -406,9 +408,18 @@ class Extractor:
                         # fetch. A link that is never queued is never fetched, which
                         # is the whole guarantee.
                         if allowed is not None and domain_of(link_url) not in allowed:
-                            self._log(
-                                f"    [blocked] {link_url} — outside the crawl boundary"
-                            )
+                            # Log each blocked URL once per crawl. A site-wide nav or
+                            # footer link is re-offered by every page it appears on,
+                            # and repeating the line per page buries the rest of the
+                            # log without adding a fact. `blocked` is per-crawl and
+                            # never consulted as policy, so a mid-crawl widening still
+                            # takes effect -- it only decides whether to log again.
+                            if link_url not in blocked:
+                                blocked.add(link_url)
+                                self._log(
+                                    f"    [blocked] {link_url} — outside the "
+                                    f"crawl boundary"
+                                )
                             continue
                         frontier.push(link_url, score=score, source=page.url)
 
@@ -442,6 +453,38 @@ class Extractor:
         if not dom or not seed_domains:
             return None
         return dom in seed_domains
+
+    def _widen_for_seed_redirects(
+        self,
+        outcomes: list[_PageOutcome],
+        *,
+        allowed: set[str] | None,
+        seed_keys: set[str],
+    ) -> None:
+        """Add each seed's landing domain to `allowed`, for a whole wave at once.
+
+        Main thread only (it mutates the boundary). Runs before any link in the wave
+        is gated, so the outcome doesn't depend on worker completion order.
+
+        A seed only widens the boundary if it came back with *readable* content: a
+        lapsed or parked domain answers the redirect chain with an error page or a
+        non-page body, and letting that nominate a domain would hand the allowed set
+        to whoever owns the name now -- the failure the boundary exists to prevent.
+        """
+        if allowed is None or not self.allow_seed_redirect_domains:
+            return
+        for outcome in outcomes:
+            if outcome.policy_skipped or not outcome.readable:
+                continue
+            if canonical(outcome.requested_url) not in seed_keys:
+                continue
+            landed = domain_of(outcome.page.url)
+            if landed and landed not in allowed:
+                allowed.add(landed)
+                self._log(
+                    f"    [boundary] seed {outcome.requested_url} resolved to "
+                    f"{landed} — added to the allowed domains"
+                )
 
     @staticmethod
     def _policy_skip(url: str) -> _PageOutcome:
@@ -488,7 +531,12 @@ class Extractor:
             return self._policy_skip(url)
         fetch_t0 = time.monotonic()
         try:
-            page = fetch_module.fetch(url)
+            # Send *this* Extractor's User-Agent, not whatever the process default
+            # happens to be: `configure` sets one string for the whole process, so a
+            # second Extractor built meanwhile would otherwise rename this crawl's
+            # traffic mid-flight -- and leave the agent sent diverging from the agent
+            # the robots rules are evaluated against.
+            page = fetch_module.fetch(url, user_agent=self.user_agent)
         except Exception as e:
             self._log(f"    ! fetch failed on {url}: {type(e).__name__}: {e}")
             return _PageOutcome(

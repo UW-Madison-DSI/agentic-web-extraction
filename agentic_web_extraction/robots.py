@@ -49,15 +49,20 @@ from .frontier import domain_of, normalize_domains
 ROBOTS_TIMEOUT = httpx.Timeout(10.0, connect=10.0)
 
 
-def _http_get(url: str) -> tuple[int, str]:
+def _http_get(url: str, user_agent: str = "") -> tuple[int, str]:
     """Fetch ``url`` with the crawl's own client; (status, body).
 
-    Deliberately the same client as the pages: identical User-Agent (the agent the
-    rules are matched against), identical connection pool, and no retry wrapper --
-    a robots.txt that fails once fails open, and re-asking three times only
-    lengthens the stall.
+    Deliberately the same client as the pages, and deliberately sent under the same
+    per-request User-Agent the rules are then matched against -- asking as one agent
+    and obeying the rules for another is the kind of divergence nobody notices until
+    it matters. Identical connection pool, and no retry wrapper: a robots.txt that
+    fails once fails open, and re-asking three times only lengthens the stall.
     """
-    response = fetch_module.get_client().get(url, timeout=ROBOTS_TIMEOUT)
+    response = fetch_module.get_client().get(
+        url,
+        timeout=ROBOTS_TIMEOUT,
+        headers={"User-Agent": user_agent} if user_agent else None,
+    )
     return response.status_code, response.text
 
 
@@ -86,7 +91,7 @@ class RobotsPolicy:
         *,
         user_agent: str,
         overrides: Iterable[str] = (),
-        fetcher: Callable[[str], tuple[int, str]] | None = None,
+        fetcher: Callable[[str, str], tuple[int, str]] | None = None,
     ) -> None:
         self.user_agent = user_agent
         # Registrable domains (or bare hosts) exempt from the check.
@@ -127,7 +132,7 @@ class RobotsPolicy:
         one (see the module docstring on failing open)."""
         url = f"{origin}/robots.txt"
         try:
-            status, body = self._fetch(url)
+            status, body = self._fetch(url, self.user_agent)
         except Exception as e:  # noqa: BLE001 - any failure to obtain it fails open
             logsink.emit(
                 f"    [robots] {url} unavailable ({type(e).__name__}: {e}) "

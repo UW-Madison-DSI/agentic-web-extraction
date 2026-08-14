@@ -111,8 +111,12 @@ def _classify(content_type: str) -> Literal["html", "pdf", "skipped"]:
     retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
     reraise=True,
 )
-def _send(url: str) -> httpx.Response:
-    response = get_client().get(url)
+def _send(url: str, user_agent: str = "") -> httpx.Response:
+    # A per-request User-Agent overrides the client default for this call only. The
+    # client is a process-wide singleton, so a caller-supplied header is the only way
+    # two Extractors in one process can each send their own identifying string.
+    headers = {"User-Agent": user_agent} if user_agent else None
+    response = get_client().get(url, headers=headers)
     if response.status_code >= 500:
         response.raise_for_status()
     return response
@@ -122,7 +126,7 @@ def content_type_of(response: httpx.Response) -> str:
     return response.headers.get("content-type", "")
 
 
-def _recover(url: str, follow_pdf: bool) -> FetchedPage | None:
+def _recover(url: str, follow_pdf: bool, user_agent: str = "") -> FetchedPage | None:
     """Ask [fallback.py](fallback.py) for a body the origin wouldn't serve.
 
     Returned under ``url`` itself -- never the reader/archive address -- so the
@@ -135,7 +139,7 @@ def _recover(url: str, follow_pdf: bool) -> FetchedPage | None:
         logsink.emit(f"    [fallback] skipping {url} — follow_pdf is off")
         return None
 
-    recovered = fallback.recover(url)
+    recovered = fallback.recover(url, user_agent=user_agent)
     if recovered is None:
         return None
     kind = _classify(recovered.content_type)
@@ -156,10 +160,13 @@ def _recover(url: str, follow_pdf: bool) -> FetchedPage | None:
     )
 
 
-def fetch(url: str) -> FetchedPage:
+def fetch(url: str, *, user_agent: str = "") -> FetchedPage:
+    """Fetch one URL. `user_agent` overrides the configured default for this call
+    only -- pass the caller's own string so the header on the wire always names the
+    Extractor that asked, whatever another Extractor configured meanwhile."""
     settings = get_settings()
     try:
-        response = _send(url)
+        response = _send(url, user_agent)
     except httpx.HTTPStatusError as exc:
         # `_send` raises this for a 5xx it gave up retrying. That is still a
         # *response* whose status is outside 2xx -- exactly the hole the status
@@ -198,7 +205,7 @@ def fetch(url: str) -> FetchedPage:
         logsink.emit(
             f"    [status] {response.status_code} on {resolved_url} — not content"
         )
-        recovered = _recover(resolved_url, settings.follow_pdf)
+        recovered = _recover(resolved_url, settings.follow_pdf, user_agent)
         if recovered is not None:
             return recovered
         return FetchedPage(

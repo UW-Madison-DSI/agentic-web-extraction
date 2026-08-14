@@ -192,9 +192,11 @@ def markdown_to_html(markdown: str) -> str:
     return _MARKDOWN_LINK.sub(anchor, escaped)
 
 
-def _jina_get(url: str, fmt: str) -> str | None:
+def _jina_get(url: str, fmt: str, user_agent: str = "") -> str | None:
     """One reader call; the body, or None if it wasn't usable."""
     headers = {"X-Return-Format": fmt} if fmt else {}
+    if user_agent:
+        headers["User-Agent"] = user_agent
     try:
         response = _get(f"{JINA_ENDPOINT}{url}", headers=headers)
     except Exception as exc:  # noqa: BLE001 — recovery is best-effort
@@ -222,7 +224,7 @@ def _has_dom(body: str) -> bool:
     return "<" in body[:2000]
 
 
-def _via_jina(url: str) -> Recovered | None:
+def _via_jina(url: str, user_agent: str = "") -> Recovered | None:
     """Read ``url`` through the Jina reader.
 
     In html mode a target with no DOM (a PDF, an Office document) yields a stub,
@@ -230,7 +232,7 @@ def _via_jina(url: str) -> Recovered | None:
     PDFs -- rather than passing the stub off as the page.
     """
     fmt = get_settings().jina_return_format.strip()
-    body = _jina_get(url, fmt)
+    body = _jina_get(url, fmt, user_agent)
     if body is None:
         return None
 
@@ -240,7 +242,7 @@ def _via_jina(url: str) -> Recovered | None:
             f"    [fallback:jina] html mode returned no markup for {url} "
             f"({len(body)}B) — retrying with the default reader"
         )
-        retried = _jina_get(url, "")
+        retried = _jina_get(url, "", user_agent)
         if retried is None:
             return None
         body, used = retried, ""
@@ -259,7 +261,7 @@ def _via_jina(url: str) -> Recovered | None:
     )
 
 
-def _newest_capture(url: str) -> str | None:
+def _newest_capture(url: str, user_agent: str = "") -> str | None:
     """Timestamp of the archive's most recent successful capture of ``url``.
 
     ``fastLatest`` lets the CDX index answer from the tail of the block instead
@@ -269,6 +271,7 @@ def _newest_capture(url: str) -> str | None:
     try:
         response = _get(
             WAYBACK_CDX_ENDPOINT,
+            headers={"User-Agent": user_agent} if user_agent else None,
             params={
                 "url": url,
                 "output": "json",
@@ -312,9 +315,9 @@ def _too_old(timestamp: str) -> bool:
     return datetime.now(UTC) - captured > timedelta(days=limit)
 
 
-def _via_wayback(url: str) -> Recovered | None:
+def _via_wayback(url: str, user_agent: str = "") -> Recovered | None:
     """Read ``url`` from the Internet Archive's newest acceptable capture."""
-    timestamp = _newest_capture(url)
+    timestamp = _newest_capture(url, user_agent)
     if timestamp is None:
         return None
     if _too_old(timestamp):
@@ -325,7 +328,10 @@ def _via_wayback(url: str) -> Recovered | None:
         return None
 
     try:
-        response = _get(WAYBACK_SNAPSHOT_TEMPLATE.format(timestamp=timestamp, url=url))
+        response = _get(
+            WAYBACK_SNAPSHOT_TEMPLATE.format(timestamp=timestamp, url=url),
+            headers={"User-Agent": user_agent} if user_agent else None,
+        )
     except Exception as exc:  # noqa: BLE001 — recovery is best-effort
         logsink.emit(f"    [fallback:wayback] snapshot fetch failed for {url}: {exc!r}")
         return None
@@ -354,7 +360,7 @@ def _via_wayback(url: str) -> Recovered | None:
     )
 
 
-_ROUTES: dict[str, Callable[[str], Recovered | None]] = {
+_ROUTES: dict[str, Callable[[str, str], Recovered | None]] = {
     "jina": _via_jina,
     "wayback": _via_wayback,
 }
@@ -376,15 +382,17 @@ def configured_routes() -> list[str]:
     return routes
 
 
-def recover(url: str) -> Recovered | None:
+def recover(url: str, *, user_agent: str = "") -> Recovered | None:
     """Try each configured route in order; the first that yields content wins.
 
-    Returns ``None`` when recovery is disabled, every route declines, or the URL
-    simply isn't available anywhere -- the caller then degrades the page to
-    ``kind="error"``, which the traversal skips at no LLM cost.
+    ``user_agent`` overrides the configured default for these requests only, so the
+    reader/archive sees the same operator the origin fetch named (see
+    :func:`fetch.fetch`). Returns ``None`` when recovery is disabled, every route
+    declines, or the URL simply isn't available anywhere -- the caller then degrades
+    the page to ``kind="error"``, which the traversal skips at no LLM cost.
     """
     for name in configured_routes():
-        recovered = _ROUTES[name](url)
+        recovered = _ROUTES[name](url, user_agent)
         if recovered is not None:
             return recovered
     return None
