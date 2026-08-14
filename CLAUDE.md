@@ -17,10 +17,16 @@ uv run ruff check  # lint
 uv run ruff format # format
 uv run ty check    # type-check (Astral's ty, not mypy)
 
+uv run pytest      # tests (offline: stub provider + stub web, no network/LLM)
+
 uv run scripts/release.py [major|minor|patch]   # cut a release (default: patch)
 ```
 
-No test suite yet; if you add one it'll be `uv run pytest`.
+Tests live in [tests/](tests/) and are deliberately network-free: [tests/conftest.py](tests/conftest.py)
+supplies a `StubProvider` (screens everything in, scores every link 0.9) and a
+`StubWeb` (url → html, plus a redirect map and a fetch log), so a test asserts on
+*which pages the traversal chose to fetch*. Anything needing a real LLM or a real
+site doesn't belong here.
 
 ## Architecture
 
@@ -39,12 +45,19 @@ budget is spent, the collected pages are concatenated and — if over
 extraction runs over the whole thing. No `merge_extractions`, no dedup. Screen, link-
 scorer, and summarizer share a cheap model; extraction uses a stronger one.
 
+Two hard controls sit on top of that policy, both off/generic by default:
+`allowed_domains` (a default-deny set of registrable domains, enforced at the
+`frontier.push` call site — off-boundary links are dropped and logged `[blocked]`,
+never fetched) and `respect_robots` (per-origin robots.txt, checked in the worker
+*before* the fetch). Plus `user_agent`, so the traffic is attributable.
+
 Key files: [extractor.py](agentic_web_extraction/extractor.py) (wave loop + consolidate),
 [summarize.py](agentic_web_extraction/summarize.py) (fit-or-summarize),
 [schema_outline.py](agentic_web_extraction/schema_outline.py) (schema → compact prompt outline),
 [tokens.py](agentic_web_extraction/tokens.py) (tiktoken counting/splitting),
 [frontier.py](agentic_web_extraction/frontier.py) (heap + visited set + snapshot + PSL
-domain compare), [fetch.py](agentic_web_extraction/fetch.py) (httpx + status guard),
+domain compare + `domain_of` allow keys), [fetch.py](agentic_web_extraction/fetch.py) (httpx + status guard + UA),
+[robots.py](agentic_web_extraction/robots.py) (opt-in robots.txt policy),
 [fallback.py](agentic_web_extraction/fallback.py) (jina/wayback recovery),
 [normalize.py](agentic_web_extraction/normalize.py),
 [providers/](agentic_web_extraction/providers/),
@@ -72,6 +85,44 @@ domain compare), [fetch.py](agentic_web_extraction/fetch.py) (httpx + status gua
   off-domain disfavor expressed *to the LLM*, not a math penalty — nothing excluded;
   generalized to "on any seed domain" for multi-seed) and `seed_is_content` (seeds are
   the content: skip screen + link-scoring, consolidate + extract).
+- **The crawl boundary is filtered at the frontier, never at the transport.** The
+  hard limit is `Extractor(allowed_domains=...)` (default `None` = unrestricted, so
+  upgrading changes nothing), enforced at the one `frontier.push` call site in the
+  fold loop and nowhere else. Do **not** move it into `_process_page`: worker-side
+  filtering would bake the current allowed set into the `PAGE` cache's stored
+  `link_scores`, so a later run with a different boundary would replay the old one.
+  Do **not** move it into `fetch.py` either: httpx follows redirects inside a single
+  fetch, and filtering requests would break every site that has rebranded or moved
+  host (the reason `allow_seed_redirect_domains`, default on, adds a *seed's* landing
+  domain to the set — a non-seed link that redirects off-boundary is read but expands
+  no further). Matching goes through `frontier.domain_of` (PSL via tldextract, bare
+  host as the fallback key for `localhost`/IPs) — don't write new host matching, and
+  don't add a blocklist or threat-intel feed: default-deny already covers everything
+  a feed would name, with no feed to keep fresh and no network dependency. Every
+  dropped link gets a `[blocked]` line so "why didn't we fetch X" is a grep. Seed
+  domains join the set automatically (a caller passing a seed is asking for that
+  domain), so `[]` means "the seeds' sites only" and callers list only the extras.
+  Deliberately **not** an `AWE_*` setting: the in-scope domains depend on a given
+  crawl's seeds, not on the environment.
+- **robots.txt is opt-in, per-origin, and fails open.**
+  [robots.py](agentic_web_extraction/robots.py) is checked inside the worker before
+  the fetch (so a disallowed URL costs no request, no budget slot, no LLM call) and
+  is safe there because it owns its cache + lock and touches no traversal state — the
+  frontier rule still holds. A skip returns `_PageOutcome(policy_skipped=True)`, which
+  the fold loop keeps out of `path` (nothing was retrieved); the log line is the
+  record. Failure to *obtain* robots.txt — 404, 401/403, 5xx, timeout — is treated as
+  unrestricted, the opposite of RFC 9309's suggestion, because an origin's brief 500
+  (or an edge rule that blocks the crawler's robots.txt too) would otherwise empty an
+  authorized crawl behind a line that reads like the site's own policy. Keep that
+  documented wherever it moves. `AWE_ROBOTS_OVERRIDES` exempts domains; it is *not* a
+  boundary — the two compose (boundary = where, robots = what).
+- **Attribution is a setting, applied module-globally.** `AWE_USER_AGENT` /
+  `Extractor(user_agent=...)` feeds `fetch.configure()` and `fallback.configure()`
+  from `Extractor.__init__`, following the `logsink.configure` precedent: both http
+  clients are process-wide singletons, so the last Extractor constructed wins for the
+  process. Recovery requests carry the *same* string as origin ones (which route
+  served a page is already in `FetchedPage.via`). The UA is also the agent name the
+  robots check is evaluated against, so keep the two reading one value.
 - **Consolidate, don't merge.** Extraction is a *single* call over the concatenated
   markdown of all screened-in pages — there is no per-page extraction and no
   `merge_extractions`/dedup. If the concatenation exceeds `max_context_tokens`, fit it
@@ -220,15 +271,24 @@ awe extract --schema ./schemas.py:Opportunities --criteria "..." \
   [--max-fetches 10] [--max-context-tokens 128000] [--max-workers 8] \
   [--always-summarize | --no-always-summarize] \
   [--seed-is-content | --no-seed-is-content] \
-  [--prefer-seed-domain | --no-prefer-seed-domain] [--log-file log.txt] [--no-cache]
+  [--prefer-seed-domain | --no-prefer-seed-domain] \
+  [--allowed-domain example.org ...] [--no-allow-seed-redirect-domains] \
+  [--user-agent "name/1.0 (+contact-url)"] \
+  [--respect-robots | --no-respect-robots] [--robots-override example.org ...] \
+  [--log-file log.txt] [--no-cache]
 ```
 
 `--criteria` accepts an inline string or `@path/to/file.txt`. `--schema` takes
 `import.path:ClassName` or `path/file.py:ClassName`. `--seed-url` is repeatable (pools
-seeds into one extraction; budget is per seed). `text_filters` are Python-API-only
-(callables — not CLI-expressible).
+seeds into one extraction; budget is per seed). `--allowed-domain` and
+`--robots-override` are repeatable too; **no** `--allowed-domain` means no boundary,
+so the CLI normalizes Click's empty tuple to `None` (an empty *set* would mean the
+opposite thing — seeds only). `text_filters` are Python-API-only (callables — not
+CLI-expressible).
 
 ## Layout
 
 The package lives at the repo root (`agentic_web_extraction/`), not under `src/` —
-enforced by `[tool.uv.build-backend].module-root = ""`.
+enforced by `[tool.uv.build-backend].module-root = ""`. `tests/` is a package
+(`__init__.py`) so test modules can `from .conftest import ...`; it sits outside the
+built wheel.

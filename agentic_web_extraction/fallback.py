@@ -62,6 +62,8 @@ WAYBACK_SNAPSHOT_TEMPLATE = "https://web.archive.org/web/{timestamp}id_/{url}"
 
 # Identifies the library to the recovery services, which are separate hosts under
 # their own rate policies -- not the origin the crawl's own User-Agent addresses.
+# Fallback only: ``configure`` replaces it with the deployment's attributable
+# string, so recovery requests are as traceable to their operator as origin ones.
 FALLBACK_USER_AGENT = "agentic-web-extraction/0.1 (fallback reader)"
 
 # Absolute markdown links in a reader's output. Relative targets are deliberately
@@ -93,6 +95,22 @@ class Recovered:
 
 _client_lock = threading.Lock()
 _client: httpx.Client | None = None
+_user_agent = FALLBACK_USER_AGENT
+
+
+def configure(*, user_agent: str = "") -> None:
+    """Set the User-Agent recovery requests send (empty restores the default).
+
+    Mirrors :func:`fetch.configure` and is called from the same place with the
+    same string: the reader/archive hosts should see who is asking just as the
+    origin does. Which *route* served a page is recorded in ``FetchedPage.via``,
+    so nothing is lost by dropping the old route-specific marker.
+    """
+    global _user_agent
+    with _client_lock:
+        _user_agent = user_agent or FALLBACK_USER_AGENT
+        if _client is not None:
+            _client.headers["User-Agent"] = _user_agent
 
 
 def get_client() -> httpx.Client:
@@ -105,7 +123,7 @@ def get_client() -> httpx.Client:
     global _client
     with _client_lock:
         if _client is None:
-            headers = {"User-Agent": FALLBACK_USER_AGENT}
+            headers = {"User-Agent": _user_agent}
             settings = get_settings()
             if settings.jina_api_key is not None:
                 key = settings.jina_api_key.get_secret_value().strip()

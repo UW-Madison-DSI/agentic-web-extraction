@@ -144,6 +144,27 @@ class Settings(BaseSettings):
     # domain information supplied. The registrable-domain comparison is generic
     # (Public Suffix List, see frontier.py) -- no logic tied to any particular site.
     prefer_seed_domain: bool = False
+    # User-Agent header sent on every crawl fetch (env: AWE_USER_AGENT), and the
+    # agent name the robots.txt check below is evaluated against. The default is
+    # the library's own generic string; deployments should replace it with one
+    # naming the operator and a real contact URL, e.g.
+    # "my-pipeline/1.0 (+https://example.edu/crawler; Some Team)". An
+    # unattributable crawler is the reason a site operator's only recourse is a
+    # complaint to whoever owns the IP.
+    user_agent: str = "agentic-web-extraction/0.1 (+https://github.com/)"
+    # Honor each origin's robots.txt for the configured user_agent
+    # (env: AWE_RESPECT_ROBOTS). Off by default so v0.2 behavior is unchanged;
+    # turn it on for any crawl of sites you don't own. A disallowed URL is skipped
+    # before it is fetched -- no request, no budget slot, no LLM work. Failures to
+    # obtain robots.txt fail OPEN (see robots.py for why).
+    respect_robots: bool = False
+    # Registrable domains exempt from the robots.txt check when respect_robots is
+    # on (env: AWE_ROBOTS_OVERRIDES, comma-separated). For hosts whose robots.txt
+    # blanket-disallows automated clients but whose content you are authorized to
+    # read anyway -- your own sites, a portal you have an agreement with. Empty
+    # (the default) exempts nothing. Note the crawl *boundary* is a separate,
+    # stricter thing: see Extractor(allowed_domains=...).
+    robots_overrides: str = ""
     # Content-addressed LLM-response cache path (SQLite), env: AWE_LLM_CACHE. On by
     # default: when a page's normalized content is unchanged from a prior run the
     # crawler replays its screen/extract/link-score outputs (and the final merge, if

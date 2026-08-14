@@ -1,6 +1,6 @@
 import json
 import time
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel
 
+from . import fallback as fallback_module
 from . import fetch as fetch_module
 from . import logsink
 from .cache import (
@@ -22,10 +23,18 @@ from .cache import (
 )
 from .config import Settings, get_settings
 from .fetch import FetchedPage
-from .frontier import Frontier, canonical, registrable_domain
+from .frontier import (
+    Frontier,
+    canonical,
+    domain_of,
+    normalize_domains,
+    registrable_domain,
+    split_domains,
+)
 from .normalize import TextFilter, extract_links, to_markdown
 from .providers import Provider, get_provider
 from .result import ExtractionResult, PageVerdict, StoppedReason, Usage
+from .robots import RobotsPolicy
 from .summarize import fit_pages
 
 # Sentinel score for seed URLs: above the 0..1 range a link scorer can return, so
@@ -53,6 +62,7 @@ class _PageOutcome:
 
     requested_url: str
     page: FetchedPage
+    policy_skipped: bool = False  # refused before the fetch (robots.txt): never visited
     readable: bool = False  # HTML/PDF body → consumes a budget slot
     has_verdict: bool = False  # a screen result (live or cached) was produced
     screen_match: bool = False
@@ -71,6 +81,11 @@ class Extractor:
         provider: Provider | None = None,
         normalize_html: bool | None = None,
         prefer_seed_domain: bool | None = None,
+        allowed_domains: Iterable[str] | None = None,
+        allow_seed_redirect_domains: bool = True,
+        user_agent: str | None = None,
+        respect_robots: bool | None = None,
+        robots_overrides: str | None = None,
         text_filters: Sequence[TextFilter] | None = None,
         settings: Settings | None = None,
         cache: KVCache | None | _DefaultCache = _DEFAULT_CACHE,
@@ -102,6 +117,55 @@ class Extractor:
             prefer_seed_domain
             if prefer_seed_domain is not None
             else self.settings.prefer_seed_domain
+        )
+        # Hard crawl boundary: the set of registrable domains a link may be queued
+        # from. `None` (the default) is unrestricted -- every link the scorer likes
+        # is fair game, wherever it points. Passing a set makes it default-deny:
+        # anything off it is dropped at the queue point with a [blocked] log line.
+        # Each seed's own domain is added per call (see extract), so an empty
+        # iterable means "the seeds and nowhere else".
+        #
+        # This is the *only* hard navigation limit in the library. `prefer_seed_domain`
+        # is a soft hint to the LLM that excludes nothing, which is not something a
+        # deployment can point at when asked to guarantee where its crawler goes.
+        self.allowed_domains = (
+            None if allowed_domains is None else normalize_domains(allowed_domains)
+        )
+        # When a seed redirects to a different registrable domain (a rebrand, an
+        # org that moved host), add where it landed to the boundary for this call.
+        # Without it, restricting to the domain you seeded would break the crawl the
+        # moment the site moves -- the seed itself resolves fine (httpx follows
+        # redirects inside one fetch; the boundary governs queuing, not requests),
+        # but every link on the page it lands on is off-boundary.
+        self.allow_seed_redirect_domains = allow_seed_redirect_domains
+        # Identify the crawler to the sites it fetches. Module-level configuration
+        # (the fetch/fallback clients are process-wide singletons), following the
+        # logsink.configure precedent -- so with several Extractors in one process
+        # the last one constructed sets the User-Agent for all of them.
+        self.user_agent = (
+            user_agent if user_agent is not None else self.settings.user_agent
+        ) or fetch_module.USER_AGENT
+        fetch_module.configure(user_agent=self.user_agent)
+        fallback_module.configure(user_agent=self.user_agent)
+        # robots.txt, off by default (see Settings.respect_robots). Evaluated against
+        # the User-Agent above, per origin, before the fetch; failures fail open.
+        self.respect_robots = (
+            respect_robots
+            if respect_robots is not None
+            else self.settings.respect_robots
+        )
+        overrides = (
+            robots_overrides
+            if robots_overrides is not None
+            else self.settings.robots_overrides
+        )
+        self.robots: RobotsPolicy | None = (
+            RobotsPolicy(
+                user_agent=self.user_agent,
+                overrides=split_domains(overrides),
+            )
+            if self.respect_robots
+            else None
         )
         # Caller-supplied `str -> str` transforms applied to the normalized
         # markdown (e.g. to strip volatile per-response tokens so the content
@@ -184,6 +248,11 @@ class Extractor:
         exceeds ``max_context_tokens`` (or always, under ``always_summarize``),
         summarized down; then one extraction runs over the whole thing. `seeds`
         accepts a single URL string or a sequence.
+
+        When the Extractor was given ``allowed_domains``, the boundary for this
+        call is that set plus every seed's own registrable domain (plus, under
+        ``allow_seed_redirect_domains``, wherever a seed redirects to): a scored
+        link outside it is dropped instead of queued, and logged as ``[blocked]``.
         """
         seed_list = [seeds] if isinstance(seeds, str) else list(seeds)
         if not seed_list:
@@ -208,6 +277,21 @@ class Extractor:
         )
         seed_ref = " ".join(seed_list)
 
+        # Crawl boundary for this call: the configured allowed domains plus every
+        # seed's own domain -- a caller that hands over a seed URL is asking for
+        # that domain by definition, so callers never have to repeat it. `None`
+        # keeps the pre-0.3 unrestricted behavior. Mutable because a seed that
+        # redirects off-domain may widen it (see the fold loop below); it is only
+        # ever read/written on the main thread.
+        allowed: set[str] | None = None
+        if self.allowed_domains is not None:
+            allowed = set(self.allowed_domains) | set(normalize_domains(seed_list))
+            self._log(
+                f"[boundary] allowed domains: {', '.join(sorted(allowed)) or '(none)'}"
+            )
+        # Canonical seed URLs, so the redirect rule above applies to seeds only.
+        seed_keys = {canonical(u) for u in seed_list}
+
         frontier = Frontier()
         for seed in seed_list:
             frontier.push(seed, score=SEED_SCORE, source="seed")
@@ -220,7 +304,10 @@ class Extractor:
 
         self._log(
             f"[traverse] {len(seed_list)} seed(s), budget={budget} "
-            f"({per_seed}/seed), workers={workers}"
+            f"({per_seed}/seed), workers={workers}, "
+            f"boundary={'off' if allowed is None else 'on'}, "
+            f"robots={'on' if self.robots is not None else 'off'}, "
+            f"ua={self.user_agent!r}"
         )
 
         path: list[str] = []
@@ -258,6 +345,13 @@ class Extractor:
 
                 for outcome in outcomes:
                     page = outcome.page
+                    if outcome.policy_skipped:
+                        # Refused before any request went out, so it is not a page
+                        # the crawl visited: keep it out of `path`, which records
+                        # what was actually retrieved. It stays marked visited (done
+                        # above) so it is not re-popped, and the worker's log line is
+                        # the durable record of why it was left alone.
+                        continue
                     rurl = canonical(page.url)
                     if rurl in resolved_seen:
                         self._log(
@@ -268,6 +362,18 @@ class Extractor:
                     resolved_seen.add(rurl)
                     frontier.mark_visited(page.url)
                     path.append(page.url)
+                    if (
+                        allowed is not None
+                        and self.allow_seed_redirect_domains
+                        and canonical(outcome.requested_url) in seed_keys
+                    ):
+                        landed = domain_of(page.url)
+                        if landed and landed not in allowed:
+                            allowed.add(landed)
+                            self._log(
+                                f"    [boundary] seed {outcome.requested_url} resolved "
+                                f"to {landed} — added to the allowed domains"
+                            )
                     if page.via:
                         fallbacks_used[page.url] = page.via
                     if not outcome.readable:
@@ -286,6 +392,19 @@ class Extractor:
                             (page.url, outcome.page_md, outcome.cache_key or "")
                         )
                     for link_url, score in outcome.link_scores:
+                        # The boundary is enforced HERE, at the queue point, and
+                        # nowhere else. Filtering in the worker instead would bake
+                        # the current allowed set into the page cache's stored link
+                        # scores, so a later run with a different boundary would
+                        # replay the old one; filtering the HTTP request instead
+                        # would break redirects, which httpx follows inside a single
+                        # fetch. A link that is never queued is never fetched, which
+                        # is the whole guarantee.
+                        if allowed is not None and domain_of(link_url) not in allowed:
+                            self._log(
+                                f"    [blocked] {link_url} — outside the crawl boundary"
+                            )
+                            continue
                         frontier.push(link_url, score=score, source=page.url)
 
         return self._consolidate_and_extract(
@@ -337,6 +456,23 @@ class Extractor:
         url, score, _source = item
         score_str = "seed" if score == SEED_SCORE else f"{score:.2f}"
         self._log(f"  [page] (score={score_str}) {url}")
+        # robots.txt (opt-in) is checked before the request, so a disallowed URL
+        # costs no fetch, no budget slot and no LLM call. Safe from a worker thread:
+        # the policy owns its cache and lock, and touches no traversal state.
+        if self.robots is not None and not self.robots.allows(url):
+            self._log(f"    [robots] disallowed for {self.user_agent!r} — skipping")
+            return _PageOutcome(
+                requested_url=url,
+                page=FetchedPage(
+                    url=url,
+                    status=0,
+                    content_type="",
+                    raw_bytes=b"",
+                    text="",
+                    kind="skipped",
+                ),
+                policy_skipped=True,
+            )
         fetch_t0 = time.monotonic()
         try:
             page = fetch_module.fetch(url)

@@ -1,4 +1,5 @@
 import heapq
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from itertools import count
 from urllib.parse import parse_qsl, urldefrag, urlencode, urlsplit, urlunsplit
@@ -36,6 +37,48 @@ def registrable_domain(host: str) -> str:
     if not ext.domain or not ext.suffix:
         return ""
     return f"{ext.domain}.{ext.suffix}".lower()
+
+
+def domain_of(value: str) -> str:
+    """Allow/deny key for `value`, which may be a full URL, a bare host, or a
+    host:port.
+
+    Normally the registrable domain (so `www.example.com`, `grants.example.com`
+    and `https://example.com/x` all key to `example.com`). Falls back to the bare
+    lowercased host when there is no registrable domain -- `localhost`, an IP
+    literal, an intranet name -- so those can still be named explicitly instead
+    of being silently un-nameable. Returns "" when no host can be read at all.
+    """
+    text = value.strip()
+    if not text:
+        return ""
+    # urlsplit only finds a host in the netloc, which needs the `//` marker; a
+    # bare "example.com:8080" would otherwise parse as scheme "example.com".
+    if "//" not in text:
+        text = f"//{text}"
+    try:
+        host = urlsplit(text).hostname or ""
+    except ValueError:
+        # Malformed authority (e.g. an unclosed IPv6 bracket). No host, so no key.
+        return ""
+    key = registrable_domain(host)
+    if key:
+        return key
+    # urlsplit is lenient about what it will call a netloc, so guard the bare-host
+    # fallback: whitespace means this was never a host, and returning it would
+    # invent a key that matches nothing (a silently ineffective allowlist entry).
+    return "" if not host or any(c.isspace() for c in host) else host.lower()
+
+
+def normalize_domains(entries: Iterable[str]) -> frozenset[str]:
+    """`domain_of` over an iterable, dropping entries that yield no key. Accepts
+    hosts or URLs so a caller can hand over whichever it has."""
+    return frozenset(key for key in (domain_of(entry) for entry in entries) if key)
+
+
+def split_domains(value: str) -> frozenset[str]:
+    """`normalize_domains` over a comma-separated string (an `AWE_*` setting)."""
+    return normalize_domains(value.split(","))
 
 
 def same_registrable_domain(url: str, seed_domain: str) -> bool | None:

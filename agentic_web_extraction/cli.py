@@ -149,6 +149,65 @@ def extract(
             ),
         ),
     ] = None,
+    allowed_domain: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--allowed-domain",
+            help=(
+                "Hard crawl boundary: a registrable domain (or a URL/host to take "
+                "one from) a link may be queued from. Repeat the flag to allow "
+                "several. Every seed's own domain is always included, so passing "
+                "just the seed's domain means 'this site only'. Omit the flag "
+                "entirely for the default: no boundary, any link the scorer likes "
+                "may be fetched."
+            ),
+        ),
+    ] = None,
+    allow_seed_redirect_domains: Annotated[
+        bool,
+        typer.Option(
+            "--allow-seed-redirect-domains/--no-allow-seed-redirect-domains",
+            help=(
+                "When a seed redirects to a different registrable domain (a rebrand, "
+                "a moved host), add where it landed to the boundary so the crawl can "
+                "continue there. On by default; only meaningful with "
+                "--allowed-domain."
+            ),
+        ),
+    ] = True,
+    user_agent: Annotated[
+        str | None,
+        typer.Option(
+            "--user-agent",
+            help=(
+                "User-Agent sent on every fetch, and the agent robots.txt is "
+                "evaluated against. Defaults to AWE_USER_AGENT. Use a string that "
+                "names the operator and a real contact URL."
+            ),
+        ),
+    ] = None,
+    respect_robots: Annotated[
+        bool | None,
+        typer.Option(
+            "--respect-robots/--no-respect-robots",
+            help=(
+                "Honor each origin's robots.txt for the configured user agent, "
+                "checked before the fetch. Defaults to AWE_RESPECT_ROBOTS (off). "
+                "A robots.txt that cannot be obtained fails open."
+            ),
+        ),
+    ] = None,
+    robots_override: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--robots-override",
+            help=(
+                "Domain exempt from the robots.txt check (repeatable). For hosts "
+                "whose robots.txt disallows automated clients but whose content you "
+                "are authorized to read. Defaults to AWE_ROBOTS_OVERRIDES."
+            ),
+        ),
+    ] = None,
     log_file: Annotated[
         str | None,
         typer.Option(
@@ -189,10 +248,18 @@ def extract(
     # Don't pass `cache` unless disabling: omitting it lets the Extractor build the
     # on-by-default store; `cache=None` is the explicit off switch.
     cache_kwargs = {"cache": None} if no_cache else {}
+    # No --allowed-domain means no boundary. Click hands back an empty tuple rather
+    # than None for an unused repeatable option, and an empty *set* would mean the
+    # opposite thing (seeds and nowhere else), so normalize the empty case to None.
     extractor = Extractor(
         schema=model,
         criteria=criterion,
         prefer_seed_domain=prefer_seed_domain,
+        allowed_domains=list(allowed_domain) if allowed_domain else None,
+        allow_seed_redirect_domains=allow_seed_redirect_domains,
+        user_agent=user_agent,
+        respect_robots=respect_robots,
+        robots_overrides=",".join(robots_override) if robots_override else None,
         settings=settings,
         log_file=log_file,
         **cache_kwargs,

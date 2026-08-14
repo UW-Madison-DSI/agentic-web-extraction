@@ -15,6 +15,11 @@ from . import fallback, logsink
 from .config import get_settings
 
 USER_AGENT = "agentic-web-extraction/0.1 (+https://github.com/)"
+"""Fallback User-Agent: what the crawl sends when nothing configures one.
+
+Generic on purpose -- it names the library, not the operator, so a site owner
+who wants the traffic to stop has nobody to write to. Set ``AWE_USER_AGENT`` (or
+pass ``Extractor(user_agent=...)``) to an attributable string instead."""
 
 
 @dataclass(frozen=True)
@@ -32,6 +37,31 @@ class FetchedPage:
 
 _client_lock = threading.Lock()
 _client: httpx.Client | None = None
+_user_agent = USER_AGENT
+
+
+def configure(*, user_agent: str = "") -> None:
+    """Set the User-Agent every crawl fetch sends (empty restores the default).
+
+    Module-level, like :func:`logsink.configure`, and called from
+    ``Extractor.__init__``: the client is a process-wide singleton, so the last
+    configuration wins for every crawl in the process. That is fine for the
+    intended use (one identifying string per deployment) but means two Extractors
+    in one process cannot send different User-Agents.
+    """
+    global _user_agent
+    with _client_lock:
+        _user_agent = user_agent or USER_AGENT
+        # The client may already exist (a previous crawl in this process built it),
+        # so update it in place rather than leaking its connection pool.
+        if _client is not None:
+            _client.headers["User-Agent"] = _user_agent
+
+
+def user_agent() -> str:
+    """The User-Agent currently in effect for crawl fetches."""
+    with _client_lock:
+        return _user_agent
 
 
 def get_client() -> httpx.Client:
@@ -51,7 +81,7 @@ def get_client() -> httpx.Client:
             # expensive work is memoized by the content-addressed LLM cache instead
             # (see cache.py / extractor.py).
             _client = httpx.Client(
-                headers={"User-Agent": USER_AGENT},
+                headers={"User-Agent": _user_agent},
                 follow_redirects=True,
                 timeout=httpx.Timeout(30.0, connect=10.0),
             )
