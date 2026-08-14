@@ -715,29 +715,44 @@ Python ≥3.13. Build backend: `uv_build`. The package lives at the repo root (`
 
 ### Releasing
 
-Per-release notes live in [CHANGELOG.md](CHANGELOG.md).
+Write what changed under `## Unreleased` in [CHANGELOG.md](CHANGELOG.md) as you
+work, then:
 
 ```bash
 uv run scripts/release.py [major|minor|patch]   # default: patch
 ```
 
 Takes the version in `pyproject.toml` as the base, bumps the chosen component,
-then commits `chore: release vX.Y.Z` and pushes the branch and a matching
-`vX.Y.Z` tag **atomically** — the pyproject version and the git tag can never
-drift apart. `uv.lock` is gitignored here, so it stays out of the release; if
-it's ever tracked, the script refreshes it in the same commit (uv records the
-project version there too). Consumers pin a release with:
+renames `## Unreleased` to `## vX.Y.Z — <date>`, then commits
+`chore: release vX.Y.Z` and pushes the branch and a matching `vX.Y.Z` tag
+**atomically** — the pyproject version and the git tag can never drift apart.
+Because the changelog entry is in that same commit, the tag carries its own notes:
+they're readable from any checkout of it, including the one a consumer installs.
+After the push, the section is also published as the tag's **GitHub Release**, so
+the Releases page and the file never disagree — one text, two places.
+`uv.lock` is gitignored here, so it stays out of the release; if it's ever tracked,
+the script refreshes it in the same commit (uv records the project version there
+too). Consumers pin a release with:
 
 ```bash
 uv add "agentic-web-extraction @ git+https://github.com/UW-Madison-DSI/agentic-web-extraction@v0.1.1"
 ```
 
 The script refuses to do anything unless the release is safe: it must run from
-`main`, the working tree must be clean, and the branch must be exactly level
-with its remote (neither ahead nor behind). If any step after the bump fails,
-the version, the commit and the tag are all rolled back, so a retry starts from
-a clean slate and releases the number that failed rather than skipping it. It's
-a PEP 723 script — `typer`/`rich` come from its own header, not the project deps.
+`main`, the working tree must be clean, the branch must be exactly level with its
+remote (neither ahead nor behind), and `## Unreleased` must exist and be non-empty
+— an undocumented release is treated as a mistake, and that check runs before
+anything is written. If any step after the bump fails, the version, the changelog,
+the commit and the tag are all rolled back, so a retry starts from a clean slate
+and releases the number that failed rather than skipping it.
+
+Publishing the GitHub Release is the one step *outside* that rollback, because by
+then the tag is public and cannot be un-released. If it fails, the script says so
+and exits non-zero with the one-line `gh` command to publish the notes by hand —
+re-running the script would cut another version, not retry the step. A machine
+without `gh` (or without it authenticated) skips the step with a note rather than
+failing: the tag is the release. It's a PEP 723 script — `typer`/`rich` come from
+its own header, not the project deps.
 
 ## Roadmap
 

@@ -13,12 +13,21 @@ Uses the version in pyproject.toml as the base, bumps the chosen component
 (major/minor/patch), writes it back, then commits and pushes a matching
 `vX.Y.Z` git tag. The pyproject version and the git tag are always kept in
 sync — the tag is the release, so nothing else may set the version.
+
+Release notes come from CHANGELOG.md: write them under `## Unreleased` as you
+work, and this script renames that heading to `## vX.Y.Z — <date>` inside the
+same commit as the version bump (so the tag carries its own notes), then attaches
+the section to the pushed tag as a GitHub Release. An empty or missing
+`## Unreleased` section aborts before anything is touched — a release with no
+notes is a release nobody can read later.
 """
 
 import os
 import re
+import shutil
 import subprocess
 import sys
+from datetime import date
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated
@@ -38,6 +47,16 @@ PYPROJECT = Path("pyproject.toml")
 # This repo currently gitignores uv.lock, hence `lockfile_is_tracked` — the
 # release must not depend on which choice the repo made.
 LOCKFILE = Path("uv.lock")
+# Release notes. Optional in the same sense as the lockfile -- a repo without a
+# tracked CHANGELOG.md still releases -- but when it exists it must have something
+# to say, or the release is silently undocumented.
+CHANGELOG = Path("CHANGELOG.md")
+UNRELEASED_HEADING = "## Unreleased"
+# The `## Unreleased` heading plus its body, up to the next `## ` heading or EOF.
+UNRELEASED_RE = re.compile(
+    r"^##[ \t]+Unreleased[ \t]*$(?P<body>.*?)(?=^##[ \t]|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
 # Used only when pyproject.toml has no version at all (no previous release).
 INITIAL_VERSION = (0, 1, 0)
 VERSION_RE = re.compile(r'^(version\s*=\s*")(\d+)\.(\d+)\.(\d+)(")', re.MULTILINE)
@@ -74,20 +93,136 @@ def best_effort(cmd: list[str], description: str) -> None:
             console.print(f"[yellow]{result.stderr.strip()}[/yellow]")
 
 
-def lockfile_is_tracked() -> bool:
-    """True when the lockfile is under version control (not gitignored/absent).
+def is_tracked(path: Path) -> bool:
+    """True when `path` is under version control (not gitignored/absent).
 
-    An untracked lockfile can't be part of the release commit, and `git add`
-    on an ignored path is a hard error — so its refresh is skipped entirely
-    rather than gambling on the repo's choice.
+    An untracked file can't be part of the release commit, and `git add` on an
+    ignored path is a hard error — so anything untracked is skipped entirely
+    rather than gambling on the repo's choice. (`uv.lock` is gitignored here;
+    other repos using this script track it.)
     """
     result = subprocess.run(
-        ["git", "ls-files", "--error-unmatch", str(LOCKFILE)],
+        ["git", "ls-files", "--error-unmatch", str(path)],
         capture_output=True,
         text=True,
         check=False,
     )
     return result.returncode == 0
+
+
+def read_unreleased(text: str) -> str:
+    """Return the body of CHANGELOG.md's `## Unreleased` section.
+
+    Raises when the section is missing or empty. Deliberately a hard failure, and
+    checked before anything is written: the whole point of stamping notes into the
+    release commit is that vX.Y.Z carries its own, and a release cut with an empty
+    section would leave the tag undocumented with nothing to point at afterwards.
+    """
+    match = UNRELEASED_RE.search(text)
+    if match is None:
+        raise ReleaseError(
+            f"{CHANGELOG} has no '{UNRELEASED_HEADING}' section — add one and write "
+            f"this release's notes under it."
+        )
+    body = match.group("body").strip()
+    if not body:
+        raise ReleaseError(
+            f"{CHANGELOG}'s '{UNRELEASED_HEADING}' section is empty — write this "
+            f"release's notes under it before releasing."
+        )
+    return body
+
+
+def stamp_unreleased(text: str, version_str: str, today: str) -> str:
+    """Rename `## Unreleased` to `## vX.Y.Z — <date>`, leaving a fresh empty one.
+
+    The empty heading stays at the top so the next author has somewhere obvious to
+    write, and so `read_unreleased` fails on emptiness rather than on absence.
+    """
+    match = UNRELEASED_RE.search(text)
+    if match is None:  # pragma: no cover - read_unreleased runs first
+        raise ReleaseError(f"{CHANGELOG} has no '{UNRELEASED_HEADING}' section")
+    stamped = (
+        f"{UNRELEASED_HEADING}\n\n"
+        f"## v{version_str} — {today}\n\n"
+        f"{match.group('body').strip()}\n\n"
+    )
+    return text[: match.start()] + stamped + text[match.end() :]
+
+
+def gh_ready() -> bool:
+    """Whether `gh` is installed and authenticated.
+
+    A machine without `gh` is not a broken release — the tag is the release — so
+    this reports a skip rather than a failure.
+    """
+    if shutil.which("gh") is None:
+        console.print(
+            "[yellow]ℹ️ `gh` is not installed — skipping the GitHub Release.[/yellow]"
+        )
+        return False
+    result = subprocess.run(
+        ["gh", "auth", "status"], capture_output=True, text=True, check=False
+    )
+    if result.returncode != 0:
+        console.print(
+            "[yellow]ℹ️ `gh` is not authenticated — skipping the GitHub Release.[/yellow]"
+        )
+        return False
+    return True
+
+
+def publish_github_release(tag_name: str, notes: str) -> bool:
+    """Attach `notes` to the pushed tag as a GitHub Release.
+
+    Runs only AFTER the atomic push, and rolls nothing back on failure: the tag is
+    public by then, so it cannot be un-released, and re-running the script would cut
+    a whole new version rather than retry this step. So a failure here reports the
+    one-line manual fix instead.
+    """
+    if not gh_ready():
+        return True
+    console.print(f"📝 [blue]Publishing release notes for {tag_name}...[/blue]")
+    result = subprocess.run(
+        [
+            "gh",
+            "release",
+            "create",
+            tag_name,
+            "--title",
+            tag_name,
+            # Refuse to invent a tag: this runs after the atomic push, so the tag
+            # must already be on the remote. Without it a mistake here would create
+            # a release pointing at a tag nobody can check out.
+            "--verify-tag",
+            "--notes-file",
+            "-",
+        ],
+        input=notes,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        console.print(
+            f"[bold yellow]⚠️ {tag_name} is pushed and IS released, but publishing "
+            f"its notes failed:[/bold yellow]"
+        )
+        if result.stderr:
+            console.print(f"[yellow]{result.stderr.strip()}[/yellow]")
+        console.print(
+            "[bold yellow]Do NOT re-run this script — it would cut another "
+            "version.[/bold yellow]"
+        )
+        console.print(
+            f"[yellow]Publish the notes by hand instead: copy the "
+            f"'## {tag_name}' section out of {CHANGELOG} and run\n"
+            f"  gh release create {tag_name} --title {tag_name} "
+            f"--notes-file -[/yellow]"
+        )
+        return False
+    console.print(f"[green]✅ Published release notes for {tag_name}.[/green]")
+    return True
 
 
 def get_repo_root() -> Path:
@@ -225,17 +360,38 @@ def main(
             f"🚀 [blue]Bumping {increment.value}: "
             f"{'.'.join(map(str, current))} → {version_str}[/blue]"
         )
+        # Read and validate the release notes BEFORE touching anything: a missing or
+        # empty `## Unreleased` section must abort with the tree exactly as it was.
+        original_changelog: str | None = None
+        release_notes = ""
+        if CHANGELOG.exists() and is_tracked(CHANGELOG):
+            original_changelog = CHANGELOG.read_text()
+            release_notes = read_unreleased(original_changelog)
+        else:
+            console.print(
+                f"[yellow]ℹ️ No tracked {CHANGELOG} — releasing without notes.[/yellow]"
+            )
+
         # Everything from here on is undone if any step fails: a bumped version
         # left on disk would silently become the base of the next run, so the
         # skipped number could never be released.
         original_pyproject = PYPROJECT.read_text()
-        tracked_lock = lockfile_is_tracked()
+        tracked_lock = is_tracked(LOCKFILE)
         committed = False
         tagged = False
         write_version(new_version)
+        if original_changelog is not None:
+            CHANGELOG.write_text(
+                stamp_unreleased(
+                    original_changelog, version_str, date.today().isoformat()
+                )
+            )
 
         try:
             paths = [str(PYPROJECT)]
+            if original_changelog is not None:
+                # Same commit as the bump, so the tag carries its own notes.
+                paths.append(str(CHANGELOG))
             if tracked_lock:
                 # Keep the lockfile's recorded project version in sync with
                 # pyproject, or a `uv sync --locked` fails on the release.
@@ -268,6 +424,8 @@ def main(
                     ["git", "reset", "--mixed", "HEAD~1"], "Reverting release commit"
                 )
             PYPROJECT.write_text(original_pyproject)
+            if original_changelog is not None:
+                CHANGELOG.write_text(original_changelog)
             if tracked_lock:
                 best_effort(["git", "restore", str(LOCKFILE)], "Restoring uv.lock")
             raise
@@ -280,6 +438,12 @@ def main(
             f"uv add 'agentic-web-extraction @ "
             f"git+https://github.com/UW-Madison-DSI/agentic-web-extraction@{tag_name}'[/green]"
         )
+
+        # Last, and outside the rollback: the release already exists.
+        if original_changelog is not None and not publish_github_release(
+            tag_name, release_notes
+        ):
+            sys.exit(1)
 
     except ReleaseError:
         sys.exit(1)

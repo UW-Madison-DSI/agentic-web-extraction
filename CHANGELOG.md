@@ -1,9 +1,16 @@
 # Changelog
 
+Write each change under `## Unreleased` as you make it.
+[scripts/release.py](scripts/release.py) renames that heading to `## vX.Y.Z — <date>`
+in the same commit as the version bump, then publishes the section as the GitHub
+Release for the tag. An empty `## Unreleased` aborts the release.
+
+## Unreleased
+
 ## v0.2.1 — 2026-08-14
 
 Crawl citizenship: the crawler can now be bounded, identified, and audited. Every
-new knob defaults to v0.2.0 behaviour, so upgrading the pin changes no crawl until
+new knob defaults to v0.2.0 behavior, so upgrading the pin changes no crawl until
 a caller opts in.
 
 - **Hard crawl boundary** — `Extractor(allowed_domains=[...])`, a default-deny

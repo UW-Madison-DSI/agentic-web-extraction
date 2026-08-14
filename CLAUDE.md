@@ -234,21 +234,37 @@ domain compare + `domain_of` allow keys), [fetch.py](agentic_web_extraction/fetc
   [scripts/release.py](scripts/release.py) is the only thing that writes
   `version` in `pyproject.toml` — never hand-edit it, because the value has to
   match the `vX.Y.Z` tag. The script is precondition-heavy on purpose: `main`
-  only, clean tree, exactly level with the remote — the point is that a release
+  only, clean tree, exactly level with the remote, **and a non-empty
+  `## Unreleased` section in [CHANGELOG.md](CHANGELOG.md)** — the point is that a release
   can't be cut from a state you can't reconstruct from the tag. Branch and tag go
   up with `git push --atomic` so a half-push can't leave a tag pointing at an
   unpushed commit, and **any** failure after the bump rolls back the version, the
-  commit and the tag together — a bumped `pyproject.toml` left on disk would
-  silently become the base of the next run, permanently skipping that number.
+  changelog, the commit and the tag together — a bumped `pyproject.toml` left on
+  disk would silently become the base of the next run, permanently skipping that
+  number.
+  Release notes are part of the release commit, not an afterthought: `## Unreleased`
+  is renamed to `## vX.Y.Z — <date>` and committed *with* the bump, so the tag
+  carries its own notes and a consumer who installs `@vX.Y.Z` has them on disk. That
+  is why the changelog is a file first and a GitHub Release second — publishing to
+  the Releases page (`gh release create`, notes piped on stdin) happens *after* the
+  atomic push and is the one step **outside** the rollback: the tag is public by
+  then, so it can't be un-released, and re-running the script would cut a new
+  version rather than retry the step. So that failure prints the manual `gh` command
+  and exits non-zero without touching git. A missing/unauthenticated `gh` is a
+  *skip*, not a failure — the tag is the release. Don't add a second source of
+  release-note truth (hand-written Release bodies, generated notes); one text, two
+  places.
   Lockfile handling is conditional on `git ls-files`, not assumed: `uv.lock` is
   gitignored here, and `git add` on an ignored path is a hard error, so the
   refresh is skipped unless the lockfile is actually tracked (where it must be
   refreshed in the same commit, since uv records the project version in it too). It's PEP 723 like
   [scripts/adopters.py](scripts/adopters.py), but *not* stdlib-only — `typer`/`rich`
   come from its own header, so it stays out of the project's dependency surface.
-  No tag-triggered workflow exists yet; the tag is currently just the pin
-  consumers install from (`git+https://...@vX.Y.Z`). If one is added, it hangs off
-  `push: tags: ["v*"]` and needs no change here.
+  No tag-triggered workflow exists yet; the tag is the pin consumers install from
+  (`git+https://...@vX.Y.Z`), and the GitHub Release is published by the script
+  itself, not by CI. If a workflow is ever added, it hangs off
+  `push: tags: ["v*"]` — and it must not also create the Release, or the two will
+  race on the same tag.
 - **The README `<!-- adopters:start -->` block is generated.** Never hand-edit it;
   [scripts/adopters.py](scripts/adopters.py) (weekly, via
   [.github/workflows/adopters.yml](.github/workflows/adopters.yml)) overwrites it. That
