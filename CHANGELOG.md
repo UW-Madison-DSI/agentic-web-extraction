@@ -10,8 +10,8 @@ Release for the tag. An empty `## Unreleased` aborts the release.
 ## v0.2.1 — 2026-08-14
 
 Crawl citizenship: the crawler can now be bounded, identified, and audited. Every
-new knob defaults to v0.2.0 behavior, so upgrading the pin changes no crawl until
-a caller opts in.
+new knob defaults to v0.2.0 behavior, so upgrading the pin changes no crawl until a
+caller opts in — with one exception, the recovery User-Agent, noted below.
 
 - **Hard crawl boundary** — `Extractor(allowed_domains=[...])`, a default-deny
   allowlist of registrable domains (PSL/eTLD+1). Enforced where links are *queued*,
@@ -24,9 +24,19 @@ a caller opts in.
   adds the domain a *seed* redirects to, so a rebrand doesn't dead-end a bounded
   crawl. Off by default: the seed's DNS owner would otherwise choose the extra
   domain. Requires the landing page to return readable content.
+  - **This does not control whether redirects are followed.** `httpx` follows them
+    inside a single fetch, as before; the flag decides only whether the landed
+    domain joins the allowlist. With no `allowed_domains` set there is no
+    allowlist, so the flag has no effect at all.
 - **Attributable User-Agent** — `AWE_USER_AGENT` / `Extractor(user_agent=...)`,
   sent per request on origin fetches, both recovery routes, and the `robots.txt`
   fetch, so concurrent Extractors can't rename each other's traffic.
+  - **Behavior change:** recovery requests (`jina`, `wayback`) now send this
+    User-Agent rather than the separate `agentic-web-extraction/0.1 (fallback
+    reader)` string, so all outbound traffic names one operator. Which route served
+    a page is still recorded in `FetchedPage.via` / `result.fallbacks_used`. This
+    applies whether or not you set `AWE_USER_AGENT`, and is the only default
+    behavior that differs from v0.2.0.
 - **robots.txt support** — `AWE_RESPECT_ROBOTS` (default off), one fetch per origin,
   evaluated against that User-Agent before the request. Re-checked on the resolved
   URL after a redirect (body discarded unread). Failure to obtain `robots.txt` fails
