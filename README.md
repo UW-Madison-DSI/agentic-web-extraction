@@ -12,8 +12,8 @@ green = pinned to a concrete release, orange = floating (a git ref or no version
 constraint at all).
 
 <!-- adopters:start -->
+[![UW-Madison-DSI/rabbit-platform](https://img.shields.io/badge/rabbit--platform-v0.2.1-brightgreen)](https://github.com/UW-Madison-DSI/rabbit-platform)
 [![UW-Madison-DSI/foundation-opportunity-extraction](https://img.shields.io/badge/foundation--opportunity--extraction-batch--extraction-orange)](https://github.com/UW-Madison-DSI/foundation-opportunity-extraction)
-[![UW-Madison-DSI/rabbit-platform](https://img.shields.io/badge/rabbit--platform-8e8f674-orange)](https://github.com/UW-Madison-DSI/rabbit-platform)
 <!-- adopters:end -->
 
 Don't hand-edit the block between those markers — the next scan overwrites it.
