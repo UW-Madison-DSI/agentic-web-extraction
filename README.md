@@ -149,7 +149,7 @@ A typed object conforming to your schema (or `None` if nothing screened in), plu
 - `content_tokens` — estimated token size of the raw concatenation of all screened-in pages
 - `extraction_input_tokens` — token size of what actually fed the extraction (smaller than `content_tokens` when `summarized`)
 - `summarized` — `True` when the concatenation was summarized down first (because it exceeded `max_context_tokens`, or because `always_summarize` is on)
-- `fallbacks_used` — URL → route for any page the origin refused that was recovered elsewhere (`"jina"` / `"wayback:<timestamp>"`); empty on a clean crawl. Non-empty means some content did not come from the site itself — see [Blocked-page recovery](#blocked-page-recovery-jina--wayback)
+- `fallbacks_used` — URL → route for any page the default transport couldn't obtain that was recovered another way (`"impersonate:<target>"` / `"jina"` / `"wayback:<timestamp>"`); empty on a clean crawl. Non-empty means some content came in by a route other than a plain fetch — see [Blocked-page recovery](#blocked-page-recovery-impersonate--jina--wayback)
 - provider and token usage across all calls, split by call purpose (each with the model it ran on)
 
 Whether the agent succeeded or gave up, the result is structured the same way — easy to audit.
@@ -193,7 +193,7 @@ Each stage is independently swappable.
 
 | Stage          | Notes                                                                                       |
 |----------------|---------------------------------------------------------------------------------------------|
-| Fetch          | Handles HTML; optionally follows linked PDFs that are part of the page. A non-2xx response is never content — recover it via a fallback route, else drop the page. Sends the configured User-Agent, and (opt-in) skips URLs robots.txt disallows before requesting them |
+| Fetch          | Handles HTML; optionally follows linked PDFs that are part of the page. A non-2xx response is never content, and neither is no response at all — recover either via a fallback route, else drop the page. Sends the configured User-Agent, and (opt-in) skips URLs robots.txt disallows before requesting them |
 | Normalize      | HTML → Markdown for token reduction; pluggable converter; caller-supplied `text_filters` run here |
 | Pre-screen     | Cheap LLM call returning a binary yes/no against user-supplied criterion                    |
 | Score links    | LLM scores every outgoing link's promise against the criterion; output feeds the frontier, where the crawl boundary (if set) drops off-domain links before they are queued |
@@ -340,8 +340,9 @@ result = extractor.extract(
 # result.content_tokens: int  -- raw concatenation size (tokens)
 # result.extraction_input_tokens: int  -- what fed extraction (< content_tokens if summarized)
 # result.summarized:     bool -- whether the concatenation was summarized down to fit
-# result.fallbacks_used: dict[str, str]  -- url -> "jina" | "wayback:<timestamp>" for
-#   pages the origin refused that were recovered elsewhere; empty on a clean crawl.
+# result.fallbacks_used: dict[str, str]  -- url -> "impersonate:<target>" | "jina" |
+#   "wayback:<timestamp>" for pages the default transport couldn't obtain that were
+#   recovered another way; empty on a clean crawl.
 # result.protocol:       str  -- provider adapter / wire protocol that ran the
 #   crawl (e.g. "openai"); names the SDK/billing surface, not the model vendor.
 # result.usage_by_function: dict[str, Usage]  -- token usage by call purpose
@@ -464,6 +465,19 @@ would silently empty an authorized crawl. `robots_overrides` exempts named domai
 for hosts that blanket-disallow automated clients but whose content you're
 authorized to read.
 
+A `200` is not automatically a policy, either. An origin fronted by a bot manager
+routinely answers `/robots.txt` with `200` and an HTML sensor page; parsed, that is
+*zero rules* — read as blanket consent, at precisely the sites likeliest to have
+meant the opposite. A body that isn't plausibly a policy (non-text content type, or
+opening with markup) is treated as **unavailable** instead: still failing open, but
+with a log line saying the rules were never obtained, which is the honest thing to
+hand whoever is deciding whether to crawl a site that won't state them. And when
+`AWE_IMPERSONATE` covers a host, a `robots.txt` the default client can't obtain is
+retried over that transport — otherwise a crawl reads a site's pages with a browser
+fingerprint while reading its policy over the channel that site blocks, and proceeds
+unrestricted every time. Never through `jina`/`wayback`: a policy has to come from
+the origin, not from a third party's copy of it.
+
 The boundary and robots are complementary, not redundant: the boundary decides
 *where* the crawl may go (a hard guarantee you can state to a security team), robots
 decides *what* it may read once there (the site's own wishes). Neither replaces
@@ -471,7 +485,7 @@ decides *what* it may read once there (the site's own wishes). Neither replaces
 `[page]`, `[blocked]` and `[robots]` lines with timestamps, on disk, surviving the
 container.
 
-#### Blocked-page recovery (jina → wayback)
+#### Blocked-page recovery (impersonate → jina → wayback)
 
 Fetch classifies on Content-Type, so an HTTP error page served as `text/html` —
 an edge-CDN "Access Denied" interstitial, a themed 404 — used to look exactly like
@@ -480,16 +494,56 @@ extracted from. Under `seed_is_content` that is worse than losing the page:
 screening is skipped, so the error text is *guaranteed* into the extraction and the
 URL becomes a citable source.
 
-So **a non-2xx response is never content**. Before dropping it, the fetcher tries
-the routes in `AWE_FETCH_FALLBACKS`, in order:
+So **a non-2xx response is never content** — and neither is *no* response.
+Recovery is driven by failure to obtain content, whatever shape it took: a refusal
+with a status, or a connection tarpitted or dropped by a bot manager that would
+rather go silent than answer. (Handling only the first was backwards: the silent
+refusal is the less polite one, and it was the one that skipped recovery entirely.)
+Before dropping the page, the fetcher tries the routes in `AWE_FETCH_FALLBACKS`, in
+order:
 
 | Route | What it does | Trade-off |
 |-------|--------------|-----------|
+| `impersonate` | Re-requests the origin through [curl_cffi](https://github.com/lexiforest/curl_cffi), whose libcurl produces a browser's TLS/HTTP fingerprint | Direct from the origin, live, nothing disclosed to anyone else — but off until `AWE_IMPERSONATE` names a target, needs the optional extra, and see the escalation note below |
 | `jina` | `r.jina.ai` renders the URL server-side and returns it — also reads PDFs, so a blocked document comes back as text | Live content, but a third party sees the URL; anonymous requests are rate-limited (set `JINA_API_KEY`) |
 | `wayback` | The Internet Archive's newest successful capture, served with the `id_` modifier so bytes come back unrewritten | Free and stable, but as stale as the capture — bound it with `AWE_WAYBACK_MAX_AGE_DAYS` |
 
 The first route that returns content wins; if all decline, the page becomes
-`kind="error"` and the traversal skips it at no LLM cost and no budget slot.
+`kind="error"` and the traversal skips it at no LLM cost and no budget slot. When
+`impersonate` is enabled, list it **first** — it costs one direct request to the
+origin instead of a third-party round trip.
+
+Recovery costs something even when it fails. A tarpitted domain now spends a
+recovery attempt on top of its retries, which is why `AWE_FETCH_ATTEMPTS` caps read
+timeouts at two attempts (a tarpit is deterministic; the third try just spends
+another 30s to be refused identically). If you'd rather not pay any of it, set
+`AWE_FETCH_FALLBACKS=` empty — the status guard stays, and no outbound call is made.
+
+##### Impersonation is an escalation — decide it deliberately
+
+Some CDNs refuse on TLS/HTTP *fingerprint* alone: the shape of the handshake, not
+who you claim to be. `AWE_IMPERSONATE=chrome` is the whole fix for those, and it
+**still sends your own attributable `AWE_USER_AGENT`** — a browser handshake under
+an honest name. That is the rung most deployments want, and it needs no further
+decision.
+
+Some sites go further and want fingerprint and identity to agree. Against those,
+a genuine Chrome User-Agent with your contact URL appended is refused just as an
+honest crawler string is; the only thing that gets through is a verbatim browser
+User-Agent, i.e. a full masquerade — commonly at a site that is simultaneously
+refusing to serve you its `robots.txt`. That is what `AWE_IMPERSONATE_BROWSER_UA`
+turns on, and it is a **separate switch** for exactly that reason: it drops the
+attribution this library otherwise insists on, and it is an institutional call
+about a clear refusal signal rather than a config default. If you do enable it,
+scope it with `AWE_IMPERSONATE_DOMAINS` to the specific hosts that need it instead
+of changing the posture of every crawl. Choosing *not* to is a legitimate outcome —
+the site is then simply unreachable, which is the site's answer.
+
+The route is retrieval only. A page it recovers is still adjudicated by
+`allowed_domains` and by robots.txt exactly as a direct fetch is — impersonation is
+not a way around either. Install it with the optional extra
+(`uv pip install "agentic-web-extraction[impersonate]"`); without the wheel the
+route declines with a log line rather than failing the crawl.
 
 Recovered content is always returned **under the original URL**, never the
 reader/archive address — `page.url` is what lands in `path`, what the extraction
@@ -624,7 +678,12 @@ Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your pr
 | Flex service tier    | `AWE_USE_FLEX`        | `false` (true = 50% off at Batch-API rates, slower; auto-fallback to standard) |
 | HTML→MD normalize    | `AWE_NORMALIZE`       | `true`                 |
 | Follow linked PDFs   | `AWE_FOLLOW_PDF`      | `true`                 |
-| Blocked-page recovery | `AWE_FETCH_FALLBACKS` | `jina,wayback` (ordered; empty = drop blocked pages, no outbound call) |
+| Blocked-page recovery | `AWE_FETCH_FALLBACKS` | `jina,wayback` (ordered; `impersonate` also available; empty = drop blocked pages, no outbound call) |
+| Origin fetch attempts | `AWE_FETCH_ATTEMPTS`  | `3` (read timeouts capped at 2 regardless — a tarpit is deterministic) |
+| Impersonation target | `AWE_IMPERSONATE`     | empty (off; `chrome`, `safari`, … — needs the `impersonate` extra) |
+| Impersonate with the browser's UA | `AWE_IMPERSONATE_BROWSER_UA` | `false` (true **drops attribution** — read the escalation note) |
+| Impersonation scope  | `AWE_IMPERSONATE_DOMAINS` | empty (every host; comma-separated domains to scope it) |
+| Impersonation timeout | `AWE_IMPERSONATE_TIMEOUT` | `30.0` seconds |
 | Jina API key         | `JINA_API_KEY`        | unset (anonymous, rate-limited) |
 | Jina return format   | `AWE_JINA_RETURN_FORMAT` | `html` (empty = readability markdown) |
 | Archive staleness cap | `AWE_WAYBACK_MAX_AGE_DAYS` | `0` (any age) |
@@ -674,9 +733,9 @@ agentic_web_extraction/
     summarize.py         # criteria/schema-aware map-reduce summarization (fit to context budget)
     schema_outline.py    # renders a caller schema as a compact field outline for the summarize prompt
     tokens.py            # tiktoken-backed token counting + token-aware splitting
-    fallback.py          # blocked-page recovery routes (jina, wayback)
+    fallback.py          # recovery routes for pages the transport lost (impersonate, jina, wayback)
     fetch.py             # httpx (plain, no HTTP cache) + tenacity retry + status guard + UA
-    robots.py            # opt-in robots.txt policy (per-origin cache; fails open)
+    robots.py            # opt-in robots.txt policy (per-origin cache; validates the body; fails open)
     logsink.py           # shared stderr + optional timestamped log-file sink
     frontier.py          # best-first heap + visited set + PSL registrable-domain (tldextract)
     normalize.py         # HTML→Markdown + raw-HTML link extraction + caller text_filters hook

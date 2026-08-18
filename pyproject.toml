@@ -19,6 +19,14 @@ dependencies = [
     "typer>=0.25.1",
 ]
 
+[project.optional-dependencies]
+# Browser TLS/HTTP fingerprint for the "impersonate" recovery route (see
+# fallback.py). Optional so the base install is unchanged and a deployment that
+# never enables AWE_IMPERSONATE never needs the binary wheel -- the route
+# declines with a log line when the import fails. Ships a bundled
+# libcurl-impersonate, so confirm a wheel exists for your image (glibc vs musl).
+impersonate = ["curl_cffi>=0.15"]
+
 [project.scripts]
 awe = "agentic_web_extraction:main"
 

@@ -56,9 +56,10 @@ Key files: [extractor.py](agentic_web_extraction/extractor.py) (wave loop + cons
 [schema_outline.py](agentic_web_extraction/schema_outline.py) (schema → compact prompt outline),
 [tokens.py](agentic_web_extraction/tokens.py) (tiktoken counting/splitting),
 [frontier.py](agentic_web_extraction/frontier.py) (heap + visited set + snapshot + PSL
-domain compare + `domain_of` allow keys), [fetch.py](agentic_web_extraction/fetch.py) (httpx + status guard + UA),
+domain compare + `domain_of` allow keys), [fetch.py](agentic_web_extraction/fetch.py) (httpx + status
+guard + transport-failure recovery + UA),
 [robots.py](agentic_web_extraction/robots.py) (opt-in robots.txt policy),
-[fallback.py](agentic_web_extraction/fallback.py) (jina/wayback recovery),
+[fallback.py](agentic_web_extraction/fallback.py) (impersonate/jina/wayback recovery),
 [normalize.py](agentic_web_extraction/normalize.py),
 [providers/](agentic_web_extraction/providers/),
 [result.py](agentic_web_extraction/result.py),
@@ -127,7 +128,17 @@ domain compare + `domain_of` allow keys), [fetch.py](agentic_web_extraction/fetc
   through the check, cross-origin included; the second request is already spent, but
   the body is discarded unread rather than screened and pooled. Running in the worker
   is safe because the policy owns its cache + lock and touches no traversal state — the
-  frontier rule still holds. A skip returns `_PageOutcome(policy_skipped=True)`, which
+  frontier rule still holds. A `200` is validated before it is parsed
+  (`looks_like_policy`): a bot-sensor page served at `/robots.txt` parses to *zero
+  rules*, i.e. blanket consent, at exactly the sites likeliest to have meant the
+  opposite, so a non-text content type or a body opening with markup counts as
+  *unavailable* (still fails open, but the log line says the rules were never obtained).
+  A policy the default client can't obtain is retried over the escalated transport when
+  `AWE_IMPERSONATE` covers the host — via `fallback.impersonate`, that route **only**,
+  never `recover()`: rules must come from the origin, not from a reader's rendering or a
+  years-old archive capture of somebody's policy. Otherwise a deployment reads a site's
+  pages with a browser fingerprint and its policy over the channel the site blocks, then
+  proceeds unrestricted every time. A skip returns `_PageOutcome(policy_skipped=True)`, which
   the fold loop keeps out of `path` (nothing was retrieved); the log line is the record,
   so it must name the URL — eight workers interleave their output, and a line that
   identifies only the agent is unattributable. Failure to *obtain* robots.txt — 404, 401/403, 5xx, timeout — is treated as
@@ -186,23 +197,52 @@ domain compare + `domain_of` allow keys), [fetch.py](agentic_web_extraction/fetc
   it reads a `frontier.snapshot()` (frozen set) to pre-filter links but never mutates
   shared state. Provider usage accumulation is lock-guarded for the same reason. Keep
   new per-page work inside the worker and new frontier work in the fold loop.
-- **Non-2xx is never content; recovery is retrieval-only.** [fetch.py](agentic_web_extraction/fetch.py)
+- **Nothing but a 2xx body is content; recovery is retrieval-only.** [fetch.py](agentic_web_extraction/fetch.py)
   classifies on Content-Type, so an edge-CDN "Access Denied" interstitial or a themed
   404 would otherwise be screened and extracted as if it were the page (guaranteed into
   the extraction under `seed_is_content`). The status guard drops anything outside 2xx;
   [fallback.py](agentic_web_extraction/fallback.py) then tries to turn the hole back into
-  content over the routes named by `AWE_FETCH_FALLBACKS` (`jina` — `r.jina.ai` renders
-  live and reads PDFs, requesting the full DOM by default so link extraction behaves as
-  on a direct fetch; `wayback` — newest Archive capture, `id_`-unrewritten, staleness
-  bounded by `AWE_WAYBACK_MAX_AGE_DAYS`). Keep that module opinionated about *retrieval
-  only* — content selection, normalization, and link policy stay where they live, and
-  nothing there may know about a particular site; the chain is driven by response status
-  alone. Recovered bytes are returned under the **caller's** URL, never the proxy/archive
+  content over the routes named by `AWE_FETCH_FALLBACKS` (`impersonate` — re-request the
+  origin through curl_cffi's browser TLS/HTTP fingerprint, see below; `jina` — `r.jina.ai`
+  renders live and reads PDFs, requesting the full DOM by default so link extraction
+  behaves as on a direct fetch; `wayback` — newest Archive capture, `id_`-unrewritten,
+  staleness bounded by `AWE_WAYBACK_MAX_AGE_DAYS`). The chain is driven by **failure to
+  obtain content**, not by response status: `fetch` calls `_recover` from the status
+  guard *and* from its bare-`Exception` transport handler, because an origin that
+  tarpits a non-browser client denies us the page exactly as completely as one that
+  answers 403 — handling only the second meant the *less* polite refusal was the one
+  that skipped recovery. Don't re-narrow that to a status check. Keep the module
+  opinionated about *retrieval only* — content selection, normalization, and link policy
+  stay where they live, nothing there may know about a particular site, and a recovered
+  page is still adjudicated by the boundary and by robots exactly as a direct fetch is.
+  Recovered bytes are returned under the **caller's** URL, never the proxy/archive
   address, so `path`, the `--- SOURCE:` markers, and caller citations stay canonical;
   the route lands in `FetchedPage.via` → `ExtractionResult.fallbacks_used`. `fallback.py`
   must not import `fetch.py` (fetch imports it, and classification/PDF policy belong to
-  the fetch path). Both routes disclose the crawled URL to a third party — empty
-  `AWE_FETCH_FALLBACKS` keeps the guard and disables recovery.
+  the fetch path). `jina`/`wayback` disclose the crawled URL to a third party;
+  `impersonate` talks to the origin only — empty `AWE_FETCH_FALLBACKS` keeps the guard
+  and disables recovery entirely. `AWE_FETCH_ATTEMPTS` (default 3) bounds origin retries,
+  with read timeouts capped at 2 attempts however high it is set: a tarpit is
+  deterministic, so the later attempts spend the read timeout again to be refused
+  identically while holding a worker slot the wave waits on.
+- **Impersonation is two switches, both off, and neither is a transport swap.**
+  `AWE_IMPERSONATE` (a curl_cffi target) buys a browser *fingerprint* while still
+  sending the crawl's own attributable User-Agent — enough for CDNs that refuse on the
+  shape of the handshake. `AWE_IMPERSONATE_BROWSER_UA` is separate because it drops
+  attribution: sites that want fingerprint and identity to agree reject even a real
+  Chrome UA with a contact URL appended, so reaching them means a full masquerade,
+  usually at a site simultaneously refusing to serve its robots.txt. That is an
+  institutional call, so it must stay opt-in, typed out, and scopeable
+  (`AWE_IMPERSONATE_DOMAINS`, matched through `frontier.domain_of` like everything
+  else). It is deliberately a *route in the existing chain*, not a pluggable primary
+  transport: as a route it inherits `recover()`'s ordering, the `via` provenance, the
+  `[fallback:*]` log convention and `configured_routes()`, escalates only after the
+  honest path has actually been refused, and duplicates none of fetch's retry/status/
+  classification logic. curl_cffi is an **optional** extra imported inside
+  `_new_session`, so a base install declines the route with a log line instead of
+  failing at import. Its sessions wrap a libcurl handle and are **not** thread-safe:
+  one per (thread, target) in a `threading.local`, never the module-level `_client`
+  singleton pattern the httpx clients use.
 - **Logging: never a bare `print`.** All diagnostics go through `logsink.emit` → stderr
   (stdout is reserved for result JSON). A `log_file` path (env `AWE_LOG_FILE`, empty =
   off) also appends timestamped lines. See [logsink.py](agentic_web_extraction/logsink.py).
@@ -286,6 +326,11 @@ domain compare + `domain_of` allow keys), [fetch.py](agentic_web_extraction/fetc
 - `httpx` — plain client, **no HTTP-response cache** (no hishel). Fetching is cheap and
   the frontier never re-fetches a URL within a crawl, so an HTTP cache wasn't worth the
   memory/disk; the content-addressed LLM cache handles the expensive re-work instead.
+- `curl_cffi` — **optional** (`[project.optional-dependencies] impersonate`), imported
+  inside `fallback._new_session` so a base install never needs the wheel. Ships a
+  bundled libcurl-impersonate binary, so a deployment image (glibc vs musl) needs its
+  own wheel check. Not in the dev group either: the tests drive the route through a fake
+  session and skip the one import-dependent case, so `uv run pytest` passes without it.
 - `tldextract` — PSL lookup for the domain comparison; constructed with
   `suffix_list_urls=()` to use the bundled offline snapshot (no runtime network fetch).
 - `tiktoken` — token counting + token-aware splitting ([tokens.py](agentic_web_extraction/tokens.py)).

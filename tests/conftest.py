@@ -5,9 +5,12 @@ Nothing here touches the network or an LLM. The traversal is exercised end to en
 and the provider replaced.
 """
 
+import threading
+
 import pytest
 from pydantic import BaseModel, Field
 
+from agentic_web_extraction import fallback
 from agentic_web_extraction.config import Settings
 from agentic_web_extraction.extractor import Extractor
 from agentic_web_extraction.fetch import FetchedPage
@@ -90,6 +93,57 @@ class StubWeb:
 def page(*links: str) -> str:
     body = "".join(f'<a href="{href}">link to {href}</a>' for href in links)
     return f"<html><body><h1>Test page</h1><p>Body text.</p>{body}</body></html>"
+
+
+class FakeImpersonateResponse:
+    """The slice of a curl_cffi response the impersonate route reads."""
+
+    def __init__(
+        self,
+        status_code: int = 200,
+        body: bytes = b"<html><body>recovered</body></html>",
+        content_type: str = "text/html; charset=utf-8",
+    ) -> None:
+        self.status_code = status_code
+        self.content = body
+        self.headers = {"content-type": content_type}
+
+    @property
+    def text(self) -> str:
+        return self.content.decode("utf-8")
+
+
+class FakeImpersonateSession:
+    """Stand-in for a curl_cffi Session, recording what went out on the wire."""
+
+    def __init__(self, target: str) -> None:
+        self.target = target
+        # (url, headers, timeout) per request.
+        self.calls: list[tuple[str, dict[str, str] | None, float | None]] = []
+        self.response = FakeImpersonateResponse()
+
+    def get(self, url, headers=None, timeout=None, allow_redirects=True):
+        self.calls.append((url, headers, timeout))
+        return self.response
+
+
+@pytest.fixture
+def fake_impersonate(monkeypatch):
+    """Replace the route's session factory; hand back the sessions it built.
+
+    Covers the route without curl_cffi installed, and keeps the thread-local
+    session cache from leaking sessions between tests.
+    """
+    built: list[FakeImpersonateSession] = []
+
+    def factory(target: str) -> FakeImpersonateSession:
+        session = FakeImpersonateSession(target)
+        built.append(session)
+        return session
+
+    monkeypatch.setattr(fallback, "_sessions", threading.local())
+    monkeypatch.setattr(fallback, "_new_session", factory)
+    return built
 
 
 @pytest.fixture

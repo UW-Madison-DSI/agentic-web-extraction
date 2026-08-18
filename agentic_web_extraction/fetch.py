@@ -5,9 +5,9 @@ from urllib.parse import urlsplit
 
 import httpx
 from tenacity import (
+    RetryCallState,
     retry,
     retry_if_exception_type,
-    stop_after_attempt,
     wait_exponential,
 )
 
@@ -31,8 +31,10 @@ class FetchedPage:
     text: str
     kind: Literal["html", "pdf", "skipped", "error"]
     via: str = ""
-    """Which recovery route supplied this body, empty when the origin did.
-    ``"jina"`` or ``"wayback:<capture timestamp>"`` — see [fallback.py](fallback.py)."""
+    """Which recovery route supplied this body, empty when the default transport
+    did. ``"jina"``, ``"wayback:<capture timestamp>"``, or
+    ``"impersonate:<target>"`` (that last one is still the origin, just reached
+    with a browser fingerprint) — see [fallback.py](fallback.py)."""
 
 
 _client_lock = threading.Lock()
@@ -105,8 +107,30 @@ def _classify(content_type: str) -> Literal["html", "pdf", "skipped"]:
     return "skipped"
 
 
+def _attempts_for(exc: BaseException | None) -> int:
+    """How many attempts `_send` is allowed, given what the last one raised.
+
+    ``AWE_FETCH_ATTEMPTS`` (default 3) governs the transient failures -- a 5xx, a
+    refused or reset connection -- where trying again is what fixes it. A *read*
+    timeout is capped at two attempts however high that is set: the failure it
+    stands for in practice is an edge CDN tarpitting a non-browser client, which
+    is a deterministic decision, so attempts two and three spend the full read
+    timeout each (and hold a worker slot the whole wave is waiting on) to be
+    refused identically. Recovery is what can actually turn that page back into
+    content -- get there sooner.
+    """
+    limit = max(1, get_settings().fetch_attempts)
+    return min(limit, 2) if isinstance(exc, httpx.ReadTimeout) else limit
+
+
+def _stop_after_attempts(retry_state: RetryCallState) -> bool:
+    outcome = retry_state.outcome
+    exc = outcome.exception() if outcome is not None else None
+    return retry_state.attempt_number >= _attempts_for(exc)
+
+
 @retry(
-    stop=stop_after_attempt(3),
+    stop=_stop_after_attempts,
     wait=wait_exponential(multiplier=1, min=1, max=8),
     retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError)),
     reraise=True,
@@ -183,6 +207,20 @@ def fetch(url: str, *, user_agent: str = "") -> FetchedPage:
         # carries a non-ASCII character (an emoji in a Location/Link header).
         # Bare `Exception` (not BaseException) still lets KeyboardInterrupt /
         # SystemExit propagate.
+        #
+        # First, though: recover, exactly as the status guard below does. There
+        # was no response at all here -- a tarpitting edge CDN, a dropped or
+        # reset connection, a malformed redirect header -- and an origin that
+        # refuses by going silent has denied us the page just as completely as
+        # one that answers 403 with an interstitial. Handling only the second is
+        # backwards: silence is the *less* polite refusal and it was the one
+        # route that skipped recovery entirely. Logged distinctly because the
+        # diagnostics differ -- a status is evidence, silence isn't -- and the
+        # requested URL is what's passed, since by definition nothing resolved.
+        logsink.emit(f"    [transport] {type(exc).__name__} on {url} — no response")
+        recovered = _recover(url, settings.follow_pdf, user_agent)
+        if recovered is not None:
+            return recovered
         return FetchedPage(
             url=url,
             status=0,

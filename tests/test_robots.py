@@ -19,12 +19,12 @@ Disallow: /secret/
 """
 
 
-def serving(body: str, status: int = 200):
+def serving(body: str, status: int = 200, content_type: str = "text/plain"):
     """A robots fetcher returning a fixed body for any origin."""
 
-    def fetcher(url: str, user_agent: str = "") -> tuple[int, str]:
+    def fetcher(url: str, user_agent: str = "") -> tuple[int, str, str]:
         assert url.endswith("/robots.txt")
-        return status, body
+        return status, content_type, body
 
     return fetcher
 
@@ -64,7 +64,7 @@ def test_override_domain_bypasses_the_check():
 
 
 def test_fetch_failure_fails_open():
-    def exploding(url: str, user_agent: str = "") -> tuple[int, str]:
+    def exploding(url: str, user_agent: str = "") -> tuple[int, str, str]:
         raise httpx.ConnectError("no route to host")
 
     policy = RobotsPolicy(user_agent=UA, fetcher=exploding)
@@ -84,9 +84,9 @@ def test_non_2xx_robots_fails_open(status):
 def test_robots_is_fetched_once_per_origin():
     calls: list[tuple[str, str]] = []
 
-    def counting(url: str, user_agent: str = "") -> tuple[int, str]:
+    def counting(url: str, user_agent: str = "") -> tuple[int, str, str]:
         calls.append((url, user_agent))
-        return 200, ROBOTS
+        return 200, "text/plain", ROBOTS
 
     policy = RobotsPolicy(user_agent=UA, fetcher=counting)
     for path in ("/a", "/b", "/private/c"):
@@ -97,6 +97,115 @@ def test_robots_is_fetched_once_per_origin():
         ("https://site-test.org/robots.txt", UA),
         ("https://other-test.com/robots.txt", UA),
     ]
+
+
+# --- a 200 is not automatically a policy ------------------------------------
+
+SENSOR_PAGE = (
+    '<html><body><h1>It works!</h1><noscript><img src="/akam/13/pixel_1"/>'
+    "</noscript></body></html>"
+)
+
+
+def test_a_bot_sensor_page_is_not_read_as_consent():
+    """The observed case: an origin answers /robots.txt with 200 and an HTML
+    interstitial. Parsed, that is an empty ruleset — blanket permission from a
+    site that said nothing of the kind. It must be treated as *unavailable*."""
+    policy = RobotsPolicy(
+        user_agent=UA, fetcher=serving(SENSOR_PAGE, content_type="text/html")
+    )
+
+    # Fails open, as every unobtainable robots.txt does...
+    assert policy.allows("https://site-test.org/anything") is True
+    # ...but with no parser cached, i.e. recorded as "no rules obtained" rather
+    # than as a policy that permits everything.
+    assert policy._parser_for("https://site-test.org/anything") is None
+
+
+def test_markup_is_rejected_even_when_typed_text_plain():
+    policy = RobotsPolicy(
+        user_agent=UA, fetcher=serving(SENSOR_PAGE, content_type="text/plain")
+    )
+
+    assert policy._parser_for("https://site-test.org/x") is None
+
+
+def test_a_real_policy_is_unchanged_by_the_check():
+    policy = RobotsPolicy(user_agent=UA, fetcher=serving(ROBOTS))
+
+    assert policy.allows("https://site-test.org/secret/x") is False
+    assert policy._parser_for("https://site-test.org/x") is not None
+
+
+@pytest.mark.parametrize(
+    "content_type",
+    ["", "text/plain", "text/plain; charset=utf-8", "text/x-robots", "TEXT/PLAIN"],
+)
+def test_plausible_policy_content_types_are_accepted(content_type):
+    """Lenient on purpose: rejecting an oddly-typed real policy would discard
+    rules the site meant us to follow."""
+    policy = RobotsPolicy(
+        user_agent=UA, fetcher=serving(ROBOTS, content_type=content_type)
+    )
+
+    assert policy.allows("https://site-test.org/secret/x") is False
+
+
+@pytest.mark.parametrize(
+    "content_type", ["text/html", "application/json", "image/png", "application/pdf"]
+)
+def test_document_content_types_are_rejected(content_type):
+    policy = RobotsPolicy(
+        user_agent=UA,
+        fetcher=serving("User-agent: *\nDisallow: /", content_type=content_type),
+    )
+
+    assert policy._parser_for("https://site-test.org/x") is None
+
+
+# --- escalated transport ----------------------------------------------------
+
+
+def test_an_unobtainable_policy_is_retried_over_the_escalated_transport():
+    """A deployment that reads a site's pages with a browser fingerprint must read
+    its rules the same way, or it always proceeds on a policy it never got."""
+    calls: list[str] = []
+
+    def escalated(url: str, user_agent: str = "") -> tuple[int, str, str]:
+        calls.append(url)
+        return 200, "text/plain", ROBOTS
+
+    policy = RobotsPolicy(
+        user_agent=UA,
+        fetcher=serving(SENSOR_PAGE, content_type="text/html"),
+        escalated_fetcher=escalated,
+    )
+
+    # The rules the origin would only serve to a browser-shaped client apply.
+    assert policy.allows("https://site-test.org/secret/x") is False
+    assert calls == ["https://site-test.org/robots.txt"]
+
+
+def test_the_escalated_transport_is_not_tried_when_the_first_one_worked():
+    def unexpected(url: str, user_agent: str = "") -> tuple[int, str, str]:
+        raise AssertionError("a usable robots.txt must not be fetched twice")
+
+    policy = RobotsPolicy(
+        user_agent=UA, fetcher=serving(ROBOTS), escalated_fetcher=unexpected
+    )
+
+    assert policy.allows("https://site-test.org/secret/x") is False
+
+
+def test_a_declining_escalated_transport_still_fails_open():
+    """The default: impersonation is unconfigured, so it returns None."""
+    policy = RobotsPolicy(
+        user_agent=UA,
+        fetcher=serving("", status=503),
+        escalated_fetcher=lambda url, ua="": None,
+    )
+
+    assert policy.allows("https://site-test.org/anything") is True
 
 
 def test_non_http_url_is_allowed():

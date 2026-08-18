@@ -1,4 +1,4 @@
-"""Recover pages the origin refuses to serve, via third-party readers/archives.
+"""Recover pages the default transport could not obtain.
 
 Sites behind an edge CDN routinely answer a non-browser client with an HTTP
 error and an HTML body -- an "Access Denied" interstitial, a themed 404. Because
@@ -7,7 +7,22 @@ through as ``kind="html"`` and be screened, summarized and extracted as if it
 were the page. The status guard in ``fetch`` stops that; this module is what
 turns the resulting hole back into content.
 
-Two retrieval routes, tried in the order named by ``AWE_FETCH_FALLBACKS``:
+An explicit refusal is only the polite half of that behavior. The other half is
+a bot manager that simply stops answering -- no status, no body, just a read
+timeout -- and a page lost that way is lost exactly as completely. So the chain
+is driven by **failure to obtain content**, whatever shape the failure took:
+``fetch`` calls in from its status guard *and* from its transport-error handler.
+
+Three retrieval routes, tried in the order named by ``AWE_FETCH_FALLBACKS``:
+
+``impersonate``
+    Re-request the origin directly through curl_cffi, whose libcurl produces a
+    browser's TLS/HTTP fingerprint. For origins that refuse on the *shape* of
+    the handshake rather than on identity, this is the whole fix -- and unlike
+    the two below it discloses nothing to a third party, needs no rate-limited
+    free tier, and returns live content. Off unless ``AWE_IMPERSONATE`` names a
+    target; see there and at ``AWE_IMPERSONATE_BROWSER_UA`` for what escalating
+    costs. Ordering it first is strictly better than not, when it is enabled.
 
 ``jina``
     ``r.jina.ai`` renders the URL server-side and returns it. Live content, and
@@ -22,9 +37,12 @@ Two retrieval routes, tried in the order named by ``AWE_FETCH_FALLBACKS``:
     modifier so the bytes come back unrewritten. Not live -- bound the staleness
     with ``AWE_WAYBACK_MAX_AGE_DAYS`` when currency matters.
 
-Both are opinionated only about *retrieval*. Content selection, normalization,
-and link policy stay where they already live, and nothing here knows about any
-particular site -- the chain is driven entirely by the response status.
+All three are opinionated only about *retrieval*. Content selection,
+normalization, and link policy stay where they already live, and nothing here
+knows about any particular site: the chain is driven by whether a body was
+obtained, never by which host was asked. In particular a recovered body is still
+adjudicated by the crawl boundary and by robots.txt exactly as a direct fetch is
+-- recovery is not a way around either.
 
 Recovered content is always returned under the **caller's** URL, never the
 proxy/archive address: ``page.url`` becomes ``result.path``, the ``--- SOURCE:``
@@ -33,8 +51,9 @@ from them. ``FetchedPage.via`` records which route supplied it (and, for the
 archive, the capture timestamp), and the extractor surfaces the map as
 ``ExtractionResult.fallbacks_used``.
 
-Note both routes disclose the URL being crawled to a third party. Set
-``AWE_FETCH_FALLBACKS=`` to disable recovery entirely and keep only the guard.
+Note ``jina`` and ``wayback`` disclose the URL being crawled to a third party;
+``impersonate`` talks to the origin only. Set ``AWE_FETCH_FALLBACKS=`` to disable
+recovery entirely and keep only the guard.
 """
 
 import html as html_module
@@ -54,7 +73,8 @@ from tenacity import (
 )
 
 from . import logsink
-from .config import get_settings
+from .config import Settings, get_settings
+from .frontier import domain_of, split_domains
 
 JINA_ENDPOINT = "https://r.jina.ai/"
 WAYBACK_CDX_ENDPOINT = "https://web.archive.org/cdx/search/cdx"
@@ -360,10 +380,139 @@ def _via_wayback(url: str, user_agent: str = "") -> Recovered | None:
     )
 
 
+# --- impersonate ------------------------------------------------------------
+#
+# One session per (thread, target). A curl_cffi session wraps a libcurl handle,
+# which is not thread-safe, and a wave runs up to `max_workers` recoveries at
+# once -- so this deliberately does NOT follow the module-level `_client`
+# singleton pattern above. `threading.local` gives each worker its own, and the
+# connection reuse a session exists for still happens within a worker.
+_sessions = threading.local()
+
+
+def _new_session(target: str):
+    """Build a curl_cffi session impersonating `target`.
+
+    Imported here, not at module scope: curl_cffi is an optional dependency
+    (``agentic-web-extraction[impersonate]``), and a deployment that never turns
+    the route on must not need the wheel. The ImportError is caught by the route,
+    which then declines like any other unavailable route.
+    """
+    # The optional "impersonate" extra: absent by design in a base install, which
+    # is why the import is here and why the route catches ImportError.
+    from curl_cffi import requests as cffi  # ty: ignore[unresolved-import]
+
+    return cffi.Session(impersonate=target)
+
+
+def _session_for_thread(target: str):
+    sessions = getattr(_sessions, "by_target", None)
+    if sessions is None:
+        sessions = _sessions.by_target = {}
+    session = sessions.get(target)
+    if session is None:
+        session = sessions[target] = _new_session(target)
+    return session
+
+
+def _impersonate_covers(url: str, settings: Settings) -> bool:
+    """Whether ``AWE_IMPERSONATE_DOMAINS`` puts `url` in scope (empty = all).
+
+    Keyed on the registrable domain via :func:`frontier.domain_of`, the same
+    comparison the crawl boundary and the robots overrides use -- one host-matching
+    rule for the whole library, so "example.org" covers "www.example.org" here too.
+    """
+    scope = split_domains(settings.impersonate_domains)
+    if not scope:
+        return True
+    return domain_of(url) in scope
+
+
+def _via_impersonate(url: str, user_agent: str = "") -> Recovered | None:
+    """Re-request `url` with a browser TLS/HTTP fingerprint via curl_cffi.
+
+    Unblocks origins that refuse on the shape of the handshake rather than on who
+    is asking. Declines -- returning None, never raising -- when the route is
+    unconfigured, curl_cffi isn't installed, the host is out of scope, or the
+    origin refuses this client too.
+    """
+    settings = get_settings()
+    target = settings.impersonate.strip()
+    if not target:
+        return None
+    if not _impersonate_covers(url, settings):
+        logsink.emit(
+            f"    [fallback:impersonate] {url} is outside AWE_IMPERSONATE_DOMAINS"
+        )
+        return None
+    try:
+        session = _session_for_thread(target)
+    except ImportError:
+        logsink.emit(
+            "    [fallback:impersonate] curl_cffi is not installed — install the "
+            '"impersonate" extra to enable this route'
+        )
+        return None
+
+    # Sending our own User-Agent beside a browser fingerprint is a mismatch some
+    # bot managers reject outright; dropping it is a masquerade. Which of those a
+    # deployment would rather do is the operator's call, not this module's, so the
+    # default keeps the attributable string and the escalation is a second switch.
+    headers = (
+        None
+        if settings.impersonate_browser_ua
+        else {"User-Agent": user_agent or _user_agent}
+    )
+    try:
+        response = session.get(
+            url,
+            headers=headers,
+            timeout=settings.impersonate_timeout,
+            allow_redirects=True,
+        )
+    except Exception as exc:  # noqa: BLE001 — recovery is best-effort
+        logsink.emit(f"    [fallback:impersonate] failed for {url}: {exc!r}")
+        return None
+    if response.status_code != 200 or not response.content:
+        logsink.emit(
+            f"    [fallback:impersonate] returned {response.status_code} for {url}"
+        )
+        return None
+
+    content_type = response.headers.get("content-type", "")
+    logsink.emit(
+        f"    [fallback:impersonate] recovered {url} as {target} "
+        f"({len(response.content)}B)"
+    )
+    return Recovered(
+        raw_bytes=response.content,
+        # Mirrors the fetch contract, as the wayback route does: `text` carries the
+        # decoded body `extract_links` parses, and stays empty for PDFs.
+        text="" if "pdf" in content_type.lower() else response.text,
+        content_type=content_type,
+        via=f"impersonate:{target}",
+    )
+
+
 _ROUTES: dict[str, Callable[[str, str], Recovered | None]] = {
+    "impersonate": _via_impersonate,
     "jina": _via_jina,
     "wayback": _via_wayback,
 }
+
+
+def impersonate(url: str, *, user_agent: str = "") -> Recovered | None:
+    """The impersonate route alone, for a caller that needs the escalated
+    transport but not the recovery chain.
+
+    [robots.py](robots.py) is the one such caller: a deployment reading a site's
+    *pages* through a browser fingerprint must read that site's *policy* the same
+    way, or it fetches robots.txt over exactly the channel the origin blocks and
+    then proceeds unrestricted every time. It must not, however, read a policy out
+    of a third-party reader or a years-old archive capture, which is what going
+    through :func:`recover` would allow.
+    """
+    return _via_impersonate(url, user_agent)
 
 
 def configured_routes() -> list[str]:
@@ -386,10 +535,11 @@ def recover(url: str, *, user_agent: str = "") -> Recovered | None:
     """Try each configured route in order; the first that yields content wins.
 
     ``user_agent`` overrides the configured default for these requests only, so the
-    reader/archive sees the same operator the origin fetch named (see
-    :func:`fetch.fetch`). Returns ``None`` when recovery is disabled, every route
-    declines, or the URL simply isn't available anywhere -- the caller then degrades
-    the page to ``kind="error"``, which the traversal skips at no LLM cost.
+    reader/archive -- or, on the impersonate route, the origin itself -- sees the
+    same operator the origin fetch named (see :func:`fetch.fetch`). Returns ``None``
+    when recovery is disabled, every route declines, or the URL simply isn't
+    available anywhere -- the caller then degrades the page to ``kind="error"``,
+    which the traversal skips at no LLM cost.
     """
     for name in configured_routes():
         recovered = _ROUTES[name](url, user_agent)

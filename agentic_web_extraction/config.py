@@ -40,17 +40,32 @@ class Settings(BaseSettings):
     # Whether to fetch and read linked PDFs as page content (env: AWE_FOLLOW_PDF).
     # When False, PDF responses are treated as skipped (no LLM work, no budget cost).
     follow_pdf: bool = True
-    # Ordered, comma-separated recovery routes tried when a fetch comes back
-    # non-2xx (env: AWE_FETCH_FALLBACKS). Empty disables recovery, leaving only
-    # the status guard: an error body is dropped rather than mistaken for the
-    # page. Known routes are "jina" (r.jina.ai renders the URL live and reads
-    # PDFs) and "wayback" (the Internet Archive's newest capture); unknown names
-    # are ignored with a log line. Recovered content is returned under the
-    # original URL, so paths and citations stay canonical, and the route is
-    # recorded in FetchedPage.via / ExtractionResult.fallbacks_used.
+    # How many times an origin fetch is attempted before it is given up on
+    # (env: AWE_FETCH_ATTEMPTS, default 3 = the historical behavior). Applies to
+    # 5xx and connect errors, which genuinely are transient. A *read* timeout is
+    # capped at two attempts regardless: the failure mode it stands for in
+    # practice is an edge CDN tarpitting a non-browser client, which is
+    # deterministic -- the later attempts only spend the read timeout again
+    # (30s each, and with max_workers of them in flight the whole wave stalls)
+    # to be refused identically. Recovery (below) is the thing that can actually
+    # turn that page back into content, so get there sooner.
+    fetch_attempts: int = 3
+    # Ordered, comma-separated recovery routes tried when a fetch fails to
+    # produce content (env: AWE_FETCH_FALLBACKS) -- a non-2xx response, or no
+    # response at all (a connection dropped or tarpitted by an edge CDN that
+    # would rather stay silent than refuse out loud). Empty disables recovery,
+    # leaving only the status guard: an error body is dropped rather than
+    # mistaken for the page. Known routes are "impersonate" (re-request the
+    # origin directly with a browser TLS/HTTP fingerprint; needs the knobs
+    # below), "jina" (r.jina.ai renders the URL live and reads PDFs) and
+    # "wayback" (the Internet Archive's newest capture); unknown names are
+    # ignored with a log line. Recovered content is returned under the original
+    # URL, so paths and citations stay canonical, and the route is recorded in
+    # FetchedPage.via / ExtractionResult.fallbacks_used.
     #
-    # NOTE both routes send the URL being crawled to a third party. Set this
-    # empty if that is unacceptable for your deployment.
+    # NOTE jina and wayback send the URL being crawled to a third party;
+    # "impersonate" talks to the origin only. Set this empty if outbound
+    # recovery is unacceptable for your deployment.
     fetch_fallbacks: str = "jina,wayback"
     # What the Jina reader should return (env: AWE_JINA_RETURN_FORMAT), sent as
     # its X-Return-Format header. "html" (the default) yields the full DOM, so
@@ -64,6 +79,40 @@ class Settings(BaseSettings):
     # zero when the criterion is time-sensitive and a years-old capture would be
     # worse than no page at all.
     wayback_max_age_days: int = 0
+    # curl_cffi impersonation target for the "impersonate" recovery route
+    # (env: AWE_IMPERSONATE) -- "chrome", "chrome124", "safari", "firefox", "edge".
+    # Empty (the default) disables the route entirely, so nothing changes for an
+    # existing deployment even if the route is named in fetch_fallbacks.
+    #
+    # What it buys: some edge CDNs refuse on TLS/HTTP *fingerprint* alone -- the
+    # shape of the handshake, not who we claim to be -- and answer a plain httpx
+    # client with a silent drop. curl_cffi re-requests through a libcurl built to
+    # produce a browser's handshake, so those origins serve the page to the same
+    # honest User-Agent they were refusing. Requires the optional dependency:
+    # `pip install "agentic-web-extraction[impersonate]"`. Absent, the route
+    # declines with a log line rather than failing the crawl.
+    impersonate: str = ""
+    # Send the impersonated browser's own User-Agent instead of ours on that route
+    # (env: AWE_IMPERSONATE_BROWSER_UA). Off by default, and think before turning
+    # it on: it DROPS ATTRIBUTION. With it off the route sends a browser handshake
+    # under the crawl's own identifying string, which is a shape mismatch some bot
+    # managers reject outright but leaves a site operator someone to write to. With
+    # it on, the request is indistinguishable from a browser -- a full masquerade,
+    # typically at a site that is refusing to identify itself to us in return. That
+    # is an institutional call about a site's refusal signal, not a default, so it
+    # is a separate switch from `impersonate` and an operator has to type it out.
+    impersonate_browser_ua: bool = False
+    # Restrict the impersonate route to these registrable domains
+    # (env: AWE_IMPERSONATE_DOMAINS, comma-separated). Empty (the default) means
+    # every host, which only takes effect once `impersonate` is set. Scope it to
+    # the handful of sites that actually need the escalation rather than changing
+    # the posture of a whole crawl -- especially alongside impersonate_browser_ua.
+    impersonate_domains: str = ""
+    # Per-request timeout for the impersonate route in seconds
+    # (env: AWE_IMPERSONATE_TIMEOUT). Shorter than the jina/wayback client's
+    # generous 120s because the origin is answering directly -- there is no
+    # server-side render or cold-storage replay to wait out.
+    impersonate_timeout: float = 30.0
     # Fetch budget PER SEED: the max number of readable pages the traversal will
     # spend LLM calls on for each seed URL (env: AWE_MAX_FETCHES). With N seeds the
     # single shared frontier gets a total budget of max_fetches * N. Errored and

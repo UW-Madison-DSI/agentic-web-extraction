@@ -100,6 +100,23 @@ def test_the_request_user_agent_reaches_the_wire(make_extractor):
     assert web.requests == [(SEED, ua)]
 
 
+def test_the_impersonate_route_carries_the_same_attribution(
+    monkeypatch, fake_impersonate
+):
+    """A browser *fingerprint* is not a browser *identity*. By default the
+    escalated route sends the crawl's own string, so the traffic stays traceable
+    to its operator; dropping it is the separate AWE_IMPERSONATE_BROWSER_UA
+    switch, and that is the only thing that drops it."""
+    ua = "rabbit-test/9.9 (+https://example.edu/crawler; Some Team)"
+    settings = Settings(impersonate="chrome", llm_cache="", log_file="")
+    monkeypatch.setattr(fallback, "get_settings", lambda: settings)
+
+    fallback.impersonate("https://blocked-test.org/x", user_agent=ua)
+
+    _url, headers, _timeout = fake_impersonate[0].calls[0]
+    assert headers == {"User-Agent": ua}
+
+
 def test_blank_user_agent_falls_back_to_the_constant(make_extractor):
     web = StubWeb({SEED: page()})
     extractor = make_extractor(

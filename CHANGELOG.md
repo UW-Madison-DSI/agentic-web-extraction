@@ -7,6 +7,59 @@ Release for the tag. An empty `## Unreleased` aborts the release.
 
 ## Unreleased
 
+Pages lost to *transport-level* blocking are now recoverable. Cut this as a
+**minor** release: it changes what a deployment with recovery configured sends,
+and how long a blocked domain takes to give up.
+
+- **Behavior change — recovery now runs on transport failures too.** A fetch that
+  produced no response at all (read timeout, dropped connection, malformed
+  redirect header) went straight to `kind="error"` and never reached
+  `AWE_FETCH_FALLBACKS`; only a non-2xx *response* did. That is backwards: an edge
+  CDN that tarpits a non-browser client refuses less politely than one that
+  answers 403, and was getting the better outcome. Both paths now recover.
+  - **What this changes for you:** with a non-empty `AWE_FETCH_FALLBACKS`, more
+    URLs are disclosed to `jina`/`wayback` and a blocked domain costs a recovery
+    attempt on top of its retries. Set `AWE_FETCH_FALLBACKS=` empty for the old
+    behavior (that also keeps the status guard, and makes no outbound call).
+- **New recovery route: `impersonate`.** Re-requests the origin through
+  [curl_cffi](https://github.com/lexiforest/curl_cffi), whose libcurl produces a
+  browser's TLS/HTTP fingerprint, for origins that refuse on the shape of the
+  handshake rather than on identity. Unlike `jina`/`wayback` it discloses nothing
+  to a third party and returns live content, so put it first
+  (`AWE_FETCH_FALLBACKS=impersonate,jina,wayback`) when it's on.
+  - Off unless `AWE_IMPERSONATE` names a target (`chrome`, `safari`, …). Optional
+    dependency: `pip install "agentic-web-extraction[impersonate]"`; without the
+    wheel the route declines with a log line instead of failing the crawl.
+  - `AWE_IMPERSONATE_BROWSER_UA` (default `false`) is a **separate** switch that
+    drops attribution: a browser fingerprint under a verbatim browser UA is a full
+    masquerade. Left off, the route sends your own `AWE_USER_AGENT`, which is
+    enough for the large class of CDNs that key on fingerprint alone. Some sites
+    reject that combination and are only reachable with it on — that is an
+    institutional call about a clear refusal signal, so it isn't a default.
+  - `AWE_IMPERSONATE_DOMAINS` scopes the escalation to named registrable domains
+    (empty = every host). `AWE_IMPERSONATE_TIMEOUT` (default `30.0`) bounds it.
+  - Recovered pages are still adjudicated by `allowed_domains` and robots.txt
+    exactly as direct fetches are; the route is retrieval only. Provenance is
+    `impersonate:<target>` in `FetchedPage.via` / `result.fallbacks_used`.
+- **Fixed — a bot-sensor page is no longer read as robots.txt consent.** An origin
+  that answers `/robots.txt` with `200` and an HTML interstitial parsed to *zero
+  rules*, i.e. blanket permission, silently and at exactly the sites likeliest to
+  have meant the opposite. A 200 that isn't plausibly a policy (non-text content
+  type, or a body opening with markup) is now treated as *unavailable* — still
+  failing open, but with a log line saying the rules were never obtained.
+  - When `AWE_IMPERSONATE` covers a host, a robots.txt the default client can't
+    obtain is retried over that transport, so a crawl doesn't read pages with a
+    browser fingerprint while reading policy over the channel the site blocks.
+    Never through `jina`/`wayback`: a policy must come from the origin.
+- **`AWE_FETCH_ATTEMPTS`** (default `3`, the previous behavior) caps origin-fetch
+  attempts. Read timeouts are capped at 2 regardless: a tarpit is deterministic,
+  so attempts 2 and 3 spend the full read timeout each — ~35s to give up on a
+  blocked URL instead of ~95s, which partly pays for the recovery attempt above.
+- **Tests** — `tests/test_fetch_recovery.py` and `tests/test_impersonate.py`, plus
+  robots.txt body-validation and escalation cases. Still fully offline; the
+  `impersonate` route is exercised against a fake session, so the suite passes
+  with the extra uninstalled.
+
 ## v0.2.1 — 2026-08-14
 
 Crawl citizenship: the crawler can now be bounded, identified, and audited. Every
