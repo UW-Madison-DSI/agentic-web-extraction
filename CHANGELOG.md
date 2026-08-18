@@ -7,6 +7,8 @@ Release for the tag. An empty `## Unreleased` aborts the release.
 
 ## Unreleased
 
+## v0.2.2 — 2026-08-18
+
 Pages lost to *transport-level* blocking are now recoverable. Cut this as a
 **minor** release: it changes what a deployment with recovery configured sends,
 and how long a blocked domain takes to give up.
