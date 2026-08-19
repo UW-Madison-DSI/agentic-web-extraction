@@ -57,7 +57,7 @@ Key files: [extractor.py](agentic_web_extraction/extractor.py) (wave loop + cons
 [tokens.py](agentic_web_extraction/tokens.py) (tiktoken counting/splitting),
 [frontier.py](agentic_web_extraction/frontier.py) (heap + visited set + snapshot + PSL
 domain compare + `domain_of` allow keys), [fetch.py](agentic_web_extraction/fetch.py) (httpx + status
-guard + transport-failure recovery + UA),
+guard + transport-failure recovery + per-domain transport memo + UA),
 [robots.py](agentic_web_extraction/robots.py) (opt-in robots.txt policy),
 [fallback.py](agentic_web_extraction/fallback.py) (impersonate/jina/wayback recovery),
 [normalize.py](agentic_web_extraction/normalize.py),
@@ -173,6 +173,19 @@ guard + transport-failure recovery + UA),
   keyed on being over budget — and it joins `ctx`/`enc` in the extraction cache key
   since it changes the extraction input. `SUMMARY` entries are keyed on content alone,
   so they stay shared between always-on and overflow-triggered runs.
+  `max_output_tokens` (env `AWE_MAX_OUTPUT_TOKENS`, default `0` = no cap, the
+  historical bytes-on-the-wire behavior) caps that one call's *output*. It exists
+  because a JSON grammar permits arbitrary whitespace between tokens, so `\n  ` is
+  always a legal next token and schema-guided decoding cannot break a repetition loop
+  the way it would for a malformed key: uncapped, the endpoint's own output limit can
+  outlast the client read timeout, so the call surfaces as a timeout, the SDK silently
+  re-sends it, and one extraction burns minutes without a recoverable error reaching
+  the caller. Capped, it becomes a `ValidationError` (truncated document) or the
+  `AssertionError` in `extract()` (no parsed object) — catchable and cheap to re-roll.
+  Note this is the Responses API, which does *not* raise `LengthFinishReasonError`.
+  Deliberately not in any cache key and not a CLI flag: it is a per-deployment
+  backstop, and a value below the largest legitimate extraction turns a working call
+  into a failing one.
 - **Summarization is schema-aware, but must not become extraction.** It's the only lossy
   step (the extract model never sees the original text), so `fit_pages` threads the target
   schema into every `provider.summarize` call and the provider appends
@@ -188,9 +201,13 @@ guard + transport-failure recovery + UA),
   detail must never abort a crawl. `schema` stays optional on the `Provider` protocol so
   `summarize` remains a generic utility, but the Extractor always passes it.
 - **Uniform result shape.** `extract` always returns the same structure (`data`,
-  `stopped_reason`, `pages_fetched`, `path`, `verdicts`, `content_tokens`,
-  `extraction_input_tokens`, `summarized`, `fallbacks_used`, per-function token usage)
-  whether it matched or exhausted budget. Plumbing this metadata is non-optional. See
+  `stopped_reason`, `pages_fetched`, `path`, `verdicts`, `protocol`, `content_tokens`,
+  `extraction_input_tokens`, `summarized`, `fallbacks_used`, plus per-function token
+  usage in `usage_by_function`/`function_model`) whether it matched or exhausted
+  budget. Plumbing this metadata is non-optional. `protocol` names the provider
+  adapter / wire protocol, **not** the model vendor — an OpenAI-compatible endpoint
+  may serve anything — so cost is only reconstructable by pairing it with
+  `function_model`; keep the two together. See
   [result.py](agentic_web_extraction/result.py).
 - **Frontier is single-threaded; workers are pure.** Only the main thread pops/pushes/
   marks the `Frontier`. `_process_page` runs on pool threads and returns a `_PageOutcome`;

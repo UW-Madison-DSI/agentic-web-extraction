@@ -150,7 +150,8 @@ A typed object conforming to your schema (or `None` if nothing screened in), plu
 - `extraction_input_tokens` — token size of what actually fed the extraction (smaller than `content_tokens` when `summarized`)
 - `summarized` — `True` when the concatenation was summarized down first (because it exceeded `max_context_tokens`, or because `always_summarize` is on)
 - `fallbacks_used` — URL → route for any page the default transport couldn't obtain that was recovered another way (`"impersonate:<target>"` / `"jina"` / `"wayback:<timestamp>"`); empty on a clean crawl. Non-empty means some content came in by a route other than a plain fetch — see [Blocked-page recovery](#blocked-page-recovery-impersonate--jina--wayback)
-- provider and token usage across all calls, split by call purpose (each with the model it ran on)
+- `protocol` — the provider adapter / wire protocol that ran the crawl (e.g. `"openai"`); it names the SDK and billing surface, not the model vendor
+- `usage_by_function` / `function_model` — token usage split by call purpose (`screen` / `score_links` / `summarize` / `extract`), each with the model it ran on
 
 Whether the agent succeeded or gave up, the result is structured the same way — easy to audit.
 
@@ -786,6 +787,7 @@ agentic_web_extraction/
     tokens.py            # tiktoken-backed token counting + token-aware splitting
     fallback.py          # recovery routes for pages the transport lost (impersonate, jina, wayback)
     fetch.py             # httpx (plain, no HTTP cache) + tenacity retry + status guard + UA
+                         #   + per-domain transport memo (skip a host that has gone silent)
     robots.py            # opt-in robots.txt policy (per-origin cache; validates the body; fails open)
     logsink.py           # shared stderr + optional timestamped log-file sink
     frontier.py          # best-first heap + visited set + PSL registrable-domain (tldextract)
@@ -799,9 +801,12 @@ examples/
     strippers.py         # example cache-stability text_filters (site-specific; kept out of the package)
 tests/
     conftest.py          # offline stub provider + stub web (no network, no LLM)
-    test_crawl_boundary.py  # allowed_domains: default-deny, seed redirects, domain keys
-    test_robots.py       # robots.txt verdicts, overrides, fail-open
-    test_user_agent.py   # User-Agent configuration reaches both http clients
+    test_crawl_boundary.py   # allowed_domains: default-deny, seed redirects, domain keys
+    test_fetch_recovery.py   # status/transport failures → fallback routes; the transport memo
+    test_impersonate.py      # the curl_cffi route: scoping, UA choice, thread-local sessions
+    test_robots.py           # robots.txt verdicts, overrides, body validation, fail-open
+    test_thin_content.py     # a shell body is a decline, so the chain falls through
+    test_user_agent.py       # User-Agent configuration reaches both http clients
 pyproject.toml           # uv project, Python ≥3.13
 scripts/
     adopters.py          # weekly org adoption scan (stdlib-only PEP 723)
@@ -886,6 +891,15 @@ v0 done:
 - [x] Opt-in soft same-domain preference (single `prefer_seed_domain` knob, off by default; LLM is fed an on-domain signal and asked to disfavor off-domain content; PSL-based registrable domain via `tldextract`)
 - [x] Opt-in direct extraction (single `seed_is_content` knob, off by default; treats the seed pages as the content — skips the pre-screen and link-scoring, no discovery)
 - [x] Opt-in flex service tier (single `AWE_USE_FLEX` knob, off by default; Batch-API rates on synchronous calls, per-call fallback to standard when flex has no capacity)
+- [x] Hard crawl boundary (`allowed_domains`, default-deny, enforced at the one frontier push site so redirects still resolve; seed domains added automatically; opt-in `allow_seed_redirect_domains` for rebrands) — see [Crawl boundary, attribution, robots.txt](#crawl-boundary-attribution-and-robotstxt)
+- [x] Attributable traffic (`user_agent` / `AWE_USER_AGENT` as a process default overridden per request, so concurrent Extractors can't rename each other's in-flight fetches)
+- [x] Opt-in robots.txt (`respect_robots`, per-origin and cached, checked in the worker *before* the fetch and again on a redirect's landing URL; a `200` is validated as a policy before it is parsed; failures to obtain it fail open; `robots_overrides` exempts named domains)
+- [x] Stderr + optional timestamped log file (`AWE_LOG_FILE` / `--log-file`; `[page]`, `[blocked]`, `[robots]`, `[fallback:*]`, `[transport-memo]` lines — never a bare `print`, stdout stays reserved for result JSON)
+- [x] Blocked-page recovery (a non-2xx response *and* no response at all are both "no content"; ordered `AWE_FETCH_FALLBACKS` routes — `impersonate` / `jina` / `wayback` — returning bytes under the original URL, with the route recorded in `fallbacks_used`)
+- [x] Opt-in browser-fingerprint impersonation (`AWE_IMPERSONATE` as a route in that chain, with attribution kept by default and a separate `AWE_IMPERSONATE_BROWSER_UA` switch to drop it; scopeable via `AWE_IMPERSONATE_DOMAINS`; optional `impersonate` extra, declines rather than fails when absent)
+- [x] Per-domain transport memo (`AWE_TRANSPORT_MEMO_FAILURES`; a host that has gone silent stops being re-proved page by page, hard to latch, cleared by any response, reset each crawl, and never able to lose a page)
+- [x] Thin-content check on recovery (`AWE_MIN_RECOVERED_TEXT_CHARS`; a client-rendered shell counts as a route declining, so a rendering route is tried — reorders the chain, never loses a page)
+- [x] Extraction output cap (`AWE_MAX_OUTPUT_TOKENS`, off by default; turns degenerate generation into a catchable prompt failure instead of a timeout the SDK silently re-sends)
 - [x] `examples/` directory with reference schemas and filters (`examples/grants.py`, `examples/strippers.py`, kept out of the package)
 - [x] Weekly org adoption scan (`scripts/adopters.py` + `.github/workflows/adopters.yml`; index-independent repo/tree sweep → shields badges in the [Adopters](#adopters) block, hard-fails and reports coverage rather than committing a silent undercount)
 - [x] Guarded release script (`scripts/release.py`; main-only, clean-and-synced preconditions, pyproject/`uv.lock`/git-tag kept in sync, atomic branch+tag push with rollback — see [Releasing](#releasing))

@@ -7,6 +7,16 @@ Release for the tag. An empty `## Unreleased` aborts the release.
 
 ## Unreleased
 
+- **Docs** — caught the documentation up with v0.2.x. `.env.example` was missing
+  `AWE_TRANSPORT_MEMO_FAILURES` and `AWE_MIN_RECOVERED_TEXT_CHARS` entirely, so both
+  v0.2.3 knobs were undiscoverable from the file deployments actually copy. The
+  README's roadmap stopped at v0.1 (no crawl boundary, robots.txt, attribution,
+  recovery, impersonation, transport memo, thin-content check, or output cap), its
+  project layout listed 4 of 7 test files, and its result-shape list named neither
+  `protocol` nor `function_model` — the two fields cost is reconstructed from.
+  `ExtractionResult.fallbacks_used`'s own docstring still described recovery as
+  firing on a non-2xx response only and omitted the `impersonate:<target>` route.
+
 ## v0.2.3 — 2026-08-18
 
 - **A host that has gone silent is written off, instead of re-proving it per page.**

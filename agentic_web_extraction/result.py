@@ -97,11 +97,14 @@ class ExtractionResult:
     ``always_summarize`` is on."""
 
     fallbacks_used: dict[str, str] = field(default_factory=dict)
-    """Pages the origin refused (non-2xx) that were recovered elsewhere, as URL →
-    route (``"jina"`` or ``"wayback:<capture timestamp>"``). Empty on a clean
-    crawl. Non-empty means some content did not come from the site itself: read
-    through a third-party renderer, or read from an archived capture that is as
-    old as its timestamp. Worth surfacing wherever the extraction is reported."""
+    """Pages the default transport could not obtain — a non-2xx response, or no
+    response at all — that were recovered another way, as URL → route
+    (``"impersonate:<target>"``, ``"jina"``, or ``"wayback:<capture timestamp>"``).
+    Empty on a clean crawl. Non-empty means some content did not arrive by a plain
+    fetch: re-requested with a browser fingerprint, read through a third-party
+    renderer, or read from an archived capture that is as old as its timestamp.
+    Only ``impersonate`` came from the site itself. Worth surfacing wherever the
+    extraction is reported."""
 
     def to_dict(self) -> dict[str, Any]:
         return {
