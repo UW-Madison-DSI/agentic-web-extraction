@@ -61,11 +61,21 @@ class Settings(BaseSettings):
     # straight to the routes in fetch_fallbacks -- and only when at least one route
     # is configured, since with recovery off there is nothing to skip to.
     #
-    # Any response clears the count, including a 403 or a 5xx: this is a memo about
-    # silence, and a host that refuses out loud is answering. Status refusals
-    # deliberately never latch it -- they come back in one round-trip, so skipping
-    # them saves no time while widening the chance of writing off a host over one
-    # page's 403.
+    # Deliberately hard to latch, because a wrong write-off routes a healthy site
+    # through the recovery chain. Any response clears the count -- a 403 or a 5xx
+    # included, since a host refusing out loud is answering in one round-trip, which
+    # is nothing to skip -- and a domain that has answered *even once* is never
+    # written off, however many later fetches time out (a host serving six pages and
+    # timing out on two big ones is slow, not silent, and interleaved workers make
+    # the count alone unable to tell those apart). Only timeouts and network-level
+    # failures count; a malformed Location header or an unfetchable URL says nothing
+    # about the host. The failure is attributed to the host that actually failed,
+    # which on a redirect is not the one asked for.
+    #
+    # It can never lose a page either: if no route can read a URL on a written-off
+    # domain, the origin is asked after all (and a fetch that then succeeds clears
+    # the memo -- the only way back). Each crawl starts by forgetting everything, so
+    # a write-off lasts exactly as long as it pays for itself.
     transport_memo_failures: int = 2
     # Ordered, comma-separated recovery routes tried when a fetch fails to
     # produce content (env: AWE_FETCH_FALLBACKS) -- a non-2xx response, or no
@@ -105,9 +115,15 @@ class Settings(BaseSettings):
     # route is treated as a decline and the next one is tried.
     #
     # Never a way to lose a page: if no route clears the threshold, the fullest body
-    # obtained is returned anyway, so the only cost for a genuinely short page is an
-    # extra request to routes already configured. PDFs are exempt (their text is
-    # carried as bytes, not as `text`).
+    # obtained is returned anyway. PDFs are exempt (their text is carried as bytes,
+    # not as `text`).
+    #
+    # The cost is that a *genuinely* short page -- a "this document has moved" stub, a
+    # link-only landing page -- also falls through, so its URL reaches whatever comes
+    # next in the chain even though the origin already served it. Where that matters
+    # more than the shell (jina/wayback disclose the URL to a third party; the
+    # origin-only impersonate route does not), lower the threshold rather than
+    # disabling it: the shells this exists for measure in the tens of characters.
     min_recovered_text_chars: int = 200
     # curl_cffi impersonation target for the "impersonate" recovery route
     # (env: AWE_IMPERSONATE) -- "chrome", "chrome124", "safari", "firefox", "edge".

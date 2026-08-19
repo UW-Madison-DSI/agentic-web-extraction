@@ -22,6 +22,27 @@ URL = "https://tarpit-test.org/corporate/index.html"
 BODY = "<html><body><h1>The page itself</h1></body></html>"
 
 
+def scripted(*outcomes, sent: list[str] | None = None):
+    """A client that produces `outcomes` in order, repeating the last forever.
+
+    Each outcome is an HTTP status to answer with, or an exception to raise. Used
+    for the cases where a host has to *answer* before it goes silent.
+    """
+    remaining = list(outcomes)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if sent is not None:
+            sent.append(str(request.url))
+        outcome = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        if isinstance(outcome, int):
+            return httpx.Response(
+                outcome, headers={"content-type": "text/html"}, text=BODY
+            )
+        raise outcome
+
+    return httpx.Client(transport=httpx.MockTransport(handler))
+
+
 def timing_out(exc: Exception | None = None, sent: list[str] | None = None):
     """A client whose every request dies in transport, with no response at all.
 
@@ -59,6 +80,7 @@ def wired(monkeypatch):
         *,
         exc: Exception | None = None,
         sent: list[str] | None = None,
+        outcomes: list | None = None,
         **updates,
     ) -> Route:
         settings = Settings(
@@ -66,7 +88,11 @@ def wired(monkeypatch):
         ).model_copy(update=updates)
         monkeypatch.setattr(fetch, "get_settings", lambda: settings)
         monkeypatch.setattr(fallback, "get_settings", lambda: settings)
-        client = timing_out(exc, sent)
+        client = (
+            scripted(*outcomes, sent=sent)
+            if outcomes is not None
+            else timing_out(exc, sent)
+        )
         monkeypatch.setattr(fetch, "get_client", lambda: client)
         route = route if route is not None else Route(html())
         monkeypatch.setitem(fallback._ROUTES, "jina", route)
@@ -196,8 +222,14 @@ def test_the_memo_can_be_turned_off(wired):
     assert len(sent) == 3
 
 
-def test_a_memoized_skip_that_recovers_nothing_still_reports_an_error(wired):
-    """The uniform error contract holds on the skipping path too."""
+def test_a_skip_that_recovers_nothing_falls_back_to_the_origin(wired):
+    """The memo is an optimization, never the reason a page is lost.
+
+    `configured_routes()` only knows the route *names*: `impersonate` declines
+    outright when `AWE_IMPERSONATE` is unset, when the host is out of scope, or when
+    curl_cffi is missing, and a deployment that names it alone would otherwise have
+    every later URL on a written-off domain fail without the origin being asked.
+    """
     sent: list[str] = []
     route = wired(Route(None), sent=sent)
 
@@ -205,14 +237,33 @@ def test_a_memoized_skip_that_recovers_nothing_still_reports_an_error(wired):
     fetch.fetch("https://tarpit-test.org/b")
     result = fetch.fetch(URL)
 
-    assert sent == [
-        "https://tarpit-test.org/a",
-        "https://tarpit-test.org/b",
-    ]  # not URL
+    # Recovery was tried first, then the origin anyway.
     assert route.calls[-1][0] == URL
+    assert sent[-1] == URL
     assert result.kind == "error"
-    assert result.status == 0
-    assert "written off" in result.text
+
+
+def test_a_host_that_answers_again_is_no_longer_written_off(wired):
+    """The only way back once a domain is written off — and the reason the
+    fall-through above matters beyond the one page it saves."""
+    sent: list[str] = []
+    wired(
+        sent=sent,
+        outcomes=[
+            httpx.ReadTimeout("tarpitted"),
+            httpx.ReadTimeout("tarpitted"),
+            200,
+        ],
+        fetch_fallbacks="",  # nothing to skip to, so every fetch reaches the wire
+    )
+
+    fetch.fetch("https://tarpit-test.org/a")
+    fetch.fetch("https://tarpit-test.org/b")
+    assert fetch._written_off(URL)
+
+    fetch.fetch("https://tarpit-test.org/c")  # answers 200
+
+    assert not fetch._written_off(URL)
 
 
 def test_recovery_disabled_never_skips_the_origin(wired):
@@ -225,6 +276,73 @@ def test_recovery_disabled_never_skips_the_origin(wired):
         fetch.fetch(f"https://tarpit-test.org/{path}")
 
     assert len(sent) == 3
+
+
+def test_a_host_that_has_ever_answered_is_never_written_off(wired):
+    """A slow host is not a silent one.
+
+    Eight workers interleave, so the count alone cannot tell "two failures in a row"
+    from "two big pages timed out among six that were served". Having answered once
+    settles it: whatever the count reaches, the origin keeps being asked.
+    """
+    sent: list[str] = []
+    wired(sent=sent, outcomes=[200, httpx.ReadTimeout("slow body")])
+
+    fetch.fetch("https://tarpit-test.org/small")  # served
+    for path in ("big-a", "big-b", "big-c"):
+        fetch.fetch(f"https://tarpit-test.org/{path}")  # read timeouts
+
+    assert not fetch._written_off(URL)
+    assert len(sent) == 4
+
+
+def test_only_silence_counts_as_silence(wired):
+    """A dead link is not evidence about the host.
+
+    The fetch handler catches bare `Exception` on purpose — a malformed Location
+    header raises UnicodeEncodeError, a bad href raises httpx.InvalidURL — and
+    writing a domain off over two of those would route a healthy site through the
+    recovery chain for the rest of the crawl.
+    """
+    assert fetch.counts_as_silence(httpx.ReadTimeout("tarpitted"))
+    assert fetch.counts_as_silence(httpx.ConnectError("refused"))
+    assert not fetch.counts_as_silence(
+        UnicodeEncodeError("utf-8", "☃", 0, 1, "bad Location header")
+    )
+    assert not fetch.counts_as_silence(httpx.InvalidURL("nope"))
+
+    sent: list[str] = []
+    wired(sent=sent, exc=UnicodeEncodeError("utf-8", "☃", 0, 1, "bad header"))
+
+    for path in ("a", "b", "c"):
+        fetch.fetch(f"https://tarpit-test.org/{path}")
+
+    assert len(sent) == 3  # never written off
+
+
+def test_the_failure_is_attributed_to_the_host_that_failed(wired):
+    """The client follows redirects inside one call, so the host that timed out is
+    not always the one asked for. Blaming the first hop writes off a host that
+    answers redirects fine while the silent landing domain never accumulates."""
+    wired()
+    landing = "https://landing-test.net/x"
+    exc = httpx.ReadTimeout("tarpitted", request=httpx.Request("GET", landing))
+
+    assert fetch._failed_host("https://redirector-test.org/x", exc) == landing
+
+    for _ in range(2):
+        fetch._note_no_response(
+            fetch._failed_host("https://redirector-test.org/x", exc)
+        )
+
+    assert fetch._written_off("https://landing-test.net/y")
+    assert not fetch._written_off("https://redirector-test.org/y")
+
+
+def test_a_failure_with_no_request_falls_back_to_the_url_asked_for(wired):
+    wired()
+
+    assert fetch._failed_host(URL, ValueError("nothing to do with httpx")) == URL
 
 
 def test_any_response_clears_the_memo(wired):
@@ -262,6 +380,21 @@ class RecoveredWeb(StubWeb):
 
     def fetch(self, url: str, *, user_agent: str = ""):
         return replace(super().fetch(url, user_agent=user_agent), via="jina")
+
+
+def test_each_crawl_re_tests_hosts_an_earlier_one_wrote_off(make_extractor):
+    """The memo is evidence gathered during a crawl, not a standing fact about the
+    network: this crawl may run under a different User-Agent or with impersonation
+    newly enabled, and the host that tarpitted an hour ago may be answering now."""
+    web = StubWeb({SEED: page()})
+    extractor = make_extractor(web)
+    fetch._note_no_response(SEED)
+    fetch._note_no_response(SEED)
+    assert fetch._written_off(SEED)
+
+    extractor.extract(SEED)
+
+    assert not fetch._written_off(SEED)
 
 
 def test_via_reaches_the_result(make_extractor):

@@ -303,6 +303,13 @@ class Extractor:
         # page on the site produces one [blocked] line rather than one per page.
         blocked: set[str] = set()
 
+        # Written-off hosts are evidence gathered *during* a crawl (see fetch.py's
+        # transport memo), not a standing fact about the network: this crawl may run
+        # under a different User-Agent or with impersonation newly enabled, and the
+        # host that tarpitted an hour ago may be answering now. So each crawl starts
+        # by re-testing, and the memo lasts exactly as long as it pays for itself.
+        fetch_module.reset_transport_memo()
+
         frontier = Frontier()
         for seed in seed_list:
             frontier.push(seed, score=SEED_SCORE, source="seed")

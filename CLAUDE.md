@@ -230,19 +230,29 @@ guard + transport-failure recovery + UA),
   registrable domain off for the process, and later URLs there skip `_send` for
   `_recover`. It lives in `fetch.py`, not `fallback.py` — it is a fact about the
   *default transport*, and `fallback.py` must stay ignorant of which host is being
-  asked. Only *silence* latches it (`_note_no_response` from the bare-`Exception`
-  handler); **any** response clears it (`_note_response`, after the try/except, which
-  the `HTTPStatusError` branch reaches too) because a host refusing out loud is
-  answering in one round-trip — there is nothing to skip, and latching on a status
-  would write off a host over one page's 403. The skip is gated on
-  `fallback.configured_routes()` being non-empty: with nothing to skip *to* it would
-  turn a slow page into a lost one. Keyed through `frontier.domain_of` like every
-  other host comparison, lock-guarded like `_client` (a wave increments it
-  concurrently), and process-wide with no expiry — `reset_transport_memo()` is the
-  only way back, and `tests/conftest.py` calls it around every test so a latched host
-  can't decide the next test's routing. Deliberately not wired into `robots.py`: that
-  fetch happens once per origin, is cached, and must come from the origin, which is
-  why it escalates to `fallback.impersonate` on its own instead.
+  asked. Every rule around it exists because a wrong write-off routes a *healthy*
+  site through the recovery chain, so keep all four: only `counts_as_silence` (httpx
+  timeouts + network errors) latches, because the bare-`Exception` handler also
+  catches per-URL failures (`UnicodeEncodeError` on a malformed `Location`,
+  `InvalidURL`) that say nothing about the host; **any** response clears it
+  (`_note_response`, after the try/except, which the `HTTPStatusError` branch reaches
+  too) since refusing out loud is answering in one round-trip; a domain that has ever
+  answered joins `_answered` and is never written off again, because eight interleaved
+  workers make a count unable to distinguish "silent" from "slow on two big pages";
+  and blame goes to `_failed_host` (the failing request's URL, not the first hop of a
+  redirect the client followed inside one call). The skip is gated on
+  `fallback.configured_routes()` being non-empty, but that only knows route *names* —
+  `impersonate` declines on its own for an unset target, an out-of-scope host, or a
+  missing curl_cffi — so when `_recover` returns nothing the fetch **falls through to
+  `_send` anyway**: the memo is an optimization and must never be why a page is lost,
+  and that fetch succeeding is the only way back. `Extractor.extract` calls
+  `reset_transport_memo()` per crawl (the memo is evidence gathered during a crawl,
+  not a standing fact — a later crawl may run under a different UA or with
+  impersonation newly enabled), and `tests/conftest.py` resets it around every test.
+  Keyed through `frontier.domain_of` like every other host comparison, lock-guarded
+  like `_client`. Deliberately not wired into `robots.py`: that fetch happens once per
+  origin, is cached, and must come from the origin, which is why it escalates to
+  `fallback.impersonate` on its own instead.
   A route wins only if what it returned is plausibly the page: `recover()` measures
   `visible_text` (regex-stripped markup/script — not markitdown, which would buy
   parser fidelity to decide 554 vs 147,000) against
@@ -252,8 +262,12 @@ guard + transport-failure recovery + UA),
   — and keep it a *preference*: the fullest sub-threshold body is returned when no
   route clears the bar, so the threshold can only change which body comes back, never
   whether one does. PDFs are exempt (their content is in `raw_bytes`; `text` is empty
-  by contract). `_has_dom` is a different mechanism and stays: a within-route retry
-  for jina's html mode, not cross-route fall-through.
+  by contract). Its known cost is that a *genuinely* short page falls through too, so
+  a stub the origin-only `impersonate` route served reaches `jina`/`wayback`; the
+  answer is a lower threshold, not scoping the fall-through to non-disclosing routes
+  (impersonate-shell → jina-render is the exact case it exists for). `_has_dom` is a
+  different mechanism and stays: a within-route retry for jina's html mode, not
+  cross-route fall-through.
 - **Impersonation is two switches, both off, and neither is a transport swap.**
   `AWE_IMPERSONATE` (a curl_cffi target) buys a browser *fingerprint* while still
   sending the crawl's own attributable User-Agent — enough for CDNs that refuse on the

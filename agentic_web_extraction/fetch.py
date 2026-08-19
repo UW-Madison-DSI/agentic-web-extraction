@@ -114,22 +114,61 @@ def close_client() -> None:
 # increments this concurrently.
 _memo_lock = threading.Lock()
 _no_response: dict[str, int] = {}
-"""Registrable domain -> consecutive fetches that produced no response at all."""
+"""Registrable domain -> fetches there that produced no response at all."""
+_answered: set[str] = set()
+"""Registrable domains that have answered us at least once, ever.
+
+The memo's whole premise is a host that never talks to us. A host that served six
+pages and then read-timed-out on two big ones is slow, not silent -- and since
+workers interleave, the count alone cannot tell those apart (two failures can land
+after six successes and look consecutive). So a domain in here is never written
+off, whatever its count reaches.
+"""
 
 
 def reset_transport_memo() -> None:
-    """Forget every written-off host.
+    """Forget every written-off host, and every host known to answer.
 
-    The memo is process-wide, like the http clients, and nothing expires it: a
-    long-lived process that wants to re-test a host (or a test that must not leak
-    state into the next one) calls this.
+    Called at the start of each crawl (see ``Extractor.extract``): the memo is
+    evidence about the network gathered *during* a crawl, and a new crawl -- which
+    may run under a different User-Agent, or with impersonation newly enabled --
+    is entitled to re-test hosts an earlier one wrote off. Also process-wide state,
+    like the http clients, so tests reset it around each case.
     """
     with _memo_lock:
         _no_response.clear()
+        _answered.clear()
 
 
 def _memo_threshold() -> int:
     return get_settings().transport_memo_failures
+
+
+def counts_as_silence(exc: BaseException) -> bool:
+    """Whether `exc` means the origin never answered, as opposed to *this URL*
+    being unfetchable.
+
+    The fetch handler catches bare ``Exception`` on purpose -- a malformed
+    ``Location`` header raises ``UnicodeEncodeError``, a bad href raises
+    ``httpx.InvalidURL`` -- and none of that is evidence about the *host*. Writing a
+    domain off over two dead links would route a healthy site through the recovery
+    routes. Only a timeout or a network-level failure counts: nothing came back.
+    """
+    return isinstance(exc, httpx.TimeoutException | httpx.NetworkError)
+
+
+def _failed_host(url: str, exc: BaseException) -> str:
+    """The URL whose host actually failed, which is not always the one asked for.
+
+    The client follows redirects inside a single call, so a rebrand or a vanity
+    domain pointing at a tarpit fails on the *second* request -- and attributing
+    that to the first hop writes off a host that answers redirects fine in one
+    round-trip while the silent landing domain never accumulates a count. httpx
+    carries the failing request on the exception; fall back to the requested URL
+    when it doesn't (a non-httpx failure, or one raised before a request existed).
+    """
+    request = getattr(exc, "request", None)
+    return str(getattr(request, "url", "") or url)
 
 
 def _note_no_response(url: str) -> None:
@@ -143,7 +182,7 @@ def _note_no_response(url: str) -> None:
         return
     with _memo_lock:
         count = _no_response[domain] = _no_response.get(domain, 0) + 1
-        latched = count == threshold
+        latched = count == threshold and domain not in _answered
     if latched:
         logsink.emit(
             f"    [transport-memo] {domain} has not answered {count} time(s) — "
@@ -151,18 +190,21 @@ def _note_no_response(url: str) -> None:
         )
 
 
-def _note_response(url: str) -> None:
-    """Record that `url`'s host answered, whatever it answered with.
+def _note_response(*urls: str) -> None:
+    """Record that these hosts answered, whatever they answered with.
 
-    Any status clears the memo, 403 and 503 included: this tracks *silence*, and a
-    host that refuses out loud is a host that is talking to us -- one round-trip
-    per page, which is nothing to skip.
+    Any status counts, 403 and 503 included: this tracks *silence*, and a host that
+    refuses out loud is a host that is talking to us -- one round-trip per page,
+    which is nothing to skip. Both the requested and the resolved URL are passed on
+    a redirect: each host in the chain answered its part.
     """
-    domain = domain_of(url)
-    if not domain:
+    domains = {domain_of(url) for url in urls} - {""}
+    if not domains:
         return
     with _memo_lock:
-        _no_response.pop(domain, None)
+        _answered.update(domains)
+        for domain in domains:
+            _no_response.pop(domain, None)
 
 
 def _written_off(url: str) -> bool:
@@ -174,7 +216,7 @@ def _written_off(url: str) -> bool:
     if not domain:
         return False
     with _memo_lock:
-        return _no_response.get(domain, 0) >= threshold
+        return domain not in _answered and _no_response.get(domain, 0) >= threshold
 
 
 def _classify(content_type: str) -> Literal["html", "pdf", "skipped"]:
@@ -271,9 +313,10 @@ def fetch(url: str, *, user_agent: str = "") -> FetchedPage:
 
     # The host has already been proven not to answer this transport (see the memo
     # above), so don't spend the attempt budget finding that out again -- go to the
-    # routes that can still read it. Gated on there *being* such a route: with
-    # recovery disabled there is nothing to skip to, and skipping would turn a slow
-    # page into a lost one.
+    # routes that can still read it. Gated on a route being *named* at all, which
+    # skips the whole detour when recovery is disabled; whether the named routes can
+    # actually act here is only knowable by asking them, which is why declining
+    # falls back to the origin below rather than reporting an error.
     if _written_off(url) and fallback.configured_routes():
         logsink.emit(
             f"    [transport-memo] skipping the default transport for {url} — "
@@ -282,16 +325,16 @@ def fetch(url: str, *, user_agent: str = "") -> FetchedPage:
         recovered = _recover(url, settings.follow_pdf, user_agent)
         if recovered is not None:
             return recovered
-        return FetchedPage(
-            url=url,
-            status=0,
-            content_type="",
-            raw_bytes=b"",
-            text=(
-                f"fetch error: default transport written off for {domain_of(url)}, "
-                "recovery declined"
-            ),
-            kind="error",
+        # No route could act -- either they all declined, or the names in
+        # AWE_FETCH_FALLBACKS can't act *here* (impersonate declines outright when
+        # AWE_IMPERSONATE is unset, when the host is outside
+        # AWE_IMPERSONATE_DOMAINS, or when curl_cffi isn't installed, and
+        # `configured_routes` can't see any of that). So fall through and ask the
+        # origin after all. The memo is an optimization; it must never be the
+        # reason a page is lost, and a fetch that then succeeds clears it, which is
+        # also the only way back once a domain is written off.
+        logsink.emit(
+            f"    [transport-memo] no route could read {url} — asking the origin anyway"
         )
 
     try:
@@ -320,12 +363,18 @@ def fetch(url: str, *, user_agent: str = "") -> FetchedPage:
         # one that answers 403 with an interstitial. Handling only the second is
         # backwards: silence is the *less* polite refusal and it was the one
         # route that skipped recovery entirely. Logged distinctly because the
-        # diagnostics differ -- a status is evidence, silence isn't -- and the
-        # requested URL is what's passed, since by definition nothing resolved.
-        logsink.emit(f"    [transport] {type(exc).__name__} on {url} — no response")
-        # Before recovering: bank the proof. It is what lets the *next* URL on this
-        # host skip the attempt budget entirely.
-        _note_no_response(url)
+        # diagnostics differ -- a status is evidence, silence isn't -- and named
+        # after the host that failed, which on a redirect is not the one asked for.
+        # Recovery, though, is asked for the URL the *caller* wanted: a recovered
+        # body is always returned under that address.
+        failed = _failed_host(url, exc)
+        logsink.emit(f"    [transport] {type(exc).__name__} on {failed} — no response")
+        # Before recovering: bank the proof, but only if it is proof about the
+        # *host* rather than about this one URL (see `counts_as_silence`), and
+        # against the host that actually failed rather than the first hop of a
+        # redirect. It is what lets the next URL there skip the attempt budget.
+        if counts_as_silence(exc):
+            _note_no_response(failed)
         recovered = _recover(url, settings.follow_pdf, user_agent)
         if recovered is not None:
             return recovered
@@ -338,12 +387,13 @@ def fetch(url: str, *, user_agent: str = "") -> FetchedPage:
             kind="error",
         )
 
-    # A response arrived, whatever its status: this host talks to us, so any memo
-    # standing against it is stale. Both paths above that reach here have a
-    # response (the 5xx one arrives as `exc.response`).
-    _note_response(url)
-
     resolved_url = str(response.url)
+    # A response arrived, whatever its status: these hosts talk to us, so any memo
+    # standing against them is stale and they are never written off again. Both
+    # paths above that reach here have a response (the 5xx one arrives as
+    # `exc.response`), and on a redirect both ends of the chain answered.
+    _note_response(url, resolved_url)
+
     # Status guard. An error page is routinely served as text/html -- an edge-CDN
     # "Access Denied" interstitial, a themed 404 -- and classifying on
     # Content-Type alone would hand that body to the screener and the extraction

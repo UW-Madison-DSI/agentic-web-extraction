@@ -523,6 +523,12 @@ as a decline and the next route is tried. If none clears the bar, the fullest bo
 obtained is returned anyway — the threshold changes *which* body you get, never
 whether you get one. PDFs are exempt; they carry their content as bytes.
 
+The cost lands on genuinely short pages: a "this document has moved" stub served by
+`impersonate` (origin-only, nothing disclosed) also falls through, so its URL reaches
+`jina`/`wayback` even though the origin answered. If that matters more than the shell
+fix, lower the threshold rather than setting it to `0` — the shells it exists for
+measure in the tens of characters.
+
 Recovery costs something even when it fails. A tarpitted domain now spends a
 recovery attempt on top of its retries, which is why `AWE_FETCH_ATTEMPTS` caps read
 timeouts at two attempts (a tarpit is deterministic; the third try just spends
@@ -542,12 +548,25 @@ go straight to the recovery routes:
 [transport-memo] skipping the default transport for https://www.kohlercompany.com/about — kohlercompany.com has not answered
 ```
 
-Only *silence* latches it — a read timeout, a dropped connection, a malformed
-redirect header. Any response clears it, a 403 or a 503 included: that host is
-talking to us, in one round-trip, which is nothing to skip. And it only ever
-applies when at least one recovery route is configured, since with
-`AWE_FETCH_FALLBACKS=` empty there is nothing to skip *to* and skipping would turn
-a slow page into a lost one.
+It is deliberately hard to latch, because writing off a healthy site would route it
+through the recovery chain for the rest of the run:
+
+- Only *silence* counts — a timeout or a network-level failure. A malformed
+  `Location` header or an unfetchable URL says nothing about the host.
+- **Any** response clears it, a 403 or a 503 included: that host is talking to us, in
+  one round-trip, which is nothing to skip.
+- A domain that has answered even **once** is never written off, however many later
+  fetches time out. A site that served six pages and timed out on two big ones is
+  slow, not silent — and with eight workers interleaving, the count alone can't tell
+  those apart.
+- The failure is attributed to the host that actually failed, which on a redirect is
+  not the host you asked for.
+
+And it can't lose you a page: if no route can read a URL on a written-off domain, the
+origin is asked after all — which is also the only way back, since a fetch that
+succeeds clears the memo. Each `extract()` call starts by forgetting every written-off
+host, so a write-off lasts exactly as long as it pays for itself and a crawl under a
+new User-Agent (or with `AWE_IMPERSONATE` newly enabled) re-tests the world.
 
 ##### Impersonation is an escalation — decide it deliberately
 
@@ -710,7 +729,7 @@ Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your pr
 | Follow linked PDFs   | `AWE_FOLLOW_PDF`      | `true`                 |
 | Blocked-page recovery | `AWE_FETCH_FALLBACKS` | `jina,wayback` (ordered; `impersonate` also available; empty = drop blocked pages, no outbound call) |
 | Origin fetch attempts | `AWE_FETCH_ATTEMPTS`  | `3` (read timeouts capped at 2 regardless — a tarpit is deterministic) |
-| Write off a silent host after | `AWE_TRANSPORT_MEMO_FAILURES` | `2` unanswered fetches (per registrable domain, then straight to recovery; `0` disables) |
+| Write off a silent host after | `AWE_TRANSPORT_MEMO_FAILURES` | `2` unanswered fetches (per registrable domain, reset each crawl, never for a host that has answered; `0` disables) |
 | Minimum recovered text | `AWE_MIN_RECOVERED_TEXT_CHARS` | `200` visible characters (below it a route is treated as declining, so a rendering route is tried; `0` disables) |
 | Impersonation target | `AWE_IMPERSONATE`     | empty (off; `chrome`, `safari`, … — needs the `impersonate` extra) |
 | Impersonate with the browser's UA | `AWE_IMPERSONATE_BROWSER_UA` | `false` (true **drops attribution** — read the escalation note) |
