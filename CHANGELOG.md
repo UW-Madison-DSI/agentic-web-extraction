@@ -7,6 +7,8 @@ Release for the tag. An empty `## Unreleased` aborts the release.
 
 ## Unreleased
 
+## v0.2.3 — 2026-08-18
+
 - **A host that has gone silent is written off, instead of re-proving it per page.**
   An origin that tarpits non-browser clients refuses every URL identically and does
   it by not answering, so each page spent its whole attempt budget (~35s) before
