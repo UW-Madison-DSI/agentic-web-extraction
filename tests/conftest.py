@@ -10,9 +10,10 @@ import threading
 import pytest
 from pydantic import BaseModel, Field
 
-from agentic_web_extraction import fallback
+from agentic_web_extraction import fallback, fetch
 from agentic_web_extraction.config import Settings
 from agentic_web_extraction.extractor import Extractor
+from agentic_web_extraction.fallback import Recovered
 from agentic_web_extraction.fetch import FetchedPage
 from agentic_web_extraction.result import ScreenVerdict, Usage
 
@@ -93,6 +94,31 @@ class StubWeb:
 def page(*links: str) -> str:
     body = "".join(f'<a href="{href}">link to {href}</a>' for href in links)
     return f"<html><body><h1>Test page</h1><p>Body text.</p>{body}</body></html>"
+
+
+class Route:
+    """A recovery route that records its calls and returns a fixed result."""
+
+    def __init__(self, recovered: Recovered | None) -> None:
+        self.recovered = recovered
+        self.calls: list[tuple[str, str]] = []
+
+    def __call__(self, url: str, user_agent: str = "") -> Recovered | None:
+        self.calls.append((url, user_agent))
+        return self.recovered
+
+
+@pytest.fixture(autouse=True)
+def clean_transport_memo():
+    """Forget written-off hosts around every test.
+
+    `fetch`'s memo is process-wide, like the http clients it sits beside, so a test
+    that proves a host silent would otherwise decide how the next test's fetches are
+    routed.
+    """
+    fetch.reset_transport_memo()
+    yield
+    fetch.reset_transport_memo()
 
 
 class FakeImpersonateResponse:

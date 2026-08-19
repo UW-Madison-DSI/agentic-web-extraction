@@ -16,31 +16,25 @@ from agentic_web_extraction import fallback, fetch
 from agentic_web_extraction.config import Settings
 from agentic_web_extraction.fallback import Recovered
 
-from .conftest import StubWeb, page
+from .conftest import Route, StubWeb, page
 
 URL = "https://tarpit-test.org/corporate/index.html"
 BODY = "<html><body><h1>The page itself</h1></body></html>"
 
 
-def timing_out(exc: Exception | None = None):
-    """A client whose every request dies in transport, with no response at all."""
+def timing_out(exc: Exception | None = None, sent: list[str] | None = None):
+    """A client whose every request dies in transport, with no response at all.
+
+    `sent` (when given) records each URL that reached the wire, which is how the
+    memo tests below prove a fetch never attempted the origin at all.
+    """
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if sent is not None:
+            sent.append(str(request.url))
         raise exc or httpx.ReadTimeout("connection tarpitted", request=request)
 
     return httpx.Client(transport=httpx.MockTransport(handler))
-
-
-class Route:
-    """A recovery route that records its calls."""
-
-    def __init__(self, recovered: Recovered | None) -> None:
-        self.recovered = recovered
-        self.calls: list[tuple[str, str]] = []
-
-    def __call__(self, url: str, user_agent: str = "") -> Recovered | None:
-        self.calls.append((url, user_agent))
-        return self.recovered
 
 
 def html(body: str = BODY) -> Recovered:
@@ -61,14 +55,19 @@ def wired(monkeypatch):
     """
 
     def configure(
-        route: Route | None = None, *, exc: Exception | None = None, **updates
+        route: Route | None = None,
+        *,
+        exc: Exception | None = None,
+        sent: list[str] | None = None,
+        **updates,
     ) -> Route:
         settings = Settings(
             fetch_attempts=1, fetch_fallbacks="jina", llm_cache="", log_file=""
         ).model_copy(update=updates)
         monkeypatch.setattr(fetch, "get_settings", lambda: settings)
         monkeypatch.setattr(fallback, "get_settings", lambda: settings)
-        monkeypatch.setattr(fetch, "get_client", lambda: timing_out(exc))
+        client = timing_out(exc, sent)
+        monkeypatch.setattr(fetch, "get_client", lambda: client)
         route = route if route is not None else Route(html())
         monkeypatch.setitem(fallback._ROUTES, "jina", route)
         return route
@@ -153,6 +152,104 @@ def test_the_attempt_budget_is_configurable(monkeypatch):
     assert fetch._attempts_for(httpx.ConnectError("refused")) == 5
     # Still capped: the setting raises the transient budget, not the tarpit one.
     assert fetch._attempts_for(httpx.ReadTimeout("tarpit")) == 2
+
+
+# --- the per-host memo ------------------------------------------------------
+#
+# A host that tarpits refuses every URL identically, and refuses by going silent,
+# so the second proof is the last one worth paying for. Before this, each page
+# spent the whole attempt budget again — the incident was ~10 minutes of read
+# timeouts on one company's site.
+
+
+def test_a_silent_host_is_written_off_after_the_configured_proofs(wired):
+    sent: list[str] = []
+    route = wired(sent=sent)
+
+    for path in ("a", "b", "c", "d"):
+        fetch.fetch(f"https://tarpit-test.org/{path}")
+
+    # Two URLs proved it; the rest never touched the origin.
+    assert [url.rsplit("/", 1)[-1] for url in sent] == ["a", "b"]
+    # Every page still went to recovery, which is the point: pages are not lost,
+    # they are reached sooner.
+    assert [url.rsplit("/", 1)[-1] for url, _ua in route.calls] == ["a", "b", "c", "d"]
+
+
+def test_the_threshold_is_configurable(wired):
+    sent: list[str] = []
+    wired(sent=sent, transport_memo_failures=1)
+
+    fetch.fetch("https://tarpit-test.org/a")
+    fetch.fetch("https://tarpit-test.org/b")
+
+    assert [url.rsplit("/", 1)[-1] for url in sent] == ["a"]
+
+
+def test_the_memo_can_be_turned_off(wired):
+    sent: list[str] = []
+    wired(sent=sent, transport_memo_failures=0)
+
+    for path in ("a", "b", "c"):
+        fetch.fetch(f"https://tarpit-test.org/{path}")
+
+    assert len(sent) == 3
+
+
+def test_a_memoized_skip_that_recovers_nothing_still_reports_an_error(wired):
+    """The uniform error contract holds on the skipping path too."""
+    sent: list[str] = []
+    route = wired(Route(None), sent=sent)
+
+    fetch.fetch("https://tarpit-test.org/a")
+    fetch.fetch("https://tarpit-test.org/b")
+    result = fetch.fetch(URL)
+
+    assert sent == [
+        "https://tarpit-test.org/a",
+        "https://tarpit-test.org/b",
+    ]  # not URL
+    assert route.calls[-1][0] == URL
+    assert result.kind == "error"
+    assert result.status == 0
+    assert "written off" in result.text
+
+
+def test_recovery_disabled_never_skips_the_origin(wired):
+    """With nothing to skip *to*, the memo must not turn a slow page into a lost
+    one: the origin is still attempted, however hopeless it has proven."""
+    sent: list[str] = []
+    wired(sent=sent, fetch_fallbacks="")
+
+    for path in ("a", "b", "c"):
+        fetch.fetch(f"https://tarpit-test.org/{path}")
+
+    assert len(sent) == 3
+
+
+def test_any_response_clears_the_memo(wired):
+    """The memo tracks *silence*. A 403 is a host talking to us — one round-trip
+    per page, which is nothing to skip — so it must not keep a host written off."""
+    wired()
+
+    fetch._note_no_response(URL)
+    fetch._note_no_response(URL)
+    assert fetch._written_off(URL)
+
+    fetch._note_response("https://tarpit-test.org/somewhere-else")
+
+    assert not fetch._written_off(URL)
+
+
+def test_the_memo_is_keyed_on_the_registrable_domain(wired):
+    """Same host matching as the crawl boundary and the robots overrides."""
+    wired()
+
+    fetch._note_no_response("https://tarpit-test.org/a")
+    fetch._note_no_response("https://cdn.tarpit-test.org/b")
+
+    assert fetch._written_off("https://www.tarpit-test.org/c")
+    assert not fetch._written_off("https://elsewhere-test.com/c")
 
 
 # --- through the traversal --------------------------------------------------

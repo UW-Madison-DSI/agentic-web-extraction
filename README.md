@@ -508,16 +508,46 @@ order:
 | `jina` | `r.jina.ai` renders the URL server-side and returns it — also reads PDFs, so a blocked document comes back as text | Live content, but a third party sees the URL; anonymous requests are rate-limited (set `JINA_API_KEY`) |
 | `wayback` | The Internet Archive's newest successful capture, served with the `id_` modifier so bytes come back unrewritten | Free and stable, but as stale as the capture — bound it with `AWE_WAYBACK_MAX_AGE_DAYS` |
 
-The first route that returns content wins; if all decline, the page becomes
+The first route that returns **the page** wins; if all decline, the page becomes
 `kind="error"` and the traversal skips it at no LLM cost and no budget slot. When
 `impersonate` is enabled, list it **first** — it costs one direct request to the
 origin instead of a third-party round trip.
+
+"The page" is doing work there. A 200 carrying a client-rendered shell — a few
+hundred bytes of empty containers, the content arriving later by script — used to
+end the chain, because *a body arrived* was read as *the page was obtained*: one
+homepage came back as 554 bytes through `impersonate`, which fetches raw HTML and
+runs no JS, where `jina` rendered the same URL to 147KB. So a body with less than
+`AWE_MIN_RECOVERED_TEXT_CHARS` of visible text (markup and script stripped) counts
+as a decline and the next route is tried. If none clears the bar, the fullest body
+obtained is returned anyway — the threshold changes *which* body you get, never
+whether you get one. PDFs are exempt; they carry their content as bytes.
 
 Recovery costs something even when it fails. A tarpitted domain now spends a
 recovery attempt on top of its retries, which is why `AWE_FETCH_ATTEMPTS` caps read
 timeouts at two attempts (a tarpit is deterministic; the third try just spends
 another 30s to be refused identically). If you'd rather not pay any of it, set
 `AWE_FETCH_FALLBACKS=` empty — the status guard stays, and no outbound call is made.
+
+The same reasoning applies across pages, not just across attempts. A host that
+tarpits refuses every URL identically and refuses by *going silent*, so without a
+memory each page pays the whole attempt budget again — ~35s apiece, and a crawl of
+one such site was observed spending ~10 minutes doing exactly that. After
+`AWE_TRANSPORT_MEMO_FAILURES` unanswered fetches (default `2`, `0` disables) the
+registrable domain is written off for the rest of the process and later URLs there
+go straight to the recovery routes:
+
+```
+[transport-memo] kohlercompany.com has not answered 2 time(s) — later fetches there go straight to recovery
+[transport-memo] skipping the default transport for https://www.kohlercompany.com/about — kohlercompany.com has not answered
+```
+
+Only *silence* latches it — a read timeout, a dropped connection, a malformed
+redirect header. Any response clears it, a 403 or a 503 included: that host is
+talking to us, in one round-trip, which is nothing to skip. And it only ever
+applies when at least one recovery route is configured, since with
+`AWE_FETCH_FALLBACKS=` empty there is nothing to skip *to* and skipping would turn
+a slow page into a lost one.
 
 ##### Impersonation is an escalation — decide it deliberately
 
@@ -680,6 +710,8 @@ Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your pr
 | Follow linked PDFs   | `AWE_FOLLOW_PDF`      | `true`                 |
 | Blocked-page recovery | `AWE_FETCH_FALLBACKS` | `jina,wayback` (ordered; `impersonate` also available; empty = drop blocked pages, no outbound call) |
 | Origin fetch attempts | `AWE_FETCH_ATTEMPTS`  | `3` (read timeouts capped at 2 regardless — a tarpit is deterministic) |
+| Write off a silent host after | `AWE_TRANSPORT_MEMO_FAILURES` | `2` unanswered fetches (per registrable domain, then straight to recovery; `0` disables) |
+| Minimum recovered text | `AWE_MIN_RECOVERED_TEXT_CHARS` | `200` visible characters (below it a route is treated as declining, so a rendering route is tried; `0` disables) |
 | Impersonation target | `AWE_IMPERSONATE`     | empty (off; `chrome`, `safari`, … — needs the `impersonate` extra) |
 | Impersonate with the browser's UA | `AWE_IMPERSONATE_BROWSER_UA` | `false` (true **drops attribution** — read the escalation note) |
 | Impersonation scope  | `AWE_IMPERSONATE_DOMAINS` | empty (every host; comma-separated domains to scope it) |

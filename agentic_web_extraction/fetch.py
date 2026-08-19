@@ -13,6 +13,7 @@ from tenacity import (
 
 from . import fallback, logsink
 from .config import get_settings
+from .frontier import domain_of
 
 USER_AGENT = "agentic-web-extraction/0.1 (+https://github.com/)"
 """Fallback User-Agent: what the crawl sends when nothing configures one.
@@ -96,6 +97,84 @@ def close_client() -> None:
         if _client is not None:
             _client.close()
             _client = None
+
+
+# --- the "this host does not answer us" memo --------------------------------
+#
+# An origin that tarpits non-browser clients refuses every URL the same way, and
+# it refuses by going silent, so each page spends its whole attempt budget (two
+# read timeouts, ~35s) before recovery is reached -- once per page, for as many
+# pages as the crawl visits there. This remembers the refusal per registrable
+# domain and skips the default transport once it has been proven, so a wave costs
+# one recovery attempt per page instead of a timeout plus a recovery attempt.
+#
+# Kept here rather than in [fallback.py](fallback.py) on purpose: it is a fact
+# about the default transport, and that module must stay ignorant of which host is
+# being asked (see its own note). Lock-guarded like `_client` -- a wave of workers
+# increments this concurrently.
+_memo_lock = threading.Lock()
+_no_response: dict[str, int] = {}
+"""Registrable domain -> consecutive fetches that produced no response at all."""
+
+
+def reset_transport_memo() -> None:
+    """Forget every written-off host.
+
+    The memo is process-wide, like the http clients, and nothing expires it: a
+    long-lived process that wants to re-test a host (or a test that must not leak
+    state into the next one) calls this.
+    """
+    with _memo_lock:
+        _no_response.clear()
+
+
+def _memo_threshold() -> int:
+    return get_settings().transport_memo_failures
+
+
+def _note_no_response(url: str) -> None:
+    """Record that `url` produced no response, and log the moment its domain is
+    written off (once -- crossing the threshold, not every fetch after it)."""
+    threshold = _memo_threshold()
+    if threshold <= 0:
+        return
+    domain = domain_of(url)
+    if not domain:
+        return
+    with _memo_lock:
+        count = _no_response[domain] = _no_response.get(domain, 0) + 1
+        latched = count == threshold
+    if latched:
+        logsink.emit(
+            f"    [transport-memo] {domain} has not answered {count} time(s) — "
+            f"later fetches there go straight to recovery"
+        )
+
+
+def _note_response(url: str) -> None:
+    """Record that `url`'s host answered, whatever it answered with.
+
+    Any status clears the memo, 403 and 503 included: this tracks *silence*, and a
+    host that refuses out loud is a host that is talking to us -- one round-trip
+    per page, which is nothing to skip.
+    """
+    domain = domain_of(url)
+    if not domain:
+        return
+    with _memo_lock:
+        _no_response.pop(domain, None)
+
+
+def _written_off(url: str) -> bool:
+    """Whether the default transport has been proven hopeless for `url`'s host."""
+    threshold = _memo_threshold()
+    if threshold <= 0:
+        return False
+    domain = domain_of(url)
+    if not domain:
+        return False
+    with _memo_lock:
+        return _no_response.get(domain, 0) >= threshold
 
 
 def _classify(content_type: str) -> Literal["html", "pdf", "skipped"]:
@@ -189,6 +268,32 @@ def fetch(url: str, *, user_agent: str = "") -> FetchedPage:
     only -- pass the caller's own string so the header on the wire always names the
     Extractor that asked, whatever another Extractor configured meanwhile."""
     settings = get_settings()
+
+    # The host has already been proven not to answer this transport (see the memo
+    # above), so don't spend the attempt budget finding that out again -- go to the
+    # routes that can still read it. Gated on there *being* such a route: with
+    # recovery disabled there is nothing to skip to, and skipping would turn a slow
+    # page into a lost one.
+    if _written_off(url) and fallback.configured_routes():
+        logsink.emit(
+            f"    [transport-memo] skipping the default transport for {url} — "
+            f"{domain_of(url)} has not answered"
+        )
+        recovered = _recover(url, settings.follow_pdf, user_agent)
+        if recovered is not None:
+            return recovered
+        return FetchedPage(
+            url=url,
+            status=0,
+            content_type="",
+            raw_bytes=b"",
+            text=(
+                f"fetch error: default transport written off for {domain_of(url)}, "
+                "recovery declined"
+            ),
+            kind="error",
+        )
+
     try:
         response = _send(url, user_agent)
     except httpx.HTTPStatusError as exc:
@@ -218,6 +323,9 @@ def fetch(url: str, *, user_agent: str = "") -> FetchedPage:
         # diagnostics differ -- a status is evidence, silence isn't -- and the
         # requested URL is what's passed, since by definition nothing resolved.
         logsink.emit(f"    [transport] {type(exc).__name__} on {url} — no response")
+        # Before recovering: bank the proof. It is what lets the *next* URL on this
+        # host skip the attempt budget entirely.
+        _note_no_response(url)
         recovered = _recover(url, settings.follow_pdf, user_agent)
         if recovered is not None:
             return recovered
@@ -229,6 +337,11 @@ def fetch(url: str, *, user_agent: str = "") -> FetchedPage:
             text=f"fetch error: {exc!r}",
             kind="error",
         )
+
+    # A response arrived, whatever its status: this host talks to us, so any memo
+    # standing against it is stale. Both paths above that reach here have a
+    # response (the 5xx one arrives as `exc.response`).
+    _note_response(url)
 
     resolved_url = str(response.url)
     # Status guard. An error page is routinely served as text/html -- an edge-CDN

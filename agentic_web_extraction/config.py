@@ -50,6 +50,23 @@ class Settings(BaseSettings):
     # to be refused identically. Recovery (below) is the thing that can actually
     # turn that page back into content, so get there sooner.
     fetch_attempts: int = 3
+    # How many *unanswered* fetches on one registrable domain write the default
+    # transport off for the rest of the process (env: AWE_TRANSPORT_MEMO_FAILURES,
+    # 0 disables). "Unanswered" means no response arrived at all -- a read timeout,
+    # a dropped connection, a malformed redirect header. An origin that tarpits
+    # non-browser clients does that to every URL, so without a memo each page pays
+    # the whole attempt budget again (~35s apiece, and a crawl of one such host was
+    # observed spending ~10 minutes on it) before reaching the recovery that can
+    # actually read it. Once the count is reached, later URLs on that domain skip
+    # straight to the routes in fetch_fallbacks -- and only when at least one route
+    # is configured, since with recovery off there is nothing to skip to.
+    #
+    # Any response clears the count, including a 403 or a 5xx: this is a memo about
+    # silence, and a host that refuses out loud is answering. Status refusals
+    # deliberately never latch it -- they come back in one round-trip, so skipping
+    # them saves no time while widening the chance of writing off a host over one
+    # page's 403.
+    transport_memo_failures: int = 2
     # Ordered, comma-separated recovery routes tried when a fetch fails to
     # produce content (env: AWE_FETCH_FALLBACKS) -- a non-2xx response, or no
     # response at all (a connection dropped or tarpitted by an edge CDN that
@@ -79,6 +96,19 @@ class Settings(BaseSettings):
     # zero when the criterion is time-sensitive and a years-old capture would be
     # worse than no page at all.
     wayback_max_age_days: int = 0
+    # Minimum visible-text length (characters, markup and script stripped) for a
+    # recovered body to be accepted as the page (env: AWE_MIN_RECOVERED_TEXT_CHARS,
+    # 0 disables). A route that answers 200 with a client-rendered shell -- one
+    # observed homepage came back as 554 bytes of empty <div>s, where a rendering
+    # route returned 147KB for the same URL -- otherwise ends the chain, because
+    # "a body arrived" was read as "the page was obtained". Under the threshold the
+    # route is treated as a decline and the next one is tried.
+    #
+    # Never a way to lose a page: if no route clears the threshold, the fullest body
+    # obtained is returned anyway, so the only cost for a genuinely short page is an
+    # extra request to routes already configured. PDFs are exempt (their text is
+    # carried as bytes, not as `text`).
+    min_recovered_text_chars: int = 200
     # curl_cffi impersonation target for the "impersonate" recovery route
     # (env: AWE_IMPERSONATE) -- "chrome", "chrome124", "safari", "firefox", "edge".
     # Empty (the default) disables the route entirely, so nothing changes for an

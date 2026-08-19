@@ -7,6 +7,36 @@ Release for the tag. An empty `## Unreleased` aborts the release.
 
 ## Unreleased
 
+- **A host that has gone silent is written off, instead of re-proving it per page.**
+  An origin that tarpits non-browser clients refuses every URL identically and does
+  it by not answering, so each page spent its whole attempt budget (~35s) before
+  reaching the recovery that could read it — one crawl spent ~10 minutes that way on
+  a single site. After `AWE_TRANSPORT_MEMO_FAILURES` unanswered fetches (default
+  `2`, `0` restores the old behavior) the registrable domain is written off for the
+  rest of the process and later URLs there go straight to `AWE_FETCH_FALLBACKS`.
+  - Only *silence* latches it — read timeout, dropped connection, malformed redirect
+    header. **Any** response clears it, 403 and 503 included: a host that refuses out
+    loud is answering, in one round-trip, which is nothing to skip.
+  - Never applies with recovery disabled: with no route to skip *to*, skipping would
+    turn a slow page into a lost one. Logged per URL (`[transport-memo]`), and
+    `fetch.reset_transport_memo()` clears it in a long-lived process.
+- **Fixed — a client-rendered shell no longer ends the recovery chain.** A route that
+  answered `200` with a few hundred bytes of empty containers won, because "a body
+  arrived" was read as "the page was obtained": one homepage came back as 554 bytes
+  through `impersonate` (raw HTML, no JS) where `jina` rendered the same URL to
+  147KB, and `jina` was never asked. A body with less than
+  `AWE_MIN_RECOVERED_TEXT_CHARS` of visible text (default `200`, `0` disables) is now
+  treated as a decline and the next route is tried.
+  - It reorders the chain; it cannot lose a page. If no route clears the bar, the
+    fullest body obtained is returned anyway. PDFs are exempt — they carry their
+    content as bytes, not as text.
+  - **What this changes for you:** with `jina`/`wayback` configured, a shell-serving
+    site now discloses those URLs to the reader/archive where an earlier route used
+    to end the chain.
+- **Tests** — `tests/test_thin_content.py` for the chain fall-through, plus memo
+  coverage in `tests/test_fetch_recovery.py` (latch, threshold, clear-on-any-response,
+  registrable-domain keying, and the no-route-configured guard).
+
 ## v0.2.2 — 2026-08-18
 
 Pages lost to *transport-level* blocking are now recoverable. Cut this as a

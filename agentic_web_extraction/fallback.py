@@ -37,6 +37,15 @@ Three retrieval routes, tried in the order named by ``AWE_FETCH_FALLBACKS``:
     modifier so the bytes come back unrewritten. Not live -- bound the staleness
     with ``AWE_WAYBACK_MAX_AGE_DAYS`` when currency matters.
 
+A route only wins if what it returned is plausibly the page. A 200 carrying a
+client-rendered shell -- a few hundred bytes of empty containers, with the content
+arriving later by script -- used to end the chain, because "a body arrived" was read
+as "the page was obtained": one homepage came back as 554 bytes through
+``impersonate`` (raw HTML, no JS) where ``jina`` rendered the same URL to 147KB. So
+a body under ``AWE_MIN_RECOVERED_TEXT_CHARS`` of visible text counts as a decline
+and the next route is tried. If none clears it, the fullest body obtained is
+returned anyway -- the threshold reorders the chain, it never loses a page.
+
 All three are opinionated only about *retrieval*. Content selection,
 normalization, and link policy stay where they already live, and nothing here
 knows about any particular site: the chain is driven by whether a body was
@@ -494,6 +503,32 @@ def _via_impersonate(url: str, user_agent: str = "") -> Recovered | None:
     )
 
 
+# --- is this body plausibly the page? ---------------------------------------
+
+# `.*?` with DOTALL, closed on the same tag name: a page's inline scripts are where
+# most of a shell's bytes live, so measuring length without dropping them measures
+# the framework, not the content.
+_SCRIPT_OR_STYLE = re.compile(
+    r"<(script|style)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL
+)
+_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+_TAG = re.compile(r"<[^>]+>")
+
+
+def visible_text(body: str) -> str:
+    """The text a reader would see in ``body``, whitespace collapsed.
+
+    Regex, deliberately, and not [normalize.py](normalize.py)'s markitdown pass:
+    this runs on every recovered body and all it has to decide is a magnitude (554
+    characters vs 147,000), which no amount of parser fidelity would change. It is
+    also why this module still imports nothing from the fetch path.
+    """
+    text = _SCRIPT_OR_STYLE.sub(" ", body)
+    text = _COMMENT.sub(" ", text)
+    text = _TAG.sub(" ", text)
+    return " ".join(html_module.unescape(text).split())
+
+
 _ROUTES: dict[str, Callable[[str, str], Recovered | None]] = {
     "impersonate": _via_impersonate,
     "jina": _via_jina,
@@ -532,7 +567,7 @@ def configured_routes() -> list[str]:
 
 
 def recover(url: str, *, user_agent: str = "") -> Recovered | None:
-    """Try each configured route in order; the first that yields content wins.
+    """Try each configured route in order; the first that yields the page wins.
 
     ``user_agent`` overrides the configured default for these requests only, so the
     reader/archive -- or, on the impersonate route, the origin itself -- sees the
@@ -540,9 +575,36 @@ def recover(url: str, *, user_agent: str = "") -> Recovered | None:
     when recovery is disabled, every route declines, or the URL simply isn't
     available anywhere -- the caller then degrades the page to ``kind="error"``,
     which the traversal skips at no LLM cost.
+
+    "Yields the page" means a body carrying at least
+    ``AWE_MIN_RECOVERED_TEXT_CHARS`` of visible text. A route that answers with a
+    client-rendered shell is treated as having declined, so a rendering route later
+    in the chain still gets asked; the fullest shell is kept as a last resort, so
+    the threshold can only change *which* body is returned, never whether one is.
+    PDFs are exempt -- they carry their content as bytes, not as ``text``.
     """
+    minimum = get_settings().min_recovered_text_chars
+    best: Recovered | None = None
+    best_chars = -1
     for name in configured_routes():
         recovered = _ROUTES[name](url, user_agent)
-        if recovered is not None:
+        if recovered is None:
+            continue
+        if minimum <= 0 or "pdf" in recovered.content_type.lower():
             return recovered
-    return None
+        chars = len(visible_text(recovered.text))
+        if chars >= minimum:
+            return recovered
+        logsink.emit(
+            f"    [fallback:{name}] {url} came back with {chars} characters of "
+            f"text (minimum {minimum}) — reads like a client-rendered shell, "
+            f"trying the next route"
+        )
+        if chars > best_chars:
+            best, best_chars = recovered, chars
+    if best is not None:
+        logsink.emit(
+            f"    [fallback] no route cleared the {minimum}-character minimum for "
+            f"{url} — keeping the fullest body ({best.via}, {best_chars} characters)"
+        )
+    return best

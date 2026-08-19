@@ -225,6 +225,35 @@ guard + transport-failure recovery + UA),
   with read timeouts capped at 2 attempts however high it is set: a tarpit is
   deterministic, so the later attempts spend the read timeout again to be refused
   identically while holding a worker slot the wave waits on.
+  The same reasoning across *pages* is the transport memo in `fetch.py`:
+  `AWE_TRANSPORT_MEMO_FAILURES` (default 2, 0 = off) unanswered fetches write the
+  registrable domain off for the process, and later URLs there skip `_send` for
+  `_recover`. It lives in `fetch.py`, not `fallback.py` — it is a fact about the
+  *default transport*, and `fallback.py` must stay ignorant of which host is being
+  asked. Only *silence* latches it (`_note_no_response` from the bare-`Exception`
+  handler); **any** response clears it (`_note_response`, after the try/except, which
+  the `HTTPStatusError` branch reaches too) because a host refusing out loud is
+  answering in one round-trip — there is nothing to skip, and latching on a status
+  would write off a host over one page's 403. The skip is gated on
+  `fallback.configured_routes()` being non-empty: with nothing to skip *to* it would
+  turn a slow page into a lost one. Keyed through `frontier.domain_of` like every
+  other host comparison, lock-guarded like `_client` (a wave increments it
+  concurrently), and process-wide with no expiry — `reset_transport_memo()` is the
+  only way back, and `tests/conftest.py` calls it around every test so a latched host
+  can't decide the next test's routing. Deliberately not wired into `robots.py`: that
+  fetch happens once per origin, is cached, and must come from the origin, which is
+  why it escalates to `fallback.impersonate` on its own instead.
+  A route wins only if what it returned is plausibly the page: `recover()` measures
+  `visible_text` (regex-stripped markup/script — not markitdown, which would buy
+  parser fidelity to decide 554 vs 147,000) against
+  `AWE_MIN_RECOVERED_TEXT_CHARS` (default 200, 0 = off) and treats a thinner body as
+  a decline, so a client-rendered shell from a raw-HTML route falls through to a
+  rendering one. Keep the check in `recover()`, route-agnostic — the routes stay dumb
+  — and keep it a *preference*: the fullest sub-threshold body is returned when no
+  route clears the bar, so the threshold can only change which body comes back, never
+  whether one does. PDFs are exempt (their content is in `raw_bytes`; `text` is empty
+  by contract). `_has_dom` is a different mechanism and stays: a within-route retry
+  for jina's html mode, not cross-route fall-through.
 - **Impersonation is two switches, both off, and neither is a transport swap.**
   `AWE_IMPERSONATE` (a curl_cffi target) buys a browser *fingerprint* while still
   sending the crawl's own attributable User-Agent — enough for CDNs that refuse on the
