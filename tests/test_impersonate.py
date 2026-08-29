@@ -197,7 +197,9 @@ OFF_SITE = "https://elsewhere-test.com/x"
 class ImpersonatedWeb(StubWeb):
     """A stub web whose pages all arrive through the escalated transport."""
 
-    def fetch(self, url: str, *, user_agent: str = ""):
+    def fetch(
+        self, url: str, *, user_agent: str = "", min_delay: float = 0.0, settings=None
+    ):
         return replace(
             super().fetch(url, user_agent=user_agent), via="impersonate:chrome"
         )

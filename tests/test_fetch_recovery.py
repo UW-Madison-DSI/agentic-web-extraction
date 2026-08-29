@@ -378,7 +378,9 @@ SEED = "https://tarpit-test.org/"
 class RecoveredWeb(StubWeb):
     """A stub web whose pages all arrive by way of a recovery route."""
 
-    def fetch(self, url: str, *, user_agent: str = ""):
+    def fetch(
+        self, url: str, *, user_agent: str = "", min_delay: float = 0.0, settings=None
+    ):
         return replace(super().fetch(url, user_agent=user_agent), via="jina")
 
 

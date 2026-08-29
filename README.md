@@ -127,6 +127,12 @@ Optional:
 - **Always summarize** — `always_summarize` (default `False`). Run the map-reduce summarization even when the concatenated pages already fit the context budget, to compress boilerplate into a criteria/schema-aware retention list and shrink the extraction call. Costs one summarize call per page and makes the pipeline's lossy step unconditional.
 - **Output cap** — `max_output_tokens` (default `0`, meaning no cap: the endpoint's own limit applies). A backstop for degenerate generation on the extract model. A JSON grammar permits arbitrary whitespace between tokens, so schema-guided decoding can't break a repetition loop the way it would for a malformed key — a model that falls into one emits blank indentation until something stops it. Uncapped, that's the endpoint's limit, which can outlast the client read timeout; the call then surfaces as a timeout and is silently re-sent by the SDK's own retries, so a single extraction can burn many minutes without a recoverable error ever reaching you. Setting a cap converts that into a prompt failure you can catch and re-roll. Size it above the largest legitimate extraction for your schema — a cap below that truncates good output.
 - **Wave concurrency** — `max_workers` (default `8`). How many top-scored links are fetched/screened/scored at once. `1` = strictly sequential best-first.
+- **Request pacing** — `request_delay` (`AWE_REQUEST_DELAY`, default `0.5`) is the minimum gap between the *starts* of two fetches to one registrable domain, and `max_per_domain` (`AWE_MAX_PER_DOMAIN`, default `0` = no cap) bounds how many are in flight there at once. **This is the one default that slows a crawl**, and it is deliberate: the crawl boundary exists to keep a traversal on one site, so `max_workers` workers concentrate on a single origin. `0.5s` caps one origin at ~2 requests/second however many workers run — inside what the per-page LLM stages sustain anyway. Set `0` for the pre-0.3 behaviour. With `respect_robots` on, an origin's own `Crawl-delay` wins when it asks for more.
+- **Main-content filtering** — `main_content_only` (`AWE_MAIN_CONTENT_ONLY`, default `False`). Drops `script`/`style`/`noscript`/`template`, plus `header`/`footer`/`nav`/`aside` elements that are **not** inside a `main` or `article`, before the HTML→Markdown conversion. That exception is the point: an article's own `<header>` holds its title and date, which is exactly what a schema asks for. Off by default because it is lossy in *your* results. It governs the markdown only — link discovery reads the unfiltered HTML, so a filtered-out nav still gets scored.
+- **Link cap** — `max_links_per_page` (`AWE_MAX_LINKS_PER_PAGE`, default `0` = no cap). Bounds what one mega-navigation page costs the link scorer. Off by default because truncating is lossy. Applied *after* links the crawl has already seen are removed, so a site-wide nav can't consume the whole allowance on every page. (Links whose extension no fetch could read as a page — `.zip`, `.jpg`, `.css`, `.docx` — are *always* dropped before scoring: they were fetched and classified `skipped` anyway, so that one is free.)
+- **Thin-page recovery** — `min_page_text_chars` (`AWE_MIN_PAGE_TEXT_CHARS`, default `0` = off). A 200 carrying less visible text than this counts as a failure to *obtain* content, so the recovery chain gets a turn at rendering it — the single-page-app case, which otherwise passes the status guard and is silently screened out. The recovered body only wins if it is fuller than the origin's.
+- **Sitemap seeding** — `use_sitemap` (`AWE_USE_SITEMAP`, default `False`). Reads each seed origin's sitemap and offers its URLs to the link scorer before traversing, so the frontier starts with pages the site advertises. Discovered URLs are scored, boundary-gated and robots-checked like any other link. Sitemap *documents* are restricted to the seed's own registrable domain — the locations are named by the site being crawled, so an unscoped fetch would let an origin point the client at any address it liked.
+- **Progress events** — `on_event`, a callable receiving a `logsink.Event(kind, message)` for every line the crawl emits, for the duration of `extract`. `kind` is the bracketed tag (`fetch`, `blocked`, `robots`, …), so you can render progress without parsing stderr.
 - **Direct extraction** — `seed_is_content` (default `False`). When `True`, every seed URL is taken to *be* the content: the pre-screen is skipped (seeds are treated as guaranteed matches) and link-scoring is skipped (no links are queued), so the agent fetches just the seeds, consolidates them, extracts once, and stops. Use it when every seed is already a known target page and you only want the structured extraction — it skips the discovery machinery and the screen/score LLM calls entirely.
 - **Same-domain preference** — `prefer_seed_domain` (default `False`). When `True`, the pre-screen and link-scorer calls are told the seed URL(s), the page/link URL, and a Python-computed `on_seed_domain` signal (on *any* seed's domain, for multi-seed runs), with an instruction to *disfavor* off-domain pages and links. The LLM applies it as a soft preference, not a filter — a clearly on-target off-domain page still matches / scores high, and nothing is excluded. Comparison is at the registrable-domain (eTLD+1) level via the Public Suffix List, so all of `*.wisc.edu` count as one domain.
 - **Crawl boundary** — `allowed_domains` (default `None`, unrestricted). A default-deny list of registrable domains a scored link may be queued from; every seed's own domain is added automatically, so `[]` means "the seeds' sites and nowhere else". The only *hard* navigation limit in the library. Paired with `allow_seed_redirect_domains` (default `False`), which opts into widening the boundary to wherever a seed redirects, so a site that rebrands or moves host doesn't dead-end the crawl — off by default because it is the one way a party other than the caller can grow the set.
@@ -672,7 +678,13 @@ uv run awe extract \
   --max-fetches 10
 ```
 
-The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunities`) or a path to a Python file (`./schemas.py:Opportunities`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Repeat `--seed-url` to pool several seeds into one extraction (`--seed-url URL1 --seed-url URL2`); the fetch budget applies per seed. Add `--max-context-tokens N` to change the extraction input budget (over it, pages are summarized down; defaults to `AWE_MAX_CONTEXT_TOKENS`), `--always-summarize` to summarize even when the pages already fit that budget (`--no-always-summarize` forces it off, the default; omit to use `AWE_ALWAYS_SUMMARIZE`), and `--max-workers N` to change wave concurrency (defaults to `AWE_MAX_WORKERS`). Add `--seed-is-content` to treat the seeds as the content directly — skip the pre-screen and link-scoring, consolidate the seeds, and extract (`--no-seed-is-content` forces it off, the default; omit to use `AWE_SEED_IS_CONTENT`). Add `--prefer-seed-domain` to softly disfavor off-domain pages/links (the LLM is told the seed/page URL and an on-domain signal; `--no-prefer-seed-domain` forces it off, the default; omit to use `AWE_PREFER_SEED_DOMAIN`). Add `--allowed-domain glpf.org` (repeatable) to impose the hard crawl boundary — links off the listed domains are never queued; seed domains are included automatically, and `--allow-seed-redirect-domains` opts into letting a redirecting seed widen it (off by default). Add `--user-agent "my-pipeline/1.0 (+https://example.edu/crawler)"` to identify the crawler (defaults to `AWE_USER_AGENT`), `--respect-robots` to honor robots.txt before each fetch (`--no-respect-robots` forces it off, the default; omit to use `AWE_RESPECT_ROBOTS`), and `--robots-override site.org` (repeatable) to exempt a domain from that check. Add `--log-file run.log` to also write a timestamped log file (off by default — no path, no file; see [Logging](#logging)). Add `--no-cache` to disable the on-by-default LLM-response cache (equivalently `AWE_LLM_CACHE=`). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
+The `--schema` flag takes either a dotted import path (`my_pkg.schemas:Opportunities`) or a path to a Python file (`./schemas.py:Opportunities`) — in both cases followed by `:ClassName`. Criteria can be a quoted string or `@path/to/criteria.txt`. Repeat `--seed-url` to pool several seeds into one extraction (`--seed-url URL1 --seed-url URL2`); the fetch budget applies per seed. Add `--max-context-tokens N` to change the extraction input budget (over it, pages are summarized down; defaults to `AWE_MAX_CONTEXT_TOKENS`), `--always-summarize` to summarize even when the pages already fit that budget (`--no-always-summarize` forces it off, the default; omit to use `AWE_ALWAYS_SUMMARIZE`), and `--max-workers N` to change wave concurrency (defaults to `AWE_MAX_WORKERS`). Add `--seed-is-content` to treat the seeds as the content directly — skip the pre-screen and link-scoring, consolidate the seeds, and extract (`--no-seed-is-content` forces it off, the default; omit to use `AWE_SEED_IS_CONTENT`). Add `--prefer-seed-domain` to softly disfavor off-domain pages/links (the LLM is told the seed/page URL and an on-domain signal; `--no-prefer-seed-domain` forces it off, the default; omit to use `AWE_PREFER_SEED_DOMAIN`). Add `--allowed-domain glpf.org` (repeatable) to impose the hard crawl boundary — links off the listed domains are never queued; seed domains are included automatically, and `--allow-seed-redirect-domains` opts into letting a redirecting seed widen it (off by default). Add `--user-agent "my-pipeline/1.0 (+https://example.edu/crawler)"` to identify the crawler (defaults to `AWE_USER_AGENT`), `--respect-robots` to honor robots.txt before each fetch (`--no-respect-robots` forces it off, the default; omit to use `AWE_RESPECT_ROBOTS`), and `--robots-override site.org` (repeatable) to exempt a domain from that check. Add `--log-file run.log` to also write a timestamped log file (off by default — no path, no file; see [Logging](#logging)). Add `--request-delay 0.5` / `--max-per-domain 2` to change per-domain pacing (defaults to `AWE_REQUEST_DELAY` / `AWE_MAX_PER_DOMAIN`), `--main-content-only` to strip site chrome before the Markdown conversion (`--no-main-content-only` forces it off, the default), `--max-links-per-page N` to cap what one page costs the link scorer, `--min-page-text-chars N` to send a suspiciously empty 200 through the recovery chain, and `--use-sitemap` to seed the frontier from each origin's sitemap (`--no-use-sitemap` forces it off, the default). Add `--no-cache` to disable the on-by-default LLM-response cache (equivalently `AWE_LLM_CACHE=`). `text_filters` are Python-API-only (they're callables, not expressible on the command line), so a CLI crawl runs with no filters — use the Python API if you need them. The CLI prints the result as JSON and exits `0` on match, `2` on budget exhaustion.
+
+`awe schema` prints the JSON Schema of every setting — names, types, defaults, and an `env` key naming the variable that sets each one. It reads no values, so the output is safe to print, log or serve; use it to validate a configuration or generate a form for one without importing the Extractor.
+
+```bash
+uv run awe schema | jq '.properties.request_delay'
+```
 
 ### Runnable example
 
@@ -744,6 +756,13 @@ Requires `OPENAI_API_KEY` and a reachable OpenAI-compatible endpoint (or your pr
 | Always summarize     | `AWE_ALWAYS_SUMMARIZE` | `false` (true = summarize even when the content already fits) |
 | Extraction output cap | `AWE_MAX_OUTPUT_TOKENS` | `0` (no cap; set it to bound degenerate generation on the extract model) |
 | Wave concurrency / beam width | `AWE_MAX_WORKERS` | `8` (1 = sequential best-first) |
+| Per-domain request delay | `AWE_REQUEST_DELAY` | `0.5` seconds between fetch *starts* on one registrable domain (`0` = unpaced, the pre-0.3 behaviour) |
+| Per-domain in-flight cap | `AWE_MAX_PER_DOMAIN` | `0` (no cap; the delay already bounds the rate) |
+| Main-content-only markdown | `AWE_MAIN_CONTENT_ONLY` | `false` (true = drop site chrome outside `main`/`article` before HTML→MD) |
+| Links scored per page | `AWE_MAX_LINKS_PER_PAGE` | `0` (no cap; lossy when set) |
+| Minimum page text | `AWE_MIN_PAGE_TEXT_CHARS` | `0` (off; above it a thin 200 goes through the recovery chain) |
+| Sitemap seeding | `AWE_USE_SITEMAP` | `false` (true = score the seed origin's advertised URLs into the frontier) |
+| Sitemap bounds | `AWE_SITEMAP_MAX_DOCUMENTS` / `AWE_SITEMAP_MAX_URLS` / `AWE_SITEMAP_MAX_BYTES` | `5` / `200` / `10000000` |
 | Token-count encoding | `AWE_TIKTOKEN_ENCODING` | `o200k_base` (fallback for models tiktoken doesn't know) |
 | Seed is content      | `AWE_SEED_IS_CONTENT` | `false` (true = skip screen + link-scoring, extract the seeds directly) |
 | Prefer seed domain   | `AWE_PREFER_SEED_DOMAIN` | `false` (true = LLM disfavors off-domain pages/links) |
@@ -771,14 +790,16 @@ Extractor(schema=..., criteria=..., log_file="run.log")  # "" or omit = no file
 
 `AWE_MAX_FETCHES` (per seed) is the main traversal knob. Depth limits and link-relevance thresholds are intentionally **not** user-configurable — the budget is the main lever and the LLM's link scoring is the navigation policy. `AWE_MAX_WORKERS` is a concurrency knob (wave/beam width), not a relevance policy: best-first ordering holds within each wave. The opt-in soft same-domain preference (`AWE_PREFER_SEED_DOMAIN`, a single on/off knob) feeds the LLM an on-domain signal and asks it to disfavor off-domain content but never excludes a link. The single *hard* limit is the crawl boundary (`allowed_domains`), which drops off-boundary links at the queue point — see [Crawl boundary, attribution, robots.txt](#crawl-boundary-attribution-and-robotstxt).
 
-The log is the audit trail for both: `[page] <url>` per fetch, `[blocked] <url>` per link the boundary dropped, `[robots] …` per page robots.txt kept us off. Point `AWE_LOG_FILE` at a path on a volume that outlives the container if you ever expect to have to reconstruct what a crawl did.
+Traffic shaping is separate from all of that and is **on by default**: `AWE_REQUEST_DELAY` (`0.5s`) spaces requests to one registrable domain, and `AWE_MAX_PER_DOMAIN` optionally caps how many are in flight there. This exists precisely because the boundary works — keeping a crawl on one site means every worker lands on one origin, so the concurrency knob and the politeness knob pull against each other and the second one has to exist. An origin's own `Crawl-delay` wins when it asks for more.
+
+The log is the audit trail for both: `[page] <url>` per fetch, `[blocked] <url>` per link the boundary dropped, `[robots] …` per page robots.txt kept us off. `[pace] …` per wait the delay imposed, `[sitemap] …` for what an origin advertised, `[thin] …` when a 200 came back too empty to be the page. Point `AWE_LOG_FILE` at a path on a volume that outlives the container if you ever expect to have to reconstruct what a crawl did.
 
 ## Project layout
 
 ```
 agentic_web_extraction/
     __init__.py          # re-exports + main() entry point
-    cli.py               # Typer CLI: `extract` subcommand
+    cli.py               # Typer CLI: `extract` and `schema` subcommands
     config.py            # AWE_* settings (pydantic-settings)
     cache.py             # KVCache protocol + SqliteKVCache + content-hash helpers (on-by-default LLM cache)
     extractor.py         # Extractor: parallel-wave frontier loop + consolidated extraction
@@ -788,10 +809,14 @@ agentic_web_extraction/
     fallback.py          # recovery routes for pages the transport lost (impersonate, jina, wayback)
     fetch.py             # httpx (plain, no HTTP cache) + tenacity retry + status guard + UA
                          #   + per-domain transport memo (skip a host that has gone silent)
-    robots.py            # opt-in robots.txt policy (per-origin cache; validates the body; fails open)
-    logsink.py           # shared stderr + optional timestamped log-file sink
+                         #   + per-domain pacing (request delay + in-flight cap)
+                         #   + thin-200 recovery trigger
+    robots.py            # opt-in robots.txt policy (per-origin cache; validates the body; fails open; Crawl-delay)
+    sitemap.py           # opt-in sitemap discovery + hardened XML parsing (seeds the frontier)
+    logsink.py           # shared stderr + optional timestamped log-file sink + on_event subscribers
     frontier.py          # best-first heap + visited set + PSL registrable-domain (tldextract)
-    normalize.py         # HTML→Markdown + raw-HTML link extraction + caller text_filters hook
+    normalize.py         # HTML→Markdown (+ optional DOM boilerplate strip) + raw-HTML link
+                         #   extraction (unreadable extensions filtered) + caller text_filters hook
     result.py            # ExtractionResult, Usage, ScreenVerdict, PageVerdict
     providers/
         __init__.py      # Provider protocol + factory
@@ -800,13 +825,23 @@ examples/
     grants.py            # reference Opportunity + Opportunities list-container schema
     strippers.py         # example cache-stability text_filters (site-specific; kept out of the package)
 tests/
-    conftest.py          # offline stub provider + stub web (no network, no LLM)
+    conftest.py          # offline stub provider + stub web (no network, no LLM) + fake_tokens
+    test_cache_keys.py       # the invalidation rules: version stamp, extract key, page key
+    test_content_filter.py   # DOM boilerplate strip, unreadable-extension filter, link cap
     test_crawl_boundary.py   # allowed_domains: default-deny, seed redirects, domain keys
+    test_events.py           # on_event subscribers, and the published settings schema
     test_fetch_recovery.py   # status/transport failures → fallback routes; the transport memo
+    test_frontier_order.py   # best-first ordering: the navigation policy itself
     test_impersonate.py      # the curl_cffi route: scoping, UA choice, thread-local sessions
+    test_politeness.py       # per-domain delay + in-flight cap + robots Crawl-delay
     test_robots.py           # robots.txt verdicts, overrides, body validation, fail-open
+    test_sitemap.py          # sitemap parsing (hardened), discovery, and frontier seeding
+    test_summarize.py        # fit-or-summarize: the map/reduce arithmetic and its caching
     test_thin_content.py     # a shell body is a decline, so the chain falls through
+    test_thin_page.py        # a thin 200 reaches recovery, and can only be improved by it
     test_user_agent.py       # User-Agent configuration reaches both http clients
+CONTRIBUTING.md          # setup, the conventions worth knowing, release rules
+LICENSE                  # MIT
 pyproject.toml           # uv project, Python ≥3.13
 scripts/
     adopters.py          # weekly org adoption scan (stdlib-only PEP 723)
@@ -903,3 +938,12 @@ v0 done:
 - [x] `examples/` directory with reference schemas and filters (`examples/grants.py`, `examples/strippers.py`, kept out of the package)
 - [x] Weekly org adoption scan (`scripts/adopters.py` + `.github/workflows/adopters.yml`; index-independent repo/tree sweep → shields badges in the [Adopters](#adopters) block, hard-fails and reports coverage rather than committing a silent undercount)
 - [x] Guarded release script (`scripts/release.py`; main-only, clean-and-synced preconditions, pyproject/`uv.lock`/git-tag kept in sync, atomic branch+tag push with rollback — see [Releasing](#releasing))
+- [x] Per-domain pacing (`AWE_REQUEST_DELAY`, **on** at `0.5s`, plus an optional `AWE_MAX_PER_DOMAIN` in-flight cap; slots reserved under the lock and slept for outside it, so concurrent workers queue instead of all waking together; an origin's `Crawl-delay` wins when it asks for more)
+- [x] Opt-in main-content filtering (`AWE_MAIN_CONTENT_ONLY`; DOM-level chrome removal that spares an `article`'s own `<header>`, and never touches link discovery)
+- [x] Always-on unreadable-link filter (extensions `fetch._classify` could never accept as content are dropped before the scorer is billed; a pure function of the URL, so it is safe to cache)
+- [x] Opt-in thin-page recovery (`AWE_MIN_PAGE_TEXT_CHARS`; a 200 that is really a client-rendered shell reaches the recovery chain, and the recovered body must be fuller than the origin's to win)
+- [x] Opt-in sitemap seeding (`AWE_USE_SITEMAP`; robots.txt `Sitemap:` lines then `/sitemap.xml`, indexes and gzip, hardened against entity expansion — and the URLs are *scored* into the frontier, never pushed around it)
+- [x] Structured progress events (`Extractor(on_event=...)`; a `logsink.Event(kind, message)` per emitted line, scoped to the crawl, so a host codebase never has to parse stderr)
+- [x] Published settings schema (`awe schema` / `config.settings_schema()`; names, types, defaults and the env var for each, reading no values)
+- [x] Tests over the expensive half (cache-key invalidation, fit-or-summarize arithmetic, best-first ordering — and a `fake_tokens` fixture so the summarization path no longer needs the network)
+- [x] LICENSE (MIT) and [CONTRIBUTING.md](CONTRIBUTING.md)

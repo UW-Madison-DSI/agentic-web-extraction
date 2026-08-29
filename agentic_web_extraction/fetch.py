@@ -1,4 +1,6 @@
 import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlsplit
@@ -12,7 +14,7 @@ from tenacity import (
 )
 
 from . import fallback, logsink
-from .config import get_settings
+from .config import Settings, get_settings
 from .frontier import domain_of
 
 USER_AGENT = "agentic-web-extraction/0.1 (+https://github.com/)"
@@ -99,6 +101,91 @@ def close_client() -> None:
             _client = None
 
 
+# --- per-domain pacing ------------------------------------------------------
+#
+# The crawl boundary exists to keep a traversal on one site, which means
+# `max_workers` workers concentrate on a single origin -- so the concurrency knob
+# that makes the crawl fast is also what makes it rude, and nothing here used to
+# stand between the two. This is that gate: requests to one registrable domain
+# start at least `AWE_REQUEST_DELAY` apart, and at most `AWE_MAX_PER_DOMAIN` are
+# in flight at once.
+#
+# It lives here, beside the transport memo, for the same reason the memo does: it
+# is a fact about the *default transport*, and it is keyed through
+# `frontier.domain_of` like every other host comparison in the library. It gates
+# the origin fetch only, not the recovery routes -- `jina` and `wayback` talk to a
+# third party whose rate limit has nothing to do with the crawled origin's, and
+# pacing them under the origin's key would throttle the wrong host.
+#
+# Slots are *reserved* under the lock and slept for outside it: a thread that held
+# the lock while sleeping would serialize every domain behind one.
+_pace_lock = threading.Lock()
+_next_allowed: dict[str, float] = {}
+"""Registrable domain -> the monotonic time its next request may start."""
+_domain_gates: dict[str, threading.Semaphore] = {}
+"""Registrable domain -> in-flight limiter, built on first use at the configured
+cap. The cap is read once per domain: changing `AWE_MAX_PER_DOMAIN` mid-process
+does not resize a gate that already exists (call `reset_pacing`)."""
+
+
+def reset_pacing() -> None:
+    """Forget every domain's reserved slot and in-flight gate.
+
+    Called per crawl (like `reset_transport_memo`), which keeps the maps from
+    growing for the life of a long-running process and lets a new crawl pick up a
+    changed delay. Stale entries are all in the past, so this is housekeeping
+    rather than correctness -- except for the gates, whose size is fixed at
+    construction.
+    """
+    with _pace_lock:
+        _next_allowed.clear()
+        _domain_gates.clear()
+
+
+def _gate_for(domain: str, limit: int) -> threading.Semaphore | None:
+    if limit <= 0 or not domain:
+        return None
+    with _pace_lock:
+        gate = _domain_gates.get(domain)
+        if gate is None:
+            gate = _domain_gates[domain] = threading.Semaphore(limit)
+        return gate
+
+
+def _reserve_slot(domain: str, delay: float) -> float:
+    """Claim this domain's next start slot; return the seconds to wait for it.
+
+    Reserving before sleeping is what makes concurrent workers queue instead of
+    colliding: N threads arriving together get slots at t, t+delay, t+2*delay,
+    rather than all reading the same "next allowed" and all waking at once.
+    """
+    if delay <= 0 or not domain:
+        return 0.0
+    now = time.monotonic()
+    with _pace_lock:
+        start = max(now, _next_allowed.get(domain, now))
+        _next_allowed[domain] = start + delay
+    return start - now
+
+
+@contextmanager
+def paced(url: str, delay: float, limit: int):
+    """Hold `url`'s domain slot for the duration of one origin request."""
+    domain = domain_of(url)
+    gate = _gate_for(domain, limit)
+    if gate is not None:
+        gate.acquire()
+    try:
+        wait = _reserve_slot(domain, delay)
+        if wait > 0:
+            logsink.emit(f"    [pace] waiting {wait:.2f}s before {domain}")
+            time.sleep(wait)
+        yield
+    finally:
+        if gate is not None:
+            gate.release()
+
+
 # --- the "this host does not answer us" memo --------------------------------
 #
 # An origin that tarpits non-browser clients refuses every URL the same way, and
@@ -141,6 +228,14 @@ def reset_transport_memo() -> None:
 
 
 def _memo_threshold() -> int:
+    """Deliberately the process setting, not a caller's.
+
+    The memo is shared across every Extractor in the process (so is the client it
+    describes), so a per-crawl threshold would let one crawl's configuration
+    decide what another crawl's fetches observe. Same for `_attempts_for`, which
+    tenacity calls from a retry predicate that has no access to a call's
+    arguments.
+    """
     return get_settings().transport_memo_failures
 
 
@@ -305,11 +400,31 @@ def _recover(url: str, follow_pdf: bool, user_agent: str = "") -> FetchedPage | 
     )
 
 
-def fetch(url: str, *, user_agent: str = "") -> FetchedPage:
+def fetch(
+    url: str,
+    *,
+    user_agent: str = "",
+    min_delay: float = 0.0,
+    settings: Settings | None = None,
+) -> FetchedPage:
     """Fetch one URL. `user_agent` overrides the configured default for this call
     only -- pass the caller's own string so the header on the wire always names the
-    Extractor that asked, whatever another Extractor configured meanwhile."""
-    settings = get_settings()
+    Extractor that asked, whatever another Extractor configured meanwhile.
+
+    `min_delay` raises this request's per-domain spacing floor for this call: the
+    caller passes an origin's own ``Crawl-delay`` when it has one, so a site that
+    asks for a slower crawl gets it without this module having to know what
+    robots.txt is.
+
+    `settings` is the *caller's* configuration, and the Extractor always passes
+    its own. Without it every knob read here -- the pace gate, the thin-page
+    threshold, ``follow_pdf`` -- would come from the process-wide
+    ``get_settings()`` and silently ignore ``Extractor(settings=...)``, which is
+    also what the CLI's settings-only flags are built on. Defaults to the process
+    settings for a direct caller.
+    """
+    settings = settings or get_settings()
+    delay = max(settings.request_delay, min_delay)
 
     # The host has already been proven not to answer this transport (see the memo
     # above), so don't spend the attempt budget finding that out again -- go to the
@@ -338,7 +453,11 @@ def fetch(url: str, *, user_agent: str = "") -> FetchedPage:
         )
 
     try:
-        response = _send(url, user_agent)
+        # Paced around the whole retry sequence rather than each attempt: tenacity
+        # already backs off exponentially between attempts (>= 1s, above any
+        # sensible delay), so gating inside would only stack two waits.
+        with paced(url, delay, settings.max_per_domain):
+            response = _send(url, user_agent)
     except httpx.HTTPStatusError as exc:
         # `_send` raises this for a 5xx it gave up retrying. That is still a
         # *response* whose status is outside 2xx -- exactly the hole the status
@@ -441,11 +560,71 @@ def fetch(url: str, *, user_agent: str = "") -> FetchedPage:
 
     raw = response.content
     text = "" if kind == "pdf" else response.text
-    return FetchedPage(
+    page = FetchedPage(
         url=resolved_url,
         status=response.status_code,
         content_type=content_type,
         raw_bytes=raw,
         text=text,
         kind=kind,
+    )
+    if kind == "html":
+        page = _recover_if_thin(page, settings.min_page_text_chars, user_agent)
+    return page
+
+
+def _recover_if_thin(page: FetchedPage, minimum: int, user_agent: str) -> FetchedPage:
+    """Send a 200 that came back nearly empty through the recovery chain.
+
+    A single-page app answers 200 with a shell whose text arrives later from
+    JavaScript we do not run. That is a failure to *obtain content* -- the same
+    thing a 403 interstitial or a tarpitted connection is -- and this module
+    already treats the chain as driven by that rather than by response status. It
+    was only the 200-shaped version of the failure that had no trigger, which made
+    it the one that vanished silently: normalized to nothing, screened out as
+    irrelevant, logged as an ordinary page.
+
+    Off unless ``AWE_MIN_PAGE_TEXT_CHARS`` is set, because a genuinely short page
+    is indistinguishable from a shell by character count and the remedy costs
+    requests at a third party. When it is on, the recovered body has to be
+    *fuller* than the origin's to win: `fallback.recover` compares routes against
+    each other, not against the page we already hold, so without this check a
+    thinner rendering could replace a real (if short) page.
+    """
+    if minimum <= 0:
+        return page
+    origin_chars = len(fallback.visible_text(page.text))
+    if origin_chars >= minimum:
+        return page
+    logsink.emit(
+        f"    [thin] {page.url} returned {origin_chars} characters of text "
+        f"(minimum {minimum}) — reads like a client-rendered shell, trying recovery"
+    )
+    recovered = fallback.recover(page.url, user_agent=user_agent)
+    if recovered is None:
+        return page
+    kind = _classify(recovered.content_type)
+    if kind != "html":
+        # A route that answered with a PDF or a non-document body for a URL the
+        # origin served as HTML has not rendered the page; keep what we have.
+        return page
+    recovered_chars = len(fallback.visible_text(recovered.text))
+    if recovered_chars <= origin_chars:
+        logsink.emit(
+            f"    [thin] keeping the origin body for {page.url} — "
+            f"{recovered.via} came back with {recovered_chars} characters"
+        )
+        return page
+    logsink.emit(
+        f"    [thin] {recovered.via} rendered {page.url} to {recovered_chars} "
+        f"characters — using it"
+    )
+    return FetchedPage(
+        url=page.url,
+        status=page.status,
+        content_type=recovered.content_type,
+        raw_bytes=recovered.raw_bytes,
+        text=recovered.text,
+        kind=kind,
+        via=recovered.via,
     )

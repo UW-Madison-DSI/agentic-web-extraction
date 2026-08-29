@@ -37,6 +37,67 @@ class Settings(BaseSettings):
     # (env: AWE_NORMALIZE). On by default to cut token cost; PDFs are always
     # converted regardless.
     normalize: bool = True
+    # Drop non-content chrome from the DOM before the HTML->Markdown conversion
+    # (env: AWE_MAIN_CONTENT_ONLY). `script`/`style`/`noscript`/`template` are
+    # always dropped when this runs -- they carry no reader-visible text -- and so
+    # are `header`/`footer`/`nav`/`aside` elements that are NOT inside a `main` or
+    # `article` (an article's own `<header>` usually holds its title and date,
+    # which is exactly what a schema asks for).
+    #
+    # OFF by default. It is lossy in the caller's own results, and a default that
+    # silently changes what the extraction sees is worse than the tokens it saves.
+    # Turn it on for portal/listing sites, where site chrome is most of the page.
+    # Note this governs the *markdown* only: link discovery reads the unfiltered
+    # HTML, so filtering a nav out of the extraction input never hides the links
+    # in it from the scorer.
+    main_content_only: bool = False
+    # Cap on how many outgoing links from one page are sent to the link scorer
+    # (env: AWE_MAX_LINKS_PER_PAGE, 0 = no cap, the default). A backstop for the
+    # mega-navigation page that bills one scoring call for eight hundred links.
+    # Off by default because, unlike the extension filter below it, truncating is
+    # *lossy*: a dropped link is one the crawl can never reach, and the outcome is
+    # cached. Document order is kept, so a cap keeps the top of the page.
+    max_links_per_page: int = 0
+    # --- politeness -------------------------------------------------------
+    # Minimum seconds between the *starts* of two fetches to the same registrable
+    # domain (env: AWE_REQUEST_DELAY). This is the one new default that is ON,
+    # because being impolite is a defect whose cost lands on somebody else: the
+    # crawl boundary exists to keep a traversal on one site, so `max_workers`
+    # workers concentrate on a single origin and, before this, arrived as fast as
+    # httpx would go. 0.5s caps one origin at ~2 requests/second however many
+    # workers are running, which is well inside what the per-page LLM stages
+    # sustain anyway -- so in practice it costs wall-clock only on a cache-warm
+    # replay. Set to 0.0 for the pre-0.3 behavior.
+    #
+    # Enforced in fetch.py (transport state, like the domain memo beside it) and
+    # keyed through frontier.domain_of like every other host comparison. When
+    # respect_robots is on and an origin publishes a Crawl-delay, the larger of
+    # the two wins for that origin.
+    request_delay: float = 0.5
+    # Hard cap on fetches in flight to one registrable domain at a time
+    # (env: AWE_MAX_PER_DOMAIN, 0 = no cap, the default). `request_delay` already
+    # bounds the *rate*, which is what a site operator feels; this bounds
+    # concurrent connections, which is what a small origin's connection pool
+    # feels. Off by default because the delay alone staggers starts enough that a
+    # cap rarely binds -- turn it on for origins that are genuinely fragile.
+    max_per_domain: int = 0
+
+    # Minimum characters of visible text a *successfully fetched* HTML page must
+    # carry before it is accepted as content (env: AWE_MIN_PAGE_TEXT_CHARS,
+    # 0 = off, the default). A single-page app answers 200 with an empty shell:
+    # that sails past the status guard, normalizes to almost nothing, gets
+    # screened out as irrelevant, and leaves a log that says nothing was wrong.
+    # Set this and a sub-threshold body is treated as a failure to *obtain*
+    # content -- the same trigger the status guard and the transport handler use --
+    # so the recovery chain gets a turn at rendering it.
+    #
+    # OFF by default because it spends extra requests, at a third party, on a
+    # judgment only the deployment can make: a genuinely short page is
+    # indistinguishable from a shell by character count alone. The recovered body
+    # only wins if it carries *more* visible text than the origin's, so turning
+    # this on can never replace a real page with a worse one.
+    min_page_text_chars: int = 0
+
     # Whether to fetch and read linked PDFs as page content (env: AWE_FOLLOW_PDF).
     # When False, PDF responses are treated as skipped (no LLM work, no budget cost).
     follow_pdf: bool = True
@@ -260,6 +321,34 @@ class Settings(BaseSettings):
     # (the default) exempts nothing. Note the crawl *boundary* is a separate,
     # stricter thing: see Extractor(allowed_domains=...).
     robots_overrides: str = ""
+    # --- sitemap seeding --------------------------------------------------
+    # Before the traversal starts, read each seed origin's sitemap and offer its
+    # URLs to the link scorer, so the frontier begins with pages the site itself
+    # advertises rather than only whatever the seed page links to
+    # (env: AWE_USE_SITEMAP). This is best-first search's weakest spot: page 12 of
+    # a listing is often reachable only through a paginator nothing scores highly,
+    # and a sitemap puts it in the frontier at the start.
+    #
+    # OFF by default: it spends extra requests before the crawl proper, and the
+    # URLs it injects change which pages a fixed budget reaches. Discovered URLs
+    # are scored by the same scorer, gated by the same crawl boundary, and (with
+    # respect_robots on) checked against the same policy as any other link -- they
+    # enter the frontier, they do not bypass it.
+    use_sitemap: bool = False
+    # Most sitemap documents fetched per seed origin, index files included
+    # (env: AWE_SITEMAP_MAX_DOCUMENTS). A sitemap index can name hundreds of
+    # children; this bounds what one seed can cost before the crawl begins.
+    sitemap_max_documents: int = 5
+    # Most URLs handed to the scorer from one origin's sitemap
+    # (env: AWE_SITEMAP_MAX_URLS). A real sitemap can carry 50,000 entries, which
+    # would be one enormous scoring call and a frontier nothing else can outrank.
+    sitemap_max_urls: int = 200
+    # Largest sitemap document body read, in bytes (env: AWE_SITEMAP_MAX_BYTES).
+    # These are attacker-controlled XML from a third party; the parser guards
+    # against entity expansion separately (see sitemap.py), and this bounds the
+    # plain "serve a 2 GB file" case.
+    sitemap_max_bytes: int = 10_000_000
+
     # Content-addressed LLM-response cache path (SQLite), env: AWE_LLM_CACHE. On by
     # default: when a page's normalized content is unchanged from a prior run the
     # crawler replays its screen/extract/link-score outputs (and the final merge, if
@@ -298,3 +387,38 @@ class Settings(BaseSettings):
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     return Settings()
+
+
+def settings_schema() -> dict:
+    """JSON Schema for every ``AWE_*`` knob: names, types, and defaults.
+
+    Published so a host codebase can validate a configuration, or generate a form
+    for one, without importing the Extractor. Also what ``awe schema`` prints.
+
+    It carries the *shape*, not the rationale: pydantic builds a schema from field
+    types and defaults, and the reasoning for each knob lives in the comments above
+    it, which do not travel. Read those (or the README) for why a default is what
+    it is; read this to find out that ``request_delay`` is a number defaulting to
+    0.5 without importing anything.
+
+    Each property additionally carries an ``env`` key naming the variable that
+    sets it. Without one a consumer has to know that most fields take an ``AWE_``
+    prefix while the credentials -- which pydantic renders under their aliases --
+    do not; "guess the naming convention" is exactly the job this exists to remove.
+
+    Values are never included: this describes the settings, it does not read the
+    environment, so it is safe to print, log, or serve. The credentials appear as
+    key *names* only, like every other setting.
+    """
+    schema = Settings.model_json_schema()
+    properties = schema.get("properties", {})
+    prefix = Settings.model_config.get("env_prefix", "")
+    for name, field in Settings.model_fields.items():
+        # A field with a string validation alias is rendered under that alias, and
+        # the alias is already the literal environment variable name.
+        alias = field.validation_alias
+        alias = alias if isinstance(alias, str) else None
+        key = alias or name
+        if key in properties:
+            properties[key]["env"] = alias or f"{prefix}{name}".upper()
+    return schema

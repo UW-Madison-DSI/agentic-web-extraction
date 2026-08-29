@@ -287,7 +287,7 @@ def test_redirect_within_allowed_paths_is_kept(make_extractor, monkeypatch):
     assert OPEN_LINK in result.path
 
 
-def test_a_malformed_url_never_aborts_the_crawl(make_extractor):
+def test_a_malformed_url_never_aborts_the_crawl(make_extractor, fake_tokens):
     """`urlsplit` raises on a bracketed host, and every URL helper goes through it.
 
     Unguarded, one such href escapes the worker, surfaces out of `pool.map`, and
