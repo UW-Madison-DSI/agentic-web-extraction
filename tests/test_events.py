@@ -136,7 +136,8 @@ def test_the_schema_carries_types_and_defaults():
     properties = settings_schema()["properties"]
     assert properties["request_delay"]["default"] == 0.5
     assert properties["max_fetches"]["type"] == "integer"
-    assert properties["use_sitemap"]["default"] is False
+    assert properties["use_sitemap"]["default"] is True
+    assert properties["max_links_per_page"]["default"] == 0
 
 
 def test_every_property_names_the_variable_that_sets_it():

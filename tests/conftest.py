@@ -190,7 +190,7 @@ def fake_impersonate(monkeypatch):
 def settings() -> Settings:
     """Settings that never read the developer's environment for what matters here:
     sequential waves (deterministic fetch order), no cache file, no log file, no
-    pacing delay."""
+    pacing delay, no sitemap pass."""
     return Settings(
         max_workers=1,
         max_fetches=10,
@@ -201,6 +201,12 @@ def settings() -> Settings:
         # real crawl and pure wall-clock in a suite whose "network" is a dict.
         # Tests that exercise pacing set their own delay.
         request_delay=0.0,
+        # Sitemap seeding is ON by default too, and it is the one default that
+        # does not go through the monkeypatched `fetch.fetch` -- sitemap.py drives
+        # the httpx client directly, so leaving it on would put real requests to
+        # example.org in front of every traversal test. test_sitemap.py turns it
+        # on against its own fake transport.
+        use_sitemap=False,
         user_agent="awe-test/1.0 (+https://example.edu/crawler)",
     )
 

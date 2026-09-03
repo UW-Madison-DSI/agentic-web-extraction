@@ -308,9 +308,11 @@ guard + transport-failure recovery + per-domain transport memo + UA),
   failing at import. Its sessions wrap a libcurl handle and are **not** thread-safe:
   one per (thread, target) in a `threading.local`, never the module-level `_client`
   singleton pattern the httpx clients use.
-- **Politeness is transport state, and it is the one new default that is ON.**
+- **Politeness is transport state, and both of its knobs are ON.**
   `AWE_REQUEST_DELAY` (0.5s) spaces the *starts* of two fetches to one registrable
-  domain; `AWE_MAX_PER_DOMAIN` (0 = off) caps how many are in flight there. Both
+  domain; `AWE_MAX_PER_DOMAIN` (4, half the default `max_workers`, 0 = off) caps
+  how many are in flight there — a ceiling rather than a schedule, binding only
+  when an origin is slow enough that five requests overlap. Both
   live in [fetch.py](agentic_web_extraction/fetch.py) beside the transport memo
   for the same reason the memo does — they are facts about the *default
   transport* — and key through `frontier.domain_of` like every other host
@@ -347,15 +349,20 @@ guard + transport-failure recovery + per-domain transport memo + UA),
   the filter is invariant, so caching it is safe, and `fetch` skips an unwanted
   PDF cheaply anyway. It costs nothing in outcome — those links were fetched,
   classified `skipped` and dropped after the scorer had already been billed — so
-  unlike `max_links_per_page` (lossy, off by default) it is always on. That cap,
+  unlike `max_links_per_page` (the one knob here left off) it is always on. That
+  cap,
   being configuration, *is* in the `PAGE` key (a `links=N` segment, added only
   when set) — and it is applied in the fold path **after** the `known` filter,
   never inside `extract_links`: capping the raw list hands the whole allowance to
   the site-wide nav at the top of every page, so `fresh` comes back empty and the
   frontier starves after the seed.
 - **DOM filtering governs the extraction input, never link discovery.**
-  `AWE_MAIN_CONTENT_ONLY` (off by default, because it is lossy in the *caller's*
-  results) strips `script`/`style`/`noscript`/`template`, plus
+  `AWE_MAIN_CONTENT_ONLY` (**on** by default: site chrome is most of the DOM and
+  none of it answers a criterion, so leaving it in means every screen, summarize
+  and extract call pays for the same masthead again — it *is* lossy in the
+  caller's results, which is what the off switch is for, and flipping it is
+  cache-safe because the page-cache key hashes the filtered markdown) strips
+  `script`/`style`/`noscript`/`template`, plus
   `header`/`footer`/`nav`/`aside` elements **not inside a `main` or `article`** —
   an article's own `<header>` holds its title and date, which is exactly what a
   schema asks for, so the naive "remove every header" rule loses data on the
@@ -367,9 +374,10 @@ guard + transport-failure recovery + per-domain transport memo + UA),
   which parser is used changes the emitted markup, which changes the content hash
   every cache key is built on, and a cache that misses because a wheel is present
   on one machine and not another is worse than a slower parse.
-- **A thin 200 is a failure to obtain content.** `AWE_MIN_PAGE_TEXT_CHARS` (off
-  by default) sends a successfully fetched HTML page carrying too little visible
-  text through the recovery chain — the single-page-app case, which was the one
+- **A thin 200 is a failure to obtain content.** `AWE_MIN_PAGE_TEXT_CHARS` (on
+  at 200, matching `min_recovered_text_chars` so one number means "is this the
+  page" on both sides of the chain) sends a fetched HTML page carrying too little
+  visible text through the recovery chain — the single-page-app case, which was the one
   refusal with no trigger and no trace: past the status guard, normalized to
   nothing, screened out as irrelevant, logged as an ordinary page. Consistent
   with the doctrine that the chain is driven by failure to obtain content rather
@@ -378,13 +386,17 @@ guard + transport-failure recovery + per-domain transport memo + UA),
   definition of "is this the page"), and the recovered body must be **fuller than
   the origin's** to win — `recover` compares routes against each other, never
   against the page already in hand, so its "fullest sub-threshold body" can be
-  worse than what the origin served. Off by default because it spends requests at
-  a third party on a judgment only a deployment can make: a genuinely short page
-  is indistinguishable from a shell by character count.
+  worse than what the origin served. Its cost is requests, at a third party, on a
+  page the origin already answered: a genuinely short page is indistinguishable
+  from a shell by character count, so a stub falls through to jina/wayback too.
+  Lower the threshold rather than zeroing it if that trade is wrong for a
+  deployment.
 - **Sitemap URLs go through the frontier, never around it.**
-  [sitemap.py](agentic_web_extraction/sitemap.py) (opt-in, `AWE_USE_SITEMAP`) is
-  frontier *seeding*, not a second navigation policy: discovered URLs are handed
-  to the same `score_links`, gated by the same `_queue_link`, and checked against
+  [sitemap.py](agentic_web_extraction/sitemap.py) (`AWE_USE_SITEMAP`, on by
+  default — the URLs are ranked, not privileged, so the worst case is candidates
+  the scorer never pops, and the extra requests are bounded and go to the origin
+  being crawled) is frontier *seeding*, not a second navigation policy: discovered
+  URLs are handed to the same `score_links`, gated by the same `_queue_link`, and checked against
   the same robots policy. Pushing a few hundred unranked URLs at a fixed score
   would drown the relevance ordering that is the entire policy. It runs on the
   main thread (which owns the frontier) *after* `allowed` is built, so a site
@@ -401,14 +413,20 @@ guard + transport-failure recovery + per-domain transport memo + UA),
   that. Its fetches go through the same pace gate as pages. Don't relax those into a parser configuration — a refusal of the
   construct cannot be reasoned around, a parser setting has to be re-verified on
   every upgrade.
-- **A new setting defaults ON only if it can neither lose the caller data nor
-  spend extra requests at a third party.** That is the whole rule, and it is what
-  separates `request_delay` (on: the cost is ours, the benefit is somebody
-  else's) and the extension filter (on: no outcome changes at all) from
-  `main_content_only`, `min_page_text_chars`, `use_sitemap` and
-  `max_links_per_page` (off: each one either drops something the caller might
-  have wanted or buys it with requests). Documented, opt-in, and explained at the
-  setting.
+- **A setting defaults ON when the typical crawl is better off and one flag
+  reverts it; OFF when no single value is right for the typical crawl, or when a
+  wrong value decides *which pages exist* rather than what they contain.** On:
+  `request_delay`/`max_per_domain` (the cost is ours, the benefit is somebody
+  else's), the extension filter (no outcome changes at all), `main_content_only`
+  (chrome is most of the DOM and answers no criterion), `min_page_text_chars` (a
+  client-rendered shell is otherwise a silent no-op), `use_sitemap` (its URLs are
+  scored like any other link). Off: `max_links_per_page`, alone — truncation
+  keeps document order, so a cap spends the allowance on the site-wide nav and
+  drops the in-content links underneath it, which is not a thinner frontier but
+  the wrong one. Three of the on defaults do cost the caller something
+  (`main_content_only` is lossy; `min_page_text_chars` and `use_sitemap` spend
+  requests): that is the trade, so keep it stated at the setting and keep the one
+  flag that turns each off working.
 - **Logging: never a bare `print`.** All diagnostics go through `logsink.emit` → stderr
   (stdout is reserved for result JSON). A `log_file` path (env `AWE_LOG_FILE`, empty =
   off) also appends timestamped lines, and `Extractor(on_event=...)` subscribes a

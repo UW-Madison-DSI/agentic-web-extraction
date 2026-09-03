@@ -1,4 +1,4 @@
-"""Seed the frontier from a site's own sitemap (opt-in, ``AWE_USE_SITEMAP``).
+"""Seed the frontier from a site's own sitemap (on by default, ``AWE_USE_SITEMAP``).
 
 Best-first search is only as good as the links it is offered, and its weakest
 spot is a page nothing links to prominently: page 12 of a listing sits behind a
@@ -105,9 +105,9 @@ def _get(
     sitemap is neither HTML nor PDF, so that path would report it `skipped`.
     """
     # Through the same pace gate as a page fetch. These are the *first* requests
-    # a crawl makes, and an opt-in sitemap pass that opened with half a dozen
-    # unspaced hits would undo the politeness the rest of the crawl now has -- at
-    # exactly the moment an origin is deciding what we are.
+    # a crawl makes, and a sitemap pass that opened with half a dozen unspaced
+    # hits would undo the politeness the rest of the crawl now has -- at exactly
+    # the moment an origin is deciding what we are.
     try:
         with (
             fetch_module.paced(url, delay, max_per_domain),
@@ -252,8 +252,8 @@ def discover(
     queue: list[str] = []
     # Deliberately re-fetched even when `respect_robots` already read this origin's
     # policy: `RobotsPolicy` caches a parser, not the body, and this pass has to
-    # work with robots off. One extra request per origin, only under an opt-in
-    # flag, is the cheaper side of that trade.
+    # work with robots off. One extra request per origin, bounded and paced, is
+    # the cheaper side of that trade.
     robots_body = fetch_document(f"{origin}/robots.txt")
     if robots_body:
         declared = _SITEMAP_LINE.findall(robots_body.decode("utf-8", errors="replace"))

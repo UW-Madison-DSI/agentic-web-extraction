@@ -16,7 +16,7 @@ import threading
 import httpx
 import pytest
 
-from agentic_web_extraction import fetch
+from agentic_web_extraction import fallback, fetch
 from agentic_web_extraction.config import Settings
 from agentic_web_extraction.robots import RobotsPolicy
 
@@ -67,8 +67,21 @@ def paced_fetch(monkeypatch):
     """`fetch.fetch` against a always-200 client, with settings a test supplies."""
 
     def wire(**overrides):
-        settings = Settings(llm_cache="", log_file="", fetch_fallbacks="", **overrides)
+        settings = Settings(
+            llm_cache="",
+            log_file="",
+            fetch_fallbacks="",
+            # These tests serve a two-character body, which the shipped
+            # `min_page_text_chars` reads as a client-rendered shell. Pacing is
+            # what is under test, so the thin-page check is off here -- and
+            # `fallback` is pinned to the same settings, because it resolves its
+            # routes from the process-wide ones: patching only `fetch` would let
+            # a stub body reach the real jina/wayback endpoints.
+            min_page_text_chars=0,
+            **overrides,
+        )
         monkeypatch.setattr(fetch, "get_settings", lambda: settings)
+        monkeypatch.setattr(fallback, "get_settings", lambda: settings)
         monkeypatch.setattr(fetch, "get_client", lambda: ok_client())
         return settings
 
@@ -247,8 +260,15 @@ def test_an_extractors_own_settings_reach_the_fetch(monkeypatch, clock):
     the settings it is *handed*, not from the process-wide `get_settings()`.
     Without that, `Extractor(settings=...)` -- which is what the CLI's
     settings-only flags are built on -- would configure nothing at all."""
-    process = Settings(llm_cache="", log_file="", fetch_fallbacks="", request_delay=0.0)
+    process = Settings(
+        llm_cache="",
+        log_file="",
+        fetch_fallbacks="",
+        request_delay=0.0,
+        min_page_text_chars=0,
+    )
     monkeypatch.setattr(fetch, "get_settings", lambda: process)
+    monkeypatch.setattr(fallback, "get_settings", lambda: process)
     monkeypatch.setattr(fetch, "get_client", lambda: ok_client())
     caller = process.model_copy(update={"request_delay": 3.0})
 
@@ -259,8 +279,15 @@ def test_an_extractors_own_settings_reach_the_fetch(monkeypatch, clock):
 
 
 def test_a_direct_caller_still_gets_the_process_settings(monkeypatch, clock):
-    process = Settings(llm_cache="", log_file="", fetch_fallbacks="", request_delay=1.5)
+    process = Settings(
+        llm_cache="",
+        log_file="",
+        fetch_fallbacks="",
+        request_delay=1.5,
+        min_page_text_chars=0,
+    )
     monkeypatch.setattr(fetch, "get_settings", lambda: process)
+    monkeypatch.setattr(fallback, "get_settings", lambda: process)
     monkeypatch.setattr(fetch, "get_client", lambda: ok_client())
 
     fetch.fetch(URL)

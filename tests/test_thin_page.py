@@ -64,10 +64,11 @@ def recovered(body: str, content_type: str = "text/html; charset=utf-8") -> Reco
     )
 
 
-def test_off_by_default_a_thin_page_is_returned_as_it_is(wired):
-    """The pre-0.3 behaviour, and still the default: the remedy costs requests at
-    a third party, on a judgment only the deployment can make."""
-    route = wired(SHELL, Route(recovered(REAL)))
+def test_a_zero_threshold_returns_a_thin_page_as_it_is(wired):
+    """The pre-0.3 behaviour, one setting away: the check costs requests at a
+    third party, so a deployment that would rather keep whatever the origin
+    served zeroes it."""
+    route = wired(SHELL, Route(recovered(REAL)), min_page_text_chars=0)
 
     page = fetch.fetch(URL)
 
@@ -76,7 +77,13 @@ def test_off_by_default_a_thin_page_is_returned_as_it_is(wired):
     assert page.via == ""
 
 
-def test_a_thin_page_is_sent_through_recovery_when_the_threshold_is_set(wired):
+def test_a_thin_page_is_sent_through_recovery_by_default(wired):
+    """200 characters is the shipped threshold, and it matches
+    `min_recovered_text_chars` so one number means "this is the page" on both
+    sides of the chain. Passed explicitly here, and in the tests below, so each
+    one reads without the default in hand."""
+    assert Settings.model_fields["min_page_text_chars"].default == 200
+
     wired(SHELL, Route(recovered(REAL)), min_page_text_chars=200)
 
     page = fetch.fetch(URL)

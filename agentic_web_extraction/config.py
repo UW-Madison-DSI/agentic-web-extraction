@@ -44,24 +44,35 @@ class Settings(BaseSettings):
     # `article` (an article's own `<header>` usually holds its title and date,
     # which is exactly what a schema asks for).
     #
-    # OFF by default. It is lossy in the caller's own results, and a default that
-    # silently changes what the extraction sees is worse than the tokens it saves.
-    # Turn it on for portal/listing sites, where site chrome is most of the page.
-    # Note this governs the *markdown* only: link discovery reads the unfiltered
+    # ON by default: site chrome is most of the DOM on a typical page and none of
+    # it answers the criterion, so leaving it in means every screen, summarize and
+    # extract call pays for the same masthead again. It *is* lossy -- content a
+    # site puts in an `<aside>` outside a `main`/`article` does not reach the
+    # extraction -- so turn it off (`--no-main-content-only`) when a site keeps
+    # real content in its chrome. Flipping it either way is safe with a warm
+    # cache: the page-cache key hashes the *filtered* markdown, so a change of
+    # this setting misses rather than replaying the other rendering.
+    #
+    # Note it governs the *markdown* only: link discovery reads the unfiltered
     # HTML, so filtering a nav out of the extraction input never hides the links
     # in it from the scorer.
-    main_content_only: bool = False
+    main_content_only: bool = True
     # Cap on how many outgoing links from one page are sent to the link scorer
     # (env: AWE_MAX_LINKS_PER_PAGE, 0 = no cap, the default). A backstop for the
     # mega-navigation page that bills one scoring call for eight hundred links.
-    # Off by default because, unlike the extension filter below it, truncating is
-    # *lossy*: a dropped link is one the crawl can never reach, and the outcome is
-    # cached. Document order is kept, so a cap keeps the top of the page.
+    #
+    # The one knob here left OFF, and the reason is that no cap is right for the
+    # typical page. Truncation is keyed on *document order*, so on an ordinary
+    # site a cap spends its allowance on the site-wide nav at the top of the
+    # markup and drops the in-content links underneath it -- the crawl does not
+    # get a thinner frontier, it gets the wrong one. Every other default here can
+    # at worst make a crawl slower or a page thinner; this one decides which
+    # pages exist. Set it per crawl for the specific site that needs it.
     max_links_per_page: int = 0
     # --- politeness -------------------------------------------------------
     # Minimum seconds between the *starts* of two fetches to the same registrable
-    # domain (env: AWE_REQUEST_DELAY). This is the one new default that is ON,
-    # because being impolite is a defect whose cost lands on somebody else: the
+    # domain (env: AWE_REQUEST_DELAY). ON by default, because being impolite is a
+    # defect whose cost lands on somebody else: the
     # crawl boundary exists to keep a traversal on one site, so `max_workers`
     # workers concentrate on a single origin and, before this, arrived as fast as
     # httpx would go. 0.5s caps one origin at ~2 requests/second however many
@@ -75,12 +86,16 @@ class Settings(BaseSettings):
     # the two wins for that origin.
     request_delay: float = 0.5
     # Hard cap on fetches in flight to one registrable domain at a time
-    # (env: AWE_MAX_PER_DOMAIN, 0 = no cap, the default). `request_delay` already
-    # bounds the *rate*, which is what a site operator feels; this bounds
-    # concurrent connections, which is what a small origin's connection pool
-    # feels. Off by default because the delay alone staggers starts enough that a
-    # cap rarely binds -- turn it on for origins that are genuinely fragile.
-    max_per_domain: int = 0
+    # (env: AWE_MAX_PER_DOMAIN, 0 = no cap). `request_delay` already bounds the
+    # *rate*, which is what a site operator feels; this bounds concurrent
+    # connections, which is what a small origin's connection pool feels.
+    #
+    # ON at 4, which is half the default `max_workers` and therefore a ceiling
+    # rather than a schedule: with starts already 0.5s apart it binds only when
+    # an origin is answering slowly enough that five requests overlap, which is
+    # exactly when a fragile origin should not be sent a sixth. Costs a healthy
+    # site nothing. Set 0 for no cap.
+    max_per_domain: int = 4
 
     # Minimum characters of visible text a *successfully fetched* HTML page must
     # carry before it is accepted as content (env: AWE_MIN_PAGE_TEXT_CHARS,
@@ -91,12 +106,19 @@ class Settings(BaseSettings):
     # content -- the same trigger the status guard and the transport handler use --
     # so the recovery chain gets a turn at rendering it.
     #
-    # OFF by default because it spends extra requests, at a third party, on a
-    # judgment only the deployment can make: a genuinely short page is
-    # indistinguishable from a shell by character count alone. The recovered body
-    # only wins if it carries *more* visible text than the origin's, so turning
-    # this on can never replace a real page with a worse one.
-    min_page_text_chars: int = 0
+    # ON at 200, matching `min_recovered_text_chars` so one number means "this is
+    # the page" on both sides of the recovery chain. A client-rendered shell is
+    # otherwise the one refusal with no trigger and no trace, and the check cannot
+    # make a result worse: the recovered body only wins if it carries *more*
+    # visible text than the origin's.
+    #
+    # What it costs is requests, at a third party, on a page the origin already
+    # answered -- a genuinely short page is indistinguishable from a shell by
+    # character count, so a "this document has moved" stub reaches jina/wayback
+    # too. Lower it rather than zeroing it if that trade is wrong for you; the
+    # shells it exists for measure in the tens of characters. Set 0 to accept any
+    # 200 as content, which is also what an empty `fetch_fallbacks` amounts to.
+    min_page_text_chars: int = 200
 
     # Whether to fetch and read linked PDFs as page content (env: AWE_FOLLOW_PDF).
     # When False, PDF responses are treated as skipped (no LLM work, no budget cost).
@@ -329,12 +351,16 @@ class Settings(BaseSettings):
     # a listing is often reachable only through a paginator nothing scores highly,
     # and a sitemap puts it in the frontier at the start.
     #
-    # OFF by default: it spends extra requests before the crawl proper, and the
-    # URLs it injects change which pages a fixed budget reaches. Discovered URLs
-    # are scored by the same scorer, gated by the same crawl boundary, and (with
-    # respect_robots on) checked against the same policy as any other link -- they
-    # enter the frontier, they do not bypass it.
-    use_sitemap: bool = False
+    # ON by default. Discovered URLs are scored by the same scorer, gated by the
+    # same crawl boundary, and (with respect_robots on) checked against the same
+    # policy as any other link -- they enter the frontier, they do not bypass it,
+    # so the worst case is candidates the scorer ranks low and never pops. What it
+    # costs is bounded and spent at the origin being crawled, not a third party:
+    # at most `sitemap_max_documents` extra requests per seed origin, paced like
+    # every other fetch, before the traversal starts. It does change which pages a
+    # fixed budget reaches, which is the point -- set it false when you want the
+    # frontier to contain only what the seed page itself links to.
+    use_sitemap: bool = True
     # Most sitemap documents fetched per seed origin, index files included
     # (env: AWE_SITEMAP_MAX_DOCUMENTS). A sitemap index can name hundreds of
     # children; this bounds what one seed can cost before the crawl begins.

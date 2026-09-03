@@ -143,8 +143,9 @@ def extract(
             "--max-per-domain",
             help=(
                 "Cap on fetches in flight to one registrable domain. Defaults to "
-                "AWE_MAX_PER_DOMAIN (0 = no cap); --request-delay already bounds "
-                "the rate."
+                "AWE_MAX_PER_DOMAIN (4, half the default worker count; 0 = no "
+                "cap). --request-delay already bounds the rate; this bounds the "
+                "connections a small origin's pool sees."
             ),
         ),
     ] = None,
@@ -156,8 +157,9 @@ def extract(
                 "Drop script/style/noscript/template, and header/footer/nav/aside "
                 "outside a <main> or <article>, before converting HTML to Markdown. "
                 "Cuts site chrome out of every screen, summarize and extract call. "
-                "Defaults to AWE_MAIN_CONTENT_ONLY (off) because it is lossy. Link "
-                "discovery reads the unfiltered HTML either way."
+                "Defaults to AWE_MAIN_CONTENT_ONLY (on); --no-main-content-only "
+                "keeps everything, for a site that puts real content in its chrome. "
+                "Link discovery reads the unfiltered HTML either way."
             ),
         ),
     ] = None,
@@ -167,8 +169,9 @@ def extract(
             "--max-links-per-page",
             help=(
                 "Cap on outgoing links from one page sent to the link scorer. "
-                "Defaults to AWE_MAX_LINKS_PER_PAGE (0 = no cap). Lossy: a dropped "
-                "link is one the crawl can never reach."
+                "Defaults to AWE_MAX_LINKS_PER_PAGE (0 = no cap). Lossy, and keyed "
+                "on document order: a cap can spend its whole allowance on the "
+                "site-wide nav at the top of the markup."
             ),
         ),
     ] = None,
@@ -180,8 +183,8 @@ def extract(
                 "Treat a 200 carrying less visible text than this as a failure to "
                 "obtain content and send it through the recovery chain, so a "
                 "client-rendered shell gets rendered rather than silently screened "
-                "out. Defaults to AWE_MIN_PAGE_TEXT_CHARS (0 = off). The recovered "
-                "body only wins if it is fuller than the origin's."
+                "out. Defaults to AWE_MIN_PAGE_TEXT_CHARS (200); 0 turns it off. "
+                "The recovered body only wins if it is fuller than the origin's."
             ),
         ),
     ] = None,
@@ -194,7 +197,8 @@ def extract(
                 "URLs to the link scorer, so the frontier starts with pages the "
                 "site advertises rather than only what the seed page links to. "
                 "Discovered URLs are scored, boundary-gated and robots-checked like "
-                "any other link. Defaults to AWE_USE_SITEMAP (off)."
+                "any other link. Defaults to AWE_USE_SITEMAP (on); "
+                "--no-use-sitemap keeps the frontier to what the seed page links to."
             ),
         ),
     ] = None,

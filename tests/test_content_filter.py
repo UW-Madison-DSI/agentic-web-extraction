@@ -2,9 +2,10 @@
 
 Two separate mechanisms that are easy to conflate:
 
-* `main_content_only` filters the DOM before the Markdown conversion. It is
-  lossy, so it is off by default -- and it must never affect link discovery,
-  which reads the unfiltered HTML.
+* `main_content_only` filters the DOM before the Markdown conversion. It is on
+  by default and it is lossy, so what it spares matters as much as what it
+  removes -- and it must never affect link discovery, which reads the unfiltered
+  HTML.
 * the extension filter drops links no fetch could ever read as a page. It is
   free of any change in outcome, so it is always on -- and it must stay a pure
   function of the URL, because its result is what the page cache stores.
@@ -42,13 +43,13 @@ def md(main_content_only: bool) -> str:
     )
 
 
-def test_off_by_default_nothing_is_removed():
+def test_nothing_is_removed_when_it_is_turned_off():
     text = md(main_content_only=False)
     assert "NAV CHROME" in text
     assert "FOOTER JUNK" in text
 
 
-def test_site_chrome_is_removed_when_asked():
+def test_site_chrome_is_removed_by_default():
     text = md(main_content_only=True)
     for junk in ("NAV CHROME", "SITE BANNER", "RELATED JUNK", "FOOTER JUNK"):
         assert junk not in text

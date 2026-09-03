@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from agentic_web_extraction import fetch, sitemap
+from agentic_web_extraction.config import Settings
 from agentic_web_extraction.sitemap import discover, parse
 
 from .conftest import StubProvider, StubWeb
@@ -328,12 +329,21 @@ def test_sitemap_urls_are_scored_and_compete_in_the_same_heap(
     assert web.fetched[:2] == [SEED, f"{ORIGIN}/a"]
 
 
-def test_the_sitemap_pass_is_off_by_default(make_extractor, served, fake_tokens):
+def test_the_sitemap_pass_can_be_turned_off(
+    make_extractor, settings, served, fake_tokens
+):
+    """It ships on -- the `settings` fixture is what pins it off for the rest of
+    the offline suite, since this pass drives the http client directly rather
+    than the stubbed `fetch`."""
+    assert Settings.model_fields["use_sitemap"].default is True
+
     requested: list[str] = []
     served({"/robots.txt": (404, b""), "/sitemap.xml": (200, URLSET)}, requested)
     web = StubWeb({SEED: html()})
 
-    make_extractor(web).extract(SEED)
+    make_extractor(
+        web, settings=settings.model_copy(update={"use_sitemap": False})
+    ).extract(SEED)
 
     assert requested == []
 

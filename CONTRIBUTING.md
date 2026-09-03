@@ -71,11 +71,28 @@ explained at length in [CLAUDE.md](CLAUDE.md); the short version:
 
 ## Defaults
 
-A new setting defaults **on** only when it can neither lose the caller data nor
-spend extra requests at a third party. Everything else ships off, documented, and
-opt-in. `request_delay` is on because being impolite is a defect whose cost lands
-on somebody else; `main_content_only` is off because it is lossy in the caller's
-own results.
+A setting defaults **on** when the typical crawl is better off with it and one
+flag reverts it. It ships **off** when no single value is right for the typical
+crawl, or when a wrong value quietly decides *which pages exist* rather than what
+they contain.
+
+On: `request_delay` and `max_per_domain`, because being impolite is a defect
+whose cost lands on somebody else; `main_content_only`, because site chrome is
+most of the DOM and none of it answers a criterion; `min_page_text_chars`,
+because a client-rendered shell is otherwise the one refusal with no trigger and
+no trace; `use_sitemap`, because its URLs are scored like any other link, so the
+worst case is candidates the scorer never pops.
+
+Off: `max_links_per_page`, and it is the only one. Truncation is keyed on
+document order, so on an ordinary page a cap spends its allowance on the
+site-wide navigation at the top of the markup and drops the in-content links
+underneath it — not a thinner frontier, the wrong one.
+
+Three of those on-by-default settings do cost the caller something:
+`main_content_only` is lossy in their own results, and `min_page_text_chars` and
+`use_sitemap` spend extra requests. That is the trade, not an oversight — say so
+in the comment at the setting, and keep the single flag that turns each one off
+working and documented.
 
 ## Releases
 

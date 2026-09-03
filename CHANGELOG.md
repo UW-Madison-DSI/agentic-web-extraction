@@ -7,11 +7,12 @@ Release for the tag. An empty `## Unreleased` aborts the release.
 
 ## Unreleased
 
-- **Per-domain pacing, and it is ON by default.** `AWE_REQUEST_DELAY` (default
-  `0.5`) is the minimum gap between the *starts* of two fetches to one registrable
-  domain; `AWE_MAX_PER_DOMAIN` (default `0`, off) caps how many are in flight
-  there at once. This is the one new default that changes behaviour, and it is
-  deliberate: the crawl boundary exists to keep a traversal on one site, so
+- **Per-domain pacing, on by default.** `AWE_REQUEST_DELAY` (default `0.5`) is
+  the minimum gap between the *starts* of two fetches to one registrable domain;
+  `AWE_MAX_PER_DOMAIN` (default `4`) caps how many are in flight there at once —
+  half the default `max_workers`, so it is a ceiling rather than a schedule and
+  binds only when an origin is answering slowly enough that five requests
+  overlap. The crawl boundary exists to keep a traversal on one site, so
   `max_workers` workers concentrate on a single origin and, before this, arrived
   as fast as httpx would go — the knob that makes the crawl fast was also what
   made it rude, with nothing in between. Set `AWE_REQUEST_DELAY=0` for the old
@@ -35,15 +36,19 @@ Release for the tag. An empty `## Unreleased` aborts the release.
     authorized to set aside is just a slower crawl.
 
 - **DOM-level boilerplate removal before the Markdown conversion**
-  (`AWE_MAIN_CONTENT_ONLY` / `--main-content-only`, default **off**). Drops
+  (`AWE_MAIN_CONTENT_ONLY` / `--main-content-only`, default **on**). Drops
   `script`/`style`/`noscript`/`template`, and `header`/`footer`/`nav`/`aside`
   elements that are **not** inside a `main` or `article`. That exception is the
   point: an article's own `<header>` holds its title and date, which is exactly
   what a target schema asks for, so the naive "remove every header" rule loses
   data on precisely the pages worth extracting from.
-  - Off by default because it is lossy in the caller's own results, and a default
-    that silently changes what the extraction sees is worse than the tokens it
-    saves.
+  - On by default because site chrome is most of the DOM on a typical page and
+    none of it answers the criterion, so leaving it in means every screen,
+    summarize and extract call pays for the same masthead again. It is lossy —
+    content a site keeps in an `<aside>` outside a `main`/`article` does not reach
+    the extraction — so `--no-main-content-only` turns it off. Flipping it is safe
+    with a warm cache: the page-cache key hashes the *filtered* markdown, so a
+    change of the setting misses rather than replaying the other rendering.
   - Governs the *extraction input* only. Link discovery reads the unfiltered HTML,
     so filtering a navigation block out of the markdown never hides the links
     inside it from the scorer.
@@ -68,8 +73,10 @@ Release for the tag. An empty `## Unreleased` aborts the release.
     crawl boundary at `frontier.push`. A pure function of the URL is the only kind
     of filter that is safe here.
   - `AWE_MAX_LINKS_PER_PAGE` (default `0`, off) caps links per scoring call, for
-    the mega-navigation page. Off by default because, unlike the extension filter,
-    truncating is lossy: a dropped link is one the crawl can never reach. Applied
+    the mega-navigation page. The one setting here left off, because no cap is
+    right for the typical page: truncation is keyed on document order, so an
+    ordinary site spends the allowance on its nav and loses the in-content links
+    underneath it. Applied
     *after* links the crawl has already seen are removed — capping the raw list
     first hands the whole allowance to the site-wide navigation at the top of every
     page, leaves nothing new to score, and starves the frontier after the seed.
@@ -77,21 +84,24 @@ Release for the tag. An empty `## Unreleased` aborts the release.
     `link_scores`; unset, the key shape is unchanged.
 
 - **A 200 that came back nearly empty can now trigger recovery**
-  (`AWE_MIN_PAGE_TEXT_CHARS`, default `0` = off). A single-page app answers 200
+  (`AWE_MIN_PAGE_TEXT_CHARS`, default `200`). A single-page app answers 200
   with a shell whose text arrives from JavaScript we do not run: it sailed past the
   status guard, normalized to almost nothing, was screened out as irrelevant, and
   left a log saying nothing was wrong — the one failure mode with no trigger and no
   trace. Failing to *obtain content* is what drives the chain, and this was the
   200-shaped version of it.
-  - Off by default: the remedy spends requests at a third party on a judgment only
-    the deployment can make, since a genuinely short page is indistinguishable from
-    a shell by character count.
+  - On at 200, matching `AWE_MIN_RECOVERED_TEXT_CHARS` so one number means "this
+    is the page" on both sides of the chain. What it costs is requests, at a third
+    party, on a page the origin already answered: a genuinely short page is
+    indistinguishable from a shell by character count, so a "this document has
+    moved" stub reaches jina/wayback too. Lower it rather than zeroing it if that
+    trade is wrong for you; `0` accepts any 200 as content.
   - The recovered body must carry **more** visible text than the origin's to win.
     `fallback.recover` compares routes against each other, never against the page
     already in hand, so without this a thinner rendering could replace a real page.
     Turning the threshold on can only improve what comes back.
 
-- **Sitemap seeding** (`AWE_USE_SITEMAP` / `--use-sitemap`, default off). Reads
+- **Sitemap seeding** (`AWE_USE_SITEMAP` / `--use-sitemap`, default **on**). Reads
   each seed origin's `robots.txt` `Sitemap:` lines, then `/sitemap.xml`, follows
   index documents, handles gzip, and offers what it finds to the link scorer.
   Best-first search's weakest spot is a page nothing links to prominently — page 12
@@ -105,6 +115,13 @@ Release for the tag. An empty `## Unreleased` aborts the release.
     a site cannot nominate a domain the caller refused just by listing it.
   - Consumes no fetch budget — budget counts readable pages, and a sitemap is not
     one — and is skipped entirely under `seed_is_content`.
+  - On by default because the URLs it finds are ranked, not privileged: the worst
+    case is frontier candidates the scorer never pops. What it costs is bounded
+    and spent at the origin being crawled, not a third party — at most
+    `AWE_SITEMAP_MAX_DOCUMENTS` extra requests per seed origin, paced like every
+    other fetch, before the traversal starts. It does change which pages a fixed
+    budget reaches, which is the point; `--no-use-sitemap` restores a frontier
+    containing only what the seed page itself links to.
   - Sitemap *documents* are restricted to the seed's own registrable domain. Both
     sources of locations — the `Sitemap:` lines in robots.txt and the `<loc>`s in a
     sitemap index — are written by the site being crawled, so without this an origin
