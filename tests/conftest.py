@@ -10,7 +10,7 @@ import threading
 import pytest
 from pydantic import BaseModel, Field
 
-from agentic_web_extraction import fallback, fetch
+from agentic_web_extraction import fallback, fetch, summarize
 from agentic_web_extraction.config import Settings
 from agentic_web_extraction.extractor import Extractor
 from agentic_web_extraction.fallback import Recovered
@@ -66,10 +66,21 @@ class StubWeb:
         self.fetched: list[str] = []
         # (url, user_agent) per request, so a test can assert what went on the wire.
         self.requests: list[tuple[str, str]] = []
+        # The per-request pacing floor each fetch was asked for -- an origin's own
+        # Crawl-delay, when robots.txt named one.
+        self.delays: list[float] = []
 
-    def fetch(self, url: str, *, user_agent: str = "") -> FetchedPage:
+    def fetch(
+        self,
+        url: str,
+        *,
+        user_agent: str = "",
+        min_delay: float = 0.0,
+        settings: object = None,
+    ) -> FetchedPage:
         self.fetched.append(url)
         self.requests.append((url, user_agent))
+        self.delays.append(min_delay)
         resolved = self.redirects.get(url, url)
         html = self.pages.get(resolved)
         if html is None:
@@ -110,15 +121,18 @@ class Route:
 
 @pytest.fixture(autouse=True)
 def clean_transport_memo():
-    """Forget written-off hosts around every test.
+    """Forget written-off hosts and reserved pace slots around every test.
 
-    `fetch`'s memo is process-wide, like the http clients it sits beside, so a test
-    that proves a host silent would otherwise decide how the next test's fetches are
-    routed.
+    Both are process-wide, like the http clients they sit beside, so a test that
+    proves a host silent -- or that reserved its next request slot a second into
+    the future -- would otherwise decide how the next test's fetches are routed
+    and when they run.
     """
     fetch.reset_transport_memo()
+    fetch.reset_pacing()
     yield
     fetch.reset_transport_memo()
+    fetch.reset_pacing()
 
 
 class FakeImpersonateResponse:
@@ -175,13 +189,24 @@ def fake_impersonate(monkeypatch):
 @pytest.fixture
 def settings() -> Settings:
     """Settings that never read the developer's environment for what matters here:
-    sequential waves (deterministic fetch order), no cache file, no log file."""
+    sequential waves (deterministic fetch order), no cache file, no log file, no
+    pacing delay, no sitemap pass."""
     return Settings(
         max_workers=1,
         max_fetches=10,
         llm_cache="",
         log_file="",
         fetch_fallbacks="",
+        # Politeness is ON by default (AWE_REQUEST_DELAY), which is right for a
+        # real crawl and pure wall-clock in a suite whose "network" is a dict.
+        # Tests that exercise pacing set their own delay.
+        request_delay=0.0,
+        # Sitemap seeding is ON by default too, and it is the one default that
+        # does not go through the monkeypatched `fetch.fetch` -- sitemap.py drives
+        # the httpx client directly, so leaving it on would put real requests to
+        # example.org in front of every traversal test. test_sitemap.py turns it
+        # on against its own fake transport.
+        use_sitemap=False,
         user_agent="awe-test/1.0 (+https://example.edu/crawler)",
     )
 
@@ -197,9 +222,45 @@ def make_extractor(settings, monkeypatch):
             criteria="anything",
             provider=StubProvider(),
             settings=kwargs.pop("settings", settings),
-            cache=None,
+            # Caching off unless a test asks for it: the store persists across
+            # runs by design, so a shared one would let the first test to run
+            # decide what the rest observe. A test about the cache passes its own.
+            cache=kwargs.pop("cache", None),
             log_file="",
             **kwargs,
         )
 
     return factory
+
+
+@pytest.fixture
+def fake_tokens(monkeypatch):
+    """Count and split on whitespace words instead of loading a real encoding.
+
+    `tiktoken` downloads its encoding table on first use, so anything that
+    exercises the fit-or-summarize path would otherwise need the network -- which
+    the rest of this suite is built to avoid. A word is a deterministic, obvious
+    stand-in for a token: `fit_pages` only ever compares a count against a budget
+    and slices text to fit one, and neither behaviour depends on which tokenizer
+    produced the number.
+    """
+
+    def count_tokens(text: str, model: str, encoding_name: str = "") -> int:
+        return len(text.split())
+
+    def split_by_tokens(
+        text: str, max_tokens: int, model: str, encoding_name: str = ""
+    ) -> list[str]:
+        if max_tokens <= 0:
+            return [text]
+        words = text.split()
+        if len(words) <= max_tokens:
+            return [text]
+        return [
+            " ".join(words[i : i + max_tokens])
+            for i in range(0, len(words), max_tokens)
+        ]
+
+    monkeypatch.setattr(summarize, "count_tokens", count_tokens)
+    monkeypatch.setattr(summarize, "split_by_tokens", split_by_tokens)
+    return count_tokens

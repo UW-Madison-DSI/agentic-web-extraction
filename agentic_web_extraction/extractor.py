@@ -11,6 +11,7 @@ from pydantic import BaseModel
 from . import fallback as fallback_module
 from . import fetch as fetch_module
 from . import logsink
+from . import sitemap as sitemap_module
 from .cache import (
     EXTRACT_NAMESPACE,
     PAGE_NAMESPACE,
@@ -90,6 +91,7 @@ class Extractor:
         settings: Settings | None = None,
         cache: KVCache | None | _DefaultCache = _DEFAULT_CACHE,
         log_file: str | None = None,
+        on_event: logsink.Subscriber | None = None,
     ) -> None:
         self.schema = schema
         self.criteria = criteria
@@ -102,6 +104,13 @@ class Extractor:
         logsink.configure(
             log_file=log_file if log_file is not None else self.settings.log_file,
         )
+        # Optional structured progress sink. Registered for the duration of
+        # `extract` (see below), so a host codebase can render a progress bar or
+        # forward to its own logger instead of scraping stderr -- the one way to
+        # follow a crawl before this. It receives every `logsink` line, including
+        # the transport and robots lines emitted from other modules, which is why
+        # it hooks the sink rather than this class's `_log`.
+        self.on_event = on_event
         self.provider = provider or get_provider(self.settings)
         self.normalize_html = (
             normalize_html if normalize_html is not None else self.settings.normalize
@@ -249,6 +258,24 @@ class Extractor:
     ) -> ExtractionResult:
         """Traverse from one or more seeds, then run a single consolidated extraction.
 
+        Thin wrapper: it registers the optional ``on_event`` subscriber for exactly
+        the duration of the crawl and delegates. The subscription is scoped here
+        rather than at construction so a subscriber never sees lines from a crawl
+        it did not ask about, and so it covers the consolidation and summarization
+        stages as well as the traversal.
+        """
+        with logsink.subscribed(self.on_event):
+            return self._extract(seeds, max_fetches, seed_is_content=seed_is_content)
+
+    def _extract(
+        self,
+        seeds: str | Sequence[str],
+        max_fetches: int | None = None,
+        *,
+        seed_is_content: bool | None = None,
+    ) -> ExtractionResult:
+        """Traverse from one or more seeds, then run a single consolidated extraction.
+
         Every seed is pushed into one shared frontier; the budget is
         ``max_fetches`` *per seed* (so ``max_fetches * len(seeds)`` total). The
         frontier is processed in parallel waves. The normalized markdown of every
@@ -309,6 +336,10 @@ class Extractor:
         # host that tarpitted an hour ago may be answering now. So each crawl starts
         # by re-testing, and the memo lasts exactly as long as it pays for itself.
         fetch_module.reset_transport_memo()
+        # Same reasoning for the per-domain pace gate beside it: reserved slots
+        # are evidence about this crawl's own traffic, and a long-lived process
+        # would otherwise accumulate an entry per domain it has ever touched.
+        fetch_module.reset_pacing()
 
         frontier = Frontier()
         for seed in seed_list:
@@ -348,6 +379,22 @@ class Extractor:
             seed_domains=seed_domains,
             direct=direct,
         )
+
+        # Sitemap seeding runs before the wave loop and on the main thread, which
+        # owns the frontier. It is not free -- a request per sitemap document, plus
+        # one scoring call -- so it is opt-in; and it deliberately happens *after*
+        # `allowed` is built, so a sitemap can never nominate a domain the boundary
+        # would refuse. It consumes no fetch budget: budget counts readable pages,
+        # and a sitemap is not one.
+        if self.settings.use_sitemap and not direct:
+            self._seed_from_sitemaps(
+                frontier,
+                seed_list=seed_list,
+                seed_ref=seed_ref,
+                seed_domains=seed_domains,
+                allowed=allowed,
+                blocked=blocked,
+            )
 
         with ThreadPoolExecutor(max_workers=workers) as pool:
             while pages_fetched < budget:
@@ -414,21 +461,14 @@ class Extractor:
                         # would break redirects, which httpx follows inside a single
                         # fetch. A link that is never queued is never fetched, which
                         # is the whole guarantee.
-                        if allowed is not None and domain_of(link_url) not in allowed:
-                            # Log each blocked URL once per crawl. A site-wide nav or
-                            # footer link is re-offered by every page it appears on,
-                            # and repeating the line per page buries the rest of the
-                            # log without adding a fact. `blocked` is per-crawl and
-                            # never consulted as policy, so a mid-crawl widening still
-                            # takes effect -- it only decides whether to log again.
-                            if link_url not in blocked:
-                                blocked.add(link_url)
-                                self._log(
-                                    f"    [blocked] {link_url} — outside the "
-                                    f"crawl boundary"
-                                )
-                            continue
-                        frontier.push(link_url, score=score, source=page.url)
+                        self._queue_link(
+                            frontier,
+                            link_url,
+                            score=score,
+                            source=page.url,
+                            allowed=allowed,
+                            blocked=blocked,
+                        )
 
         return self._consolidate_and_extract(
             matched_pages=matched_pages,
@@ -438,6 +478,130 @@ class Extractor:
             fallbacks_used=fallbacks_used,
             usage_by_function_at_start=usage_by_function_at_start,
         )
+
+    def _queue_link(
+        self,
+        frontier: Frontier,
+        link_url: str,
+        *,
+        score: float,
+        source: str,
+        allowed: set[str] | None,
+        blocked: set[str],
+    ) -> bool:
+        """Push one scored link, unless the crawl boundary refuses it.
+
+        The boundary is enforced HERE, at the queue point, and nowhere else.
+        Filtering in the worker instead would bake the current allowed set into the
+        page cache's stored link scores, so a later run with a different boundary
+        would replay the old one; filtering the HTTP request instead would break
+        redirects, which httpx follows inside a single fetch. A link that is never
+        queued is never fetched, which is the whole guarantee.
+
+        Shared by the fold loop and the sitemap seeding pass, so a URL the site
+        advertises is gated by exactly the same rule as one the scorer found on a
+        page -- a second copy of this check is a second place for the boundary to
+        drift.
+        """
+        if allowed is not None and domain_of(link_url) not in allowed:
+            # Log each blocked URL once per crawl. A site-wide nav or footer link
+            # is re-offered by every page it appears on, and repeating the line per
+            # page buries the rest of the log without adding a fact. `blocked` is
+            # per-crawl and never consulted as policy, so a mid-crawl widening
+            # still takes effect -- it only decides whether to log again.
+            if link_url not in blocked:
+                blocked.add(link_url)
+                self._log(f"    [blocked] {link_url} — outside the crawl boundary")
+            return False
+        return frontier.push(link_url, score=score, source=source)
+
+    def _seed_from_sitemaps(
+        self,
+        frontier: Frontier,
+        *,
+        seed_list: list[str],
+        seed_ref: str,
+        seed_domains: frozenset[str],
+        allowed: set[str] | None,
+        blocked: set[str],
+    ) -> None:
+        """Offer each seed origin's advertised URLs to the scorer, then queue them.
+
+        Scored, not pushed at a fixed score: relevance ranking is the navigation
+        policy, and a few hundred unranked URLs entering the heap would outnumber
+        everything the crawl actually reasoned about. One scoring call per origin,
+        on the cheap screen model.
+
+        Every failure here is survivable and logged -- a site with no sitemap is the
+        common case, and a crawl that dies because a third party served malformed
+        XML before it fetched its first page would be a poor trade for a hint.
+        """
+        origins: dict[str, str] = {}
+        for seed in seed_list:
+            parts = urlsplit(seed)
+            if parts.scheme in ("http", "https") and parts.netloc:
+                origins.setdefault(f"{parts.scheme}://{parts.netloc}", seed)
+        known = frontier.snapshot()
+        for origin, seed in origins.items():
+            self._log(f"[sitemap] looking for a sitemap at {origin}")
+            try:
+                found = sitemap_module.discover(
+                    seed,
+                    user_agent=self.user_agent,
+                    max_documents=self.settings.sitemap_max_documents,
+                    max_urls=self.settings.sitemap_max_urls,
+                    max_bytes=self.settings.sitemap_max_bytes,
+                    delay=self.settings.request_delay,
+                    max_per_domain=self.settings.max_per_domain,
+                    # Sitemaps are pages of the site like any other: a crawl that
+                    # honours robots.txt for its content while reading whatever it
+                    # likes at /sitemap.xml is honouring it selectively.
+                    allows=self.robots.allows if self.robots is not None else None,
+                )
+            except Exception as e:  # noqa: BLE001 - a hint must not cost the crawl
+                self._log(
+                    f"    ! sitemap discovery failed for {origin}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                continue
+            # Anchor text is genuinely absent -- a sitemap carries locations, not
+            # link text -- so the scorer ranks these on the URL alone. That is
+            # weaker evidence than a real anchor, and it is why these compete in
+            # the same heap rather than jumping it.
+            fresh = [("", url) for url in found if canonical(url) not in known]
+            if not fresh:
+                continue
+            score_kwargs: dict = {}
+            if self.prefer_seed_domain:
+                score_kwargs = {
+                    "seed_url": seed_ref,
+                    "on_seed_domain": {
+                        url: self._on_any_seed_domain(url, seed_domains)
+                        for _, url in fresh
+                    },
+                }
+            try:
+                scores = self.provider.score_links(
+                    fresh, "", self.criteria, **score_kwargs
+                )
+            except Exception as e:  # noqa: BLE001
+                self._log(
+                    f"    ! scoring sitemap URLs for {origin} failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+                continue
+            queued = sum(
+                self._queue_link(
+                    frontier,
+                    url,
+                    score=score,
+                    source=f"sitemap:{origin}",
+                    allowed=allowed,
+                    blocked=blocked,
+                )
+                for url, score in scores
+            )
+            self._log(f"    [sitemap] queued {queued} of {len(fresh)} URL(s)")
 
     @staticmethod
     def _pop_batch(frontier: Frontier, n: int) -> list[tuple[str, float, str]]:
@@ -531,11 +695,24 @@ class Extractor:
         # robots.txt (opt-in) is checked before the request, so a disallowed URL
         # costs no fetch, no budget slot and no LLM call. Safe from a worker thread:
         # the policy owns its cache and lock, and touches no traversal state.
-        if self.robots is not None and not self.robots.allows(url):
-            self._log(
-                f"    [robots] {url} disallowed for {self.user_agent!r} — skipping"
-            )
-            return self._policy_skip(url)
+        crawl_delay = 0.0
+        if self.robots is not None:
+            if not self.robots.allows(url):
+                self._log(
+                    f"    [robots] {url} disallowed for {self.user_agent!r} — skipping"
+                )
+                return self._policy_skip(url)
+            # An origin that publishes Crawl-delay has named a rate; honour it when
+            # it is slower than ours. Read from the parser the check above already
+            # cached, so it costs no extra request -- and passed down to `fetch`
+            # rather than applied here, so all pacing stays in one place and
+            # `fetch.py` never has to learn what robots.txt is.
+            crawl_delay = self.robots.crawl_delay(url)
+            if crawl_delay > self.settings.request_delay:
+                self._log(
+                    f"    [robots] {domain_of(url)} asks for a "
+                    f"{crawl_delay:g}s crawl delay"
+                )
         fetch_t0 = time.monotonic()
         try:
             # Send *this* Extractor's User-Agent, not whatever the process default
@@ -543,7 +720,17 @@ class Extractor:
             # second Extractor built meanwhile would otherwise rename this crawl's
             # traffic mid-flight -- and leave the agent sent diverging from the agent
             # the robots rules are evaluated against.
-            page = fetch_module.fetch(url, user_agent=self.user_agent)
+            page = fetch_module.fetch(
+                url,
+                user_agent=self.user_agent,
+                min_delay=crawl_delay,
+                # This Extractor's own settings, not the process-wide ones: the
+                # pace gate, the thin-page threshold and follow_pdf are all read
+                # inside `fetch`, and without this `Extractor(settings=...)` --
+                # which is what the CLI's settings-only flags are built on --
+                # would silently not reach them.
+                settings=self.settings,
+            )
         except Exception as e:
             self._log(f"    ! fetch failed on {url}: {type(e).__name__}: {e}")
             return _PageOutcome(
@@ -586,6 +773,7 @@ class Extractor:
                     page.content_type,
                     url=page.url,
                     text_filters=self.text_filters,
+                    main_content_only=self.settings.main_content_only,
                 )
                 if self.normalize_html or page.kind == "pdf"
                 else page.text
@@ -607,6 +795,13 @@ class Extractor:
             key_prefix = f"{key_prefix}:seeddom={','.join(sorted(seed_domains))}"
         if direct:
             key_prefix = f"{key_prefix}:direct"
+        if self.settings.max_links_per_page > 0:
+            # The cap decides which links get scored, so it decides the
+            # `link_scores` this entry stores. Without it in the key, raising or
+            # removing the cap would replay the old truncated list -- the same
+            # failure the crawl boundary is kept out of the worker to avoid. Only
+            # added when set, so the default key shape is unchanged.
+            key_prefix = f"{key_prefix}:links={self.settings.max_links_per_page}"
         cache_key = f"{key_prefix}:{content_hash(page_md)}:{page.url}"
         cached_raw = self._cache_get(PAGE_NAMESPACE, cache_key)
         if cached_raw is not None:
@@ -661,6 +856,18 @@ class Extractor:
                     for text, link in extract_links(page.text, base_url=page.url)
                     if canonical(link) not in known
                 ]
+                # Capped *after* the known-filter, deliberately. Truncating the raw
+                # list first would hand the whole allowance to the site-wide
+                # navigation at the top of every page -- links the crawl has
+                # already queued -- so `fresh` would come back empty and the
+                # frontier would starve after the seed.
+                cap = self.settings.max_links_per_page
+                if cap > 0 and len(fresh) > cap:
+                    self._log(
+                        f"    [links] {page.url} offered {len(fresh)} new links — "
+                        f"scoring the first {cap}"
+                    )
+                    fresh = fresh[:cap]
             except Exception as e:
                 # A single malformed href must not cost the whole crawl. `urlsplit`
                 # raises ValueError on a bracketed-host URL (`http://a[b]c.com/`),

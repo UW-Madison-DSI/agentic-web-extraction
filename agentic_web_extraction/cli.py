@@ -8,7 +8,7 @@ from typing import Annotated
 import typer
 from pydantic import BaseModel
 
-from .config import get_settings
+from .config import get_settings, settings_schema
 from .extractor import Extractor
 
 app = typer.Typer(
@@ -120,6 +120,85 @@ def extract(
             help=(
                 "Wave concurrency / beam width: how many top-scored links are "
                 "fetched/screened/scored at once. Defaults to AWE_MAX_WORKERS (8)."
+            ),
+        ),
+    ] = None,
+    request_delay: Annotated[
+        float | None,
+        typer.Option(
+            "--request-delay",
+            help=(
+                "Minimum seconds between fetches to the same registrable domain. "
+                "Defaults to AWE_REQUEST_DELAY (0.5). Set 0 to disable pacing -- "
+                "note the crawl boundary concentrates every worker on one origin, "
+                "so unpaced means --max-workers requests at once to one site. When "
+                "--respect-robots is on and an origin publishes a Crawl-delay, the "
+                "larger of the two applies."
+            ),
+        ),
+    ] = None,
+    max_per_domain: Annotated[
+        int | None,
+        typer.Option(
+            "--max-per-domain",
+            help=(
+                "Cap on fetches in flight to one registrable domain. Defaults to "
+                "AWE_MAX_PER_DOMAIN (4, half the default worker count; 0 = no "
+                "cap). --request-delay already bounds the rate; this bounds the "
+                "connections a small origin's pool sees."
+            ),
+        ),
+    ] = None,
+    main_content_only: Annotated[
+        bool | None,
+        typer.Option(
+            "--main-content-only/--no-main-content-only",
+            help=(
+                "Drop script/style/noscript/template, and header/footer/nav/aside "
+                "outside a <main> or <article>, before converting HTML to Markdown. "
+                "Cuts site chrome out of every screen, summarize and extract call. "
+                "Defaults to AWE_MAIN_CONTENT_ONLY (on); --no-main-content-only "
+                "keeps everything, for a site that puts real content in its chrome. "
+                "Link discovery reads the unfiltered HTML either way."
+            ),
+        ),
+    ] = None,
+    max_links_per_page: Annotated[
+        int | None,
+        typer.Option(
+            "--max-links-per-page",
+            help=(
+                "Cap on outgoing links from one page sent to the link scorer. "
+                "Defaults to AWE_MAX_LINKS_PER_PAGE (0 = no cap). Lossy, and keyed "
+                "on document order: a cap can spend its whole allowance on the "
+                "site-wide nav at the top of the markup."
+            ),
+        ),
+    ] = None,
+    min_page_text_chars: Annotated[
+        int | None,
+        typer.Option(
+            "--min-page-text-chars",
+            help=(
+                "Treat a 200 carrying less visible text than this as a failure to "
+                "obtain content and send it through the recovery chain, so a "
+                "client-rendered shell gets rendered rather than silently screened "
+                "out. Defaults to AWE_MIN_PAGE_TEXT_CHARS (200); 0 turns it off. "
+                "The recovered body only wins if it is fuller than the origin's."
+            ),
+        ),
+    ] = None,
+    use_sitemap: Annotated[
+        bool | None,
+        typer.Option(
+            "--use-sitemap/--no-use-sitemap",
+            help=(
+                "Before traversing, read each seed origin's sitemap and offer its "
+                "URLs to the link scorer, so the frontier starts with pages the "
+                "site advertises rather than only what the seed page links to. "
+                "Discovered URLs are scored, boundary-gated and robots-checked like "
+                "any other link. Defaults to AWE_USE_SITEMAP (on); "
+                "--no-use-sitemap keeps the frontier to what the seed page links to."
             ),
         ),
     ] = None,
@@ -238,13 +317,25 @@ def extract(
     # Apply the settings-only knobs from the CLI via a copy of the base settings
     # (leaving the cached singleton untouched); everything else keeps its
     # AWE_* / env default.
-    overrides: dict[str, int | bool] = {}
+    overrides: dict[str, int | bool | float] = {}
     if max_context_tokens is not None:
         overrides["max_context_tokens"] = max_context_tokens
     if always_summarize is not None:
         overrides["always_summarize"] = always_summarize
     if max_workers is not None:
         overrides["max_workers"] = max_workers
+    if request_delay is not None:
+        overrides["request_delay"] = request_delay
+    if max_per_domain is not None:
+        overrides["max_per_domain"] = max_per_domain
+    if main_content_only is not None:
+        overrides["main_content_only"] = main_content_only
+    if max_links_per_page is not None:
+        overrides["max_links_per_page"] = max_links_per_page
+    if min_page_text_chars is not None:
+        overrides["min_page_text_chars"] = min_page_text_chars
+    if use_sitemap is not None:
+        overrides["use_sitemap"] = use_sitemap
     settings = get_settings().model_copy(update=overrides) if overrides else None
     # Don't pass `cache` unless disabling: omitting it lets the Extractor build the
     # on-by-default store; `cache=None` is the explicit off switch.
@@ -272,3 +363,15 @@ def extract(
     )
     typer.echo(json.dumps(result.to_dict(), indent=2))
     sys.exit(0 if result.stopped_reason == "match" else 2)
+
+
+@app.command()
+def schema() -> None:
+    """Print the JSON Schema of every AWE_* setting: names, types and defaults.
+
+    For a host codebase that wants to validate a configuration, or build a form
+    for one, without importing the Extractor or re-reading the README. Values are
+    never included -- this describes the settings, it does not read the
+    environment -- so the output is safe to print, log, or serve.
+    """
+    typer.echo(json.dumps(settings_schema(), indent=2))

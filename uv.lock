@@ -11,6 +11,7 @@ name = "agentic-web-extraction"
 version = "0.2.3"
 source = { editable = "." }
 dependencies = [
+    { name = "beautifulsoup4" },
     { name = "httpx" },
     { name = "markitdown" },
     { name = "openai" },
@@ -36,6 +37,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "beautifulsoup4", specifier = ">=4.12" },
     { name = "curl-cffi", marker = "extra == 'impersonate'", specifier = ">=0.15" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "markitdown", specifier = ">=0.1.5" },

@@ -175,6 +175,31 @@ class RobotsPolicy:
             return True
         return parser.can_fetch(self.user_agent, url)
 
+    def crawl_delay(self, url: str) -> float:
+        """Seconds this origin asks the crawl to leave between requests, else 0.
+
+        Read from the already-cached parser, so it costs no extra request. An
+        override exempts a domain from the *rules*; it also exempts it from the
+        delay, since the two are one policy and honouring half of a policy a
+        deployment has been authorized to set aside is just a slower crawl.
+
+        Failure to read one is 0, not an error: the caller's own
+        ``AWE_REQUEST_DELAY`` still applies, so the crawl stays paced either way.
+        """
+        if self.overrides and domain_of(url) in self.overrides:
+            return 0.0
+        parser = self._parser_for(url)
+        if parser is None:
+            return 0.0
+        try:
+            delay = parser.crawl_delay(self.user_agent)
+        except Exception:  # noqa: BLE001 - a malformed directive is not a policy
+            return 0.0
+        try:
+            return max(0.0, float(delay)) if delay is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
     def _parser_for(self, url: str) -> RobotFileParser | None:
         origin = _origin(url)
         if not origin:

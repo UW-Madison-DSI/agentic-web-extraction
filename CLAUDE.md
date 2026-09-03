@@ -12,7 +12,7 @@ Managed with **uv** (Python ≥3.13, build backend `uv_build`):
 
 ```bash
 uv sync            # install deps (incl. dev group)
-uv run awe         # CLI entry point (`awe extract ...`)
+uv run awe         # CLI entry point (`awe extract ...`, `awe schema`)
 uv run ruff check  # lint
 uv run ruff format # format
 uv run ty check    # type-check (Astral's ty, not mypy)
@@ -26,7 +26,10 @@ Tests live in [tests/](tests/) and are deliberately network-free: [tests/conftes
 supplies a `StubProvider` (screens everything in, scores every link 0.9) and a
 `StubWeb` (url → html, plus a redirect map and a fetch log), so a test asserts on
 *which pages the traversal chose to fetch*. Anything needing a real LLM or a real
-site doesn't belong here.
+site doesn't belong here — including *indirectly*: `tiktoken` downloads its
+encoding table on first use, so anything touching the fit-or-summarize path takes
+the `fake_tokens` fixture (whitespace words for tokens) rather than letting a real
+encoding load.
 
 ## Architecture
 
@@ -49,7 +52,8 @@ Two hard controls sit on top of that policy, both off/generic by default:
 `allowed_domains` (a default-deny set of registrable domains, enforced at the
 `frontier.push` call site — off-boundary links are dropped and logged `[blocked]`,
 never fetched) and `respect_robots` (per-origin robots.txt, checked in the worker
-*before* the fetch). Plus `user_agent`, so the traffic is attributable.
+*before* the fetch). Plus `user_agent`, so the traffic is attributable, and
+per-domain pacing (`AWE_REQUEST_DELAY`, **on**), so it is bearable.
 
 Key files: [extractor.py](agentic_web_extraction/extractor.py) (wave loop + consolidate),
 [summarize.py](agentic_web_extraction/summarize.py) (fit-or-summarize),
@@ -58,7 +62,8 @@ Key files: [extractor.py](agentic_web_extraction/extractor.py) (wave loop + cons
 [frontier.py](agentic_web_extraction/frontier.py) (heap + visited set + snapshot + PSL
 domain compare + `domain_of` allow keys), [fetch.py](agentic_web_extraction/fetch.py) (httpx + status
 guard + transport-failure recovery + per-domain transport memo + UA),
-[robots.py](agentic_web_extraction/robots.py) (opt-in robots.txt policy),
+[robots.py](agentic_web_extraction/robots.py) (opt-in robots.txt policy + `Crawl-delay`),
+[sitemap.py](agentic_web_extraction/sitemap.py) (opt-in sitemap discovery, hardened XML),
 [fallback.py](agentic_web_extraction/fallback.py) (impersonate/jina/wayback recovery),
 [normalize.py](agentic_web_extraction/normalize.py),
 [providers/](agentic_web_extraction/providers/),
@@ -303,9 +308,137 @@ guard + transport-failure recovery + per-domain transport memo + UA),
   failing at import. Its sessions wrap a libcurl handle and are **not** thread-safe:
   one per (thread, target) in a `threading.local`, never the module-level `_client`
   singleton pattern the httpx clients use.
+- **Politeness is transport state, and both of its knobs are ON.**
+  `AWE_REQUEST_DELAY` (0.5s) spaces the *starts* of two fetches to one registrable
+  domain; `AWE_MAX_PER_DOMAIN` (4, half the default `max_workers`, 0 = off) caps
+  how many are in flight there — a ceiling rather than a schedule, binding only
+  when an origin is slow enough that five requests overlap. Both
+  live in [fetch.py](agentic_web_extraction/fetch.py) beside the transport memo
+  for the same reason the memo does — they are facts about the *default
+  transport* — and key through `frontier.domain_of` like every other host
+  comparison. `fetch()` reads them from the `Settings` it is **handed**, not from
+  `get_settings()`: without that, `Extractor(settings=...)` — which is what the
+  CLI's settings-only flags are built on — reaches nothing inside `fetch`. The
+  memo threshold and the attempt budget stay global, deliberately: the memo is
+  shared across every Extractor in the process, and tenacity calls the attempt
+  predicate from a retry hook that cannot see the call's arguments. The default is on because being impolite is a defect whose cost
+  lands on somebody else, and because the crawl boundary *causes* the problem it
+  fixes: keeping a traversal on one site means `max_workers` workers concentrate
+  on a single origin, so the knob that makes the crawl fast was also what made it
+  rude, with nothing in between. Three rules to keep. Slots are **reserved under
+  the lock and slept for outside it**: a thread holding the lock while sleeping
+  would serialize every domain behind one, and threads that each *read* "next
+  allowed" and slept toward the same instant would all wake together — pacing
+  that reads correctly in a log and changes nothing at the origin. The gate wraps
+  the whole retry sequence, not each attempt, since tenacity already backs off
+  ≥1s. And it gates the **origin fetch only**, never the recovery routes: `jina`
+  and `wayback` talk to a third party whose rate limit has nothing to do with the
+  crawled origin's, and pacing them under the origin's key would throttle the
+  wrong host. An origin's `Crawl-delay` is read off the parser `robots.allows`
+  already cached and passed down as `fetch(min_delay=...)` — larger of the two
+  wins — so `fetch.py` never learns what robots.txt is. A `robots_overrides`
+  domain is exempt from the delay too: honouring half of a policy the operator
+  has been authorized to set aside is just a slower crawl.
+- **A filter that runs in the worker must be a pure function of the URL.** The
+  worker's output is what the `PAGE` cache stores, so anything varying with
+  configuration gets baked into an entry and replayed under a different
+  configuration later — the same argument that keeps the crawl boundary at
+  `frontier.push`. That is why `normalize.extract_links` drops extensions
+  `fetch._classify` could never accept as content (`.zip`, `.jpg`, `.css`,
+  `.docx`) but **not** `.pdf`, and deliberately does not consult `follow_pdf`:
+  the filter is invariant, so caching it is safe, and `fetch` skips an unwanted
+  PDF cheaply anyway. It costs nothing in outcome — those links were fetched,
+  classified `skipped` and dropped after the scorer had already been billed — so
+  unlike `max_links_per_page` (the one knob here left off) it is always on. That
+  cap,
+  being configuration, *is* in the `PAGE` key (a `links=N` segment, added only
+  when set) — and it is applied in the fold path **after** the `known` filter,
+  never inside `extract_links`: capping the raw list hands the whole allowance to
+  the site-wide nav at the top of every page, so `fresh` comes back empty and the
+  frontier starves after the seed.
+- **DOM filtering governs the extraction input, never link discovery.**
+  `AWE_MAIN_CONTENT_ONLY` (**on** by default: site chrome is most of the DOM and
+  none of it answers a criterion, so leaving it in means every screen, summarize
+  and extract call pays for the same masthead again — it *is* lossy in the
+  caller's results, which is what the off switch is for, and flipping it is
+  cache-safe because the page-cache key hashes the filtered markdown) strips
+  `script`/`style`/`noscript`/`template`, plus
+  `header`/`footer`/`nav`/`aside` elements **not inside a `main` or `article`** —
+  an article's own `<header>` holds its title and date, which is exactly what a
+  schema asks for, so the naive "remove every header" rule loses data on the
+  pages worth extracting from. This is *not* the site-specific munging this
+  library bans from `normalize.py`: it names only standard sectioning elements.
+  Link discovery reads the *unfiltered* `page.text`, so filtering a nav out of
+  the markdown never hides the links in it from the scorer — keep that
+  separation. bs4 is pinned to the stdlib `html.parser`, never lxml-if-available:
+  which parser is used changes the emitted markup, which changes the content hash
+  every cache key is built on, and a cache that misses because a wheel is present
+  on one machine and not another is worse than a slower parse.
+- **A thin 200 is a failure to obtain content.** `AWE_MIN_PAGE_TEXT_CHARS` (on
+  at 200, matching `min_recovered_text_chars` so one number means "is this the
+  page" on both sides of the chain) sends a fetched HTML page carrying too little
+  visible text through the recovery chain — the single-page-app case, which was the one
+  refusal with no trigger and no trace: past the status guard, normalized to
+  nothing, screened out as irrelevant, logged as an ordinary page. Consistent
+  with the doctrine that the chain is driven by failure to obtain content rather
+  than by status. Two things keep it safe and must stay: it reuses
+  `fallback.visible_text` (the same measure `recover` uses, so there is one
+  definition of "is this the page"), and the recovered body must be **fuller than
+  the origin's** to win — `recover` compares routes against each other, never
+  against the page already in hand, so its "fullest sub-threshold body" can be
+  worse than what the origin served. Its cost is requests, at a third party, on a
+  page the origin already answered: a genuinely short page is indistinguishable
+  from a shell by character count, so a stub falls through to jina/wayback too.
+  Lower the threshold rather than zeroing it if that trade is wrong for a
+  deployment.
+- **Sitemap URLs go through the frontier, never around it.**
+  [sitemap.py](agentic_web_extraction/sitemap.py) (`AWE_USE_SITEMAP`, on by
+  default — the URLs are ranked, not privileged, so the worst case is candidates
+  the scorer never pops, and the extra requests are bounded and go to the origin
+  being crawled) is frontier *seeding*, not a second navigation policy: discovered
+  URLs are handed to the same `score_links`, gated by the same `_queue_link`, and checked against
+  the same robots policy. Pushing a few hundred unranked URLs at a fixed score
+  would drown the relevance ordering that is the entire policy. It runs on the
+  main thread (which owns the frontier) *after* `allowed` is built, so a site
+  cannot nominate a domain the caller refused just by listing it; it consumes no
+  fetch budget (budget counts readable pages); and it is skipped under
+  `seed_is_content`, which asserts the seeds already are the content. The XML is
+  written by the party being crawled: a body declaring a DTD or an entity is
+  refused *unparsed* (ElementTree really does expand internal general entities),
+  bodies are size-capped before parsing, only `http`/`https` locations are
+  returned, and sitemap *documents* are restricted to the seed's own registrable
+  domain — both sources of locations (robots.txt `Sitemap:` lines and an index's
+  `<loc>`s) are attacker-controlled, and the crawl boundary does not cover them
+  because it gates links entering the frontier while these are fetched before
+  that. Its fetches go through the same pace gate as pages. Don't relax those into a parser configuration — a refusal of the
+  construct cannot be reasoned around, a parser setting has to be re-verified on
+  every upgrade.
+- **A setting defaults ON when the typical crawl is better off and one flag
+  reverts it; OFF when no single value is right for the typical crawl, or when a
+  wrong value decides *which pages exist* rather than what they contain.** On:
+  `request_delay`/`max_per_domain` (the cost is ours, the benefit is somebody
+  else's), the extension filter (no outcome changes at all), `main_content_only`
+  (chrome is most of the DOM and answers no criterion), `min_page_text_chars` (a
+  client-rendered shell is otherwise a silent no-op), `use_sitemap` (its URLs are
+  scored like any other link). Off: `max_links_per_page`, alone — truncation
+  keeps document order, so a cap spends the allowance on the site-wide nav and
+  drops the in-content links underneath it, which is not a thinner frontier but
+  the wrong one. Three of the on defaults do cost the caller something
+  (`main_content_only` is lossy; `min_page_text_chars` and `use_sitemap` spend
+  requests): that is the trade, so keep it stated at the setting and keep the one
+  flag that turns each off working.
 - **Logging: never a bare `print`.** All diagnostics go through `logsink.emit` → stderr
   (stdout is reserved for result JSON). A `log_file` path (env `AWE_LOG_FILE`, empty =
-  off) also appends timestamped lines. See [logsink.py](agentic_web_extraction/logsink.py).
+  off) also appends timestamped lines, and `Extractor(on_event=...)` subscribes a
+  callable to the same stream for the duration of `extract`. Lines carry a
+  bracketed `[tag]` prefix by convention and `Event.kind` is derived from it, so
+  keep emitting them that way — best-effort, not a stable API, which is why the
+  raw message travels alongside. Subscribers are notified **outside** `logsink`'s
+  lock (it is not reentrant, and a subscriber that logs — forwarding to another
+  logger is half the point — would deadlock the crawl), while the file write
+  stays inside it (concurrent emits would interleave half-lines). A subscriber
+  that raises is swallowed: a progress display must not cost a crawl that is
+  otherwise working. See [logsink.py](agentic_web_extraction/logsink.py).
 - **On-by-default LLM cache is generic, at three levels.** Caching is on by default: the
   Extractor builds a `SqliteKVCache` at `AWE_LLM_CACHE` (`data/llm_cache.sqlite`) unless
   the caller passes their own `KVCache`, passes `cache=None` to disable, or the setting is
@@ -391,6 +524,14 @@ guard + transport-failure recovery + per-domain transport memo + UA),
   bundled libcurl-impersonate binary, so a deployment image (glibc vs musl) needs its
   own wheel check. Not in the dev group either: the tests drive the route through a fake
   session and skip the one import-dependent case, so `uv run pytest` passes without it.
+- `beautifulsoup4` — DOM filtering in `normalize.strip_boilerplate`. Already arrived
+  transitively via markitdown; now declared, since depending on a transitive dependency
+  is depending on somebody else's dependency choices. **Pinned to the stdlib
+  `html.parser`** — see the DOM-filtering convention above on why the parser choice is
+  a cache-stability question.
+- `xml.etree.ElementTree` (stdlib) — sitemap parsing. It **does** expand internal
+  general entities, so `sitemap.py` refuses a body declaring a DTD or an entity before
+  parsing rather than relying on parser configuration.
 - `tldextract` — PSL lookup for the domain comparison; constructed with
   `suffix_list_urls=()` to use the bundled offline snapshot (no runtime network fetch).
 - `tiktoken` — token counting + token-aware splitting ([tokens.py](agentic_web_extraction/tokens.py)).
@@ -413,9 +554,14 @@ guard + transport-failure recovery + per-domain transport memo + UA),
 ## CLI contract
 
 ```
+awe schema     # JSON Schema of every AWE_* setting (names, types, defaults, env)
+
 awe extract --schema ./schemas.py:Opportunities --criteria "..." \
   --seed-url https://... [--seed-url https://... ...] \
   [--max-fetches 10] [--max-context-tokens 128000] [--max-workers 8] \
+  [--request-delay 0.5] [--max-per-domain 0] \
+  [--main-content-only | --no-main-content-only] [--max-links-per-page 0] \
+  [--min-page-text-chars 0] [--use-sitemap | --no-use-sitemap] \
   [--always-summarize | --no-always-summarize] \
   [--seed-is-content | --no-seed-is-content] \
   [--prefer-seed-domain | --no-prefer-seed-domain] \

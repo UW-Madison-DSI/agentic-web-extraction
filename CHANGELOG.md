@@ -7,6 +7,188 @@ Release for the tag. An empty `## Unreleased` aborts the release.
 
 ## Unreleased
 
+- **Per-domain pacing, on by default.** `AWE_REQUEST_DELAY` (default `0.5`) is
+  the minimum gap between the *starts* of two fetches to one registrable domain;
+  `AWE_MAX_PER_DOMAIN` (default `4`) caps how many are in flight there at once —
+  half the default `max_workers`, so it is a ceiling rather than a schedule and
+  binds only when an origin is answering slowly enough that five requests
+  overlap. The crawl boundary exists to keep a traversal on one site, so
+  `max_workers` workers concentrate on a single origin and, before this, arrived
+  as fast as httpx would go — the knob that makes the crawl fast was also what
+  made it rude, with nothing in between. Set `AWE_REQUEST_DELAY=0` for the old
+  behavior.
+  - Enforced in [fetch.py](agentic_web_extraction/fetch.py) beside the transport
+    memo, for the same reason: it is a fact about the *default transport*, keyed
+    through `frontier.domain_of` like every other host comparison. Slots are
+    reserved under the lock and slept for outside it, so N concurrent workers
+    queue at t, t+delay, t+2·delay rather than all waking at the same instant —
+    pacing that reads correctly in a log and changes nothing at the origin.
+  - Gates the origin fetch only, never the recovery routes: `jina` and `wayback`
+    talk to a third party whose rate limit has nothing to do with the crawled
+    origin's, and pacing them under the origin's key would throttle the wrong host.
+  - Wrapped around the whole retry sequence rather than each attempt, since
+    tenacity already backs off ≥1s between attempts.
+  - With `respect_robots` on, an origin's own `Crawl-delay` is honoured when it
+    asks for more than `AWE_REQUEST_DELAY`. Read off the parser the allow-check
+    already cached (no extra request) and passed down as `fetch(min_delay=...)`,
+    so `fetch.py` never learns what robots.txt is. A `robots_overrides` domain is
+    exempt from the delay too — honouring half of a policy the operator has been
+    authorized to set aside is just a slower crawl.
+
+- **DOM-level boilerplate removal before the Markdown conversion**
+  (`AWE_MAIN_CONTENT_ONLY` / `--main-content-only`, default **on**). Drops
+  `script`/`style`/`noscript`/`template`, and `header`/`footer`/`nav`/`aside`
+  elements that are **not** inside a `main` or `article`. That exception is the
+  point: an article's own `<header>` holds its title and date, which is exactly
+  what a target schema asks for, so the naive "remove every header" rule loses
+  data on precisely the pages worth extracting from.
+  - On by default because site chrome is most of the DOM on a typical page and
+    none of it answers the criterion, so leaving it in means every screen,
+    summarize and extract call pays for the same masthead again. It is lossy —
+    content a site keeps in an `<aside>` outside a `main`/`article` does not reach
+    the extraction — so `--no-main-content-only` turns it off. Flipping it is safe
+    with a warm cache: the page-cache key hashes the *filtered* markdown, so a
+    change of the setting misses rather than replaying the other rendering.
+  - Governs the *extraction input* only. Link discovery reads the unfiltered HTML,
+    so filtering a navigation block out of the markdown never hides the links
+    inside it from the scorer.
+  - `beautifulsoup4` is now a declared dependency (markitdown already pulled it
+    in; [normalize.py](agentic_web_extraction/normalize.py) now imports it
+    directly). Pinned to the stdlib `html.parser`: which parser bs4 picks changes
+    the markup it emits, which changes the content hash every cache key is built
+    on, and a cache that misses because a wheel is present on one machine and not
+    another is worse than a marginally slower parse.
+
+- **Links no fetch could read are dropped before the scorer is billed for them.**
+  `fetch._classify` admits HTML and PDF and nothing else, so a link to a `.zip`,
+  `.jpg`, `.mp4` or `.css` was fetched, classified `skipped` and dropped — after
+  the link scorer had already ranked it. `normalize.extract_links` now filters
+  those out. No change in outcome, only in cost, which is why this one is on.
+  - A deny list, not an allow list: `.php`, `.aspx`, `.do` and every extensionless
+    URL are pages.
+  - `.pdf` is absent from the list and deliberately **not** gated on `follow_pdf`.
+    This filter runs in the worker, whose output the `PAGE` cache stores, so
+    anything varying with configuration would be baked into an entry and replayed
+    under a different configuration later — the same reasoning that keeps the
+    crawl boundary at `frontier.push`. A pure function of the URL is the only kind
+    of filter that is safe here.
+  - `AWE_MAX_LINKS_PER_PAGE` (default `0`, off) caps links per scoring call, for
+    the mega-navigation page. The one setting here left off, because no cap is
+    right for the typical page: truncation is keyed on document order, so an
+    ordinary site spends the allowance on its nav and loses the in-content links
+    underneath it. Applied
+    *after* links the crawl has already seen are removed — capping the raw list
+    first hands the whole allowance to the site-wide navigation at the top of every
+    page, leaves nothing new to score, and starves the frontier after the seed.
+    It joins the `PAGE` cache key when set, since it decides the stored
+    `link_scores`; unset, the key shape is unchanged.
+
+- **A 200 that came back nearly empty can now trigger recovery**
+  (`AWE_MIN_PAGE_TEXT_CHARS`, default `200`). A single-page app answers 200
+  with a shell whose text arrives from JavaScript we do not run: it sailed past the
+  status guard, normalized to almost nothing, was screened out as irrelevant, and
+  left a log saying nothing was wrong — the one failure mode with no trigger and no
+  trace. Failing to *obtain content* is what drives the chain, and this was the
+  200-shaped version of it.
+  - On at 200, matching `AWE_MIN_RECOVERED_TEXT_CHARS` so one number means "this
+    is the page" on both sides of the chain. What it costs is requests, at a third
+    party, on a page the origin already answered: a genuinely short page is
+    indistinguishable from a shell by character count, so a "this document has
+    moved" stub reaches jina/wayback too. Lower it rather than zeroing it if that
+    trade is wrong for you; `0` accepts any 200 as content.
+  - The recovered body must carry **more** visible text than the origin's to win.
+    `fallback.recover` compares routes against each other, never against the page
+    already in hand, so without this a thinner rendering could replace a real page.
+    Turning the threshold on can only improve what comes back.
+
+- **Sitemap seeding** (`AWE_USE_SITEMAP` / `--use-sitemap`, default **on**). Reads
+  each seed origin's `robots.txt` `Sitemap:` lines, then `/sitemap.xml`, follows
+  index documents, handles gzip, and offers what it finds to the link scorer.
+  Best-first search's weakest spot is a page nothing links to prominently — page 12
+  of a listing sits behind a paginator no scorer ranks highly — and a sitemap puts
+  it in the frontier at the start.
+  - Discovered URLs go **through** the frontier: scored by the same scorer, gated
+    by the same crawl boundary, checked against the same robots policy. Pushing a
+    few hundred unranked URLs at a fixed score would drown the relevance ordering
+    that is the entire navigation policy.
+  - Runs on the main thread (which owns the frontier) after `allowed` is built, so
+    a site cannot nominate a domain the caller refused just by listing it.
+  - Consumes no fetch budget — budget counts readable pages, and a sitemap is not
+    one — and is skipped entirely under `seed_is_content`.
+  - On by default because the URLs it finds are ranked, not privileged: the worst
+    case is frontier candidates the scorer never pops. What it costs is bounded
+    and spent at the origin being crawled, not a third party — at most
+    `AWE_SITEMAP_MAX_DOCUMENTS` extra requests per seed origin, paced like every
+    other fetch, before the traversal starts. It does change which pages a fixed
+    budget reaches, which is the point; `--no-use-sitemap` restores a frontier
+    containing only what the seed page itself links to.
+  - Sitemap *documents* are restricted to the seed's own registrable domain. Both
+    sources of locations — the `Sitemap:` lines in robots.txt and the `<loc>`s in a
+    sitemap index — are written by the site being crawled, so without this an origin
+    could name any address and have the client fetch it: another tenant's host, an
+    internal service, a cloud instance's link-local metadata endpoint. The crawl
+    boundary does not cover it, because that gates links entering the *frontier* and
+    these are documents fetched before that.
+  - Sitemap fetches go through the same pace gate as pages: they are the first
+    requests a crawl makes.
+  - The XML is written by the site being crawled, which is not a trusted party:
+    `AWE_SITEMAP_MAX_BYTES` caps a body before parsing, a document declaring a
+    DTD or an entity is refused unparsed (ElementTree does expand internal general
+    entities, so billion-laughs works against it), and only `http`/`https`
+    locations are returned. `AWE_SITEMAP_MAX_DOCUMENTS` and `AWE_SITEMAP_MAX_URLS`
+    bound what one seed can cost.
+
+- **`Extractor(on_event=...)`: structured progress without parsing stderr.** A
+  subscriber receives a `logsink.Event(kind, message)` for every emitted line, for
+  exactly the duration of `extract`. `kind` is the bracketed tag the lines already
+  carry by convention (`fetch`, `blocked`, `robots`, `summarize`), so a caller can
+  branch without parsing prose — best-effort, not a stable API, which is why the
+  message is carried verbatim alongside it.
+  - Hooks the sink rather than the Extractor's `_log`, so the transport, robots and
+    fallback lines reach it too.
+  - Subscribers are notified outside `logsink`'s lock: it is not reentrant, and a
+    subscriber that logs — forwarding to another logger is half the point — would
+    otherwise deadlock the crawl. A subscriber that raises is swallowed; a progress
+    display must not cost a crawl that is otherwise working.
+
+- **`awe schema` / `config.settings_schema()`** publish the JSON Schema of every
+  setting: names, types, defaults, and an `env` key naming the variable that sets
+  each one. A host codebase can now validate a configuration, or build a form for
+  one, without importing the Extractor. It reads no values, so the output is safe
+  to print, log or serve.
+
+- **Tests for the half that costs money.** The suite covered fetch, boundary,
+  robots and recovery, and nothing else — caching, summarization, consolidation and
+  frontier ordering had no tests at all, which are the parts where a fault is
+  expensive and silent. Added `test_cache_keys.py`, `test_summarize.py`,
+  `test_frontier_order.py`, plus coverage for everything above.
+  - A new `fake_tokens` fixture counts whitespace words instead of loading a real
+    encoding. `tiktoken` downloads its table on first use, so the summarization
+    path was reachable only with network — which also made
+    `test_a_malformed_url_never_aborts_the_crawl` fail offline. It now passes.
+  - `make_extractor` accepts a `cache=`; it hardcoded `cache=None`, which is why
+    the cache had no tests.
+
+- **`fetch()` now takes the caller's `Settings`.** Everything it reads — the pace
+  gate, the thin-page threshold, `follow_pdf` — came from the process-wide
+  `get_settings()`, so `Extractor(settings=...)` silently did not reach any of it,
+  and the CLI's settings-only flags are built on exactly that. The Extractor passes
+  its own settings per fetch; a direct caller still gets the process defaults. The
+  transport memo threshold and the attempt budget stay global on purpose: the memo
+  is shared across every Extractor in the process, and tenacity calls the attempt
+  predicate from a retry hook with no access to the call's arguments.
+
+- **Charset detection was broken under `main_content_only`.** The body was decoded
+  to `str` before BeautifulSoup saw it, so the document's own `<meta charset>` was
+  never consulted and a windows-1251 page that declares its encoding only in the
+  markup arrived as replacement characters — silently, in the text the extraction
+  model reads. bs4 now gets the undecoded bytes, with the HTTP header's charset as
+  a hint it can override.
+
+- **LICENSE (MIT) and CONTRIBUTING.md.** The package had no licence file at all,
+  which left it legally unusable by default — including by the two org repos that
+  already depend on it.
+
 - **Docs** — caught the documentation up with v0.2.x. `.env.example` was missing
   `AWE_TRANSPORT_MEMO_FAILURES` and `AWE_MIN_RECOVERED_TEXT_CHARS` entirely, so both
   v0.2.3 knobs were undiscoverable from the file deployments actually copy. The
