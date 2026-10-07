@@ -7,18 +7,29 @@ Release for the tag. An empty `## Unreleased` aborts the release.
 
 ## Unreleased
 
-- **Link-scorer output cap, on by default.** `AWE_SCORE_OUTPUT_TOKENS_PER_LINK`
-  (default `100`) caps each `score_links` call at `4000 + 100 × links` output
-  tokens. The scorer can fall into the same whitespace loop that
+- **Output caps on the screen model's calls, on by default.** `score_links` is
+  capped at `4000 + the links' URLs in tokens + 100 × links` output tokens and
+  `screen` at `4000 + 1000`. Both calls can fall into the same whitespace loop that
   `AWE_MAX_OUTPUT_TOKENS` guards against on extraction. Uncapped, such a call ran to
   the endpoint limit, outlasted the 600 s read timeout, was re-sent by the SDK, and
   failed anyway as a `ValidationError` 13–22 minutes later. One crawl took 3 h 48 min
   instead of about 80 min ([#6](https://github.com/UW-Madison-DSI/agentic-web-extraction/issues/6)).
-  The scorer's output size is known (one url and score per link), so the default
-  leaves 3–5× headroom over normal calls, and a capped runaway now fails in a minute
-  or two with the same result: that page's links stay unscored. A cutoff that yields
-  no parsed object now raises an explicit error instead of a bare `assert`. Set the
-  variable to `0` to send no cap.
+  Both outputs have a known size, so a capped runaway now fails in a minute or two
+  with the same result: that page goes unscreened or its links unscored.
+  - Settings: `AWE_SCORE_OUTPUT_TOKENS_PER_LINK` (default `100`) and
+    `AWE_SCREEN_OUTPUT_TOKENS` (default `1000`), each `<= 0` = no cap on that call;
+    `AWE_REASONING_OUTPUT_TOKENS` (default `4000`), the reasoning allowance in both.
+  - The scorer's cap counts each URL's tokens, because the scorer echoes every URL
+    exactly and a page of long URLs needs more room than a page of short ones.
+  - `AWE_SCREEN_MODEL_MAX_OUTPUT_TOKENS` (default `0` = unknown) clamps both caps to
+    the endpoint's limit. A 400 that refuses one of these caps (an over-limit
+    `max_output_tokens`, or a vLLM-style "maximum context length") is retried once
+    without a cap and logged, so a call that worked before the caps still works.
+    An explicit `AWE_MAX_OUTPUT_TOKENS` on extraction is never dropped that way.
+  - Tokens billed for a call the cap cut off mid-JSON are now counted in
+    `usage_by_function` (the SDK's parse used to raise before usage was recorded;
+    this applies to `extract` too). A cutoff with no parsed object raises an
+    explicit error from all three structured calls instead of a bare `assert`.
 - **Per-domain pacing, on by default.** `AWE_REQUEST_DELAY` (default `0.5`) is
   the minimum gap between the *starts* of two fetches to one registrable domain;
   `AWE_MAX_PER_DOMAIN` (default `4`) caps how many are in flight there at once —

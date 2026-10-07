@@ -2,10 +2,19 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, TypeVar
+from types import SimpleNamespace
+from typing import Literal, Protocol, TypeVar
 
 import httpx
-from openai import OpenAI, Omit, RateLimitError, omit
+from openai import (
+    APIStatusError,
+    BadRequestError,
+    OpenAI,
+    Omit,
+    RateLimitError,
+    UnprocessableEntityError,
+    omit,
+)
 from openai.types.responses import ParsedResponse
 from pydantic import BaseModel, Field
 
@@ -13,6 +22,7 @@ from .. import logsink
 from ..config import Settings
 from ..result import ScreenVerdict, Usage
 from ..schema_outline import schema_outline_safe
+from ..tokens import count_tokens
 
 DEFAULT_SCREEN_PROMPT = (
     "You are a precise relevance judge. Decide if the PAGE matches the CRITERION.\n"
@@ -100,17 +110,67 @@ _TIER_STANDARD: _Tier = "auto"
 _TIMEOUT_STANDARD = 600.0
 _TIMEOUT_FLEX = 1800.0
 
-# Fixed part of the score_links output cap; the per-link part is
-# Settings.score_output_tokens_per_link. Sized for reasoning tokens, which bill as
-# output and arrive before the first scored link.
-_SCORE_OUTPUT_BASE_TOKENS = 4000
-
 _T = TypeVar("_T")
+_T_co = TypeVar("_T_co", covariant=True)
+
+
+class _RawParsed(Protocol[_T_co]):
+    """What `responses.with_raw_response.parse(...)` returns, as far as we use it.
+
+    The raw wrapper defers the SDK's structured parse to `.parse()`, so when that
+    parse fails -- the usual shape of an output cap cutting the JSON off mid-string
+    -- the billed usage is still readable off `http_response`.
+    """
+
+    http_response: httpx.Response
+
+    def parse(self) -> ParsedResponse[_T_co]: ...
 
 
 def _yn(on_seed_domain: bool | None) -> str:
     """Render the on-domain signal for the prompt (None = host unparseable)."""
     return {True: "yes", False: "no", None: "unknown"}[on_seed_domain]
+
+
+def _rejects_output_cap(error: APIStatusError) -> bool:
+    """True for a 400/422 that refuses the request's max_output_tokens.
+
+    OpenAI names the parameter (`param`); OpenAI-compatible servers often don't,
+    and a vLLM-style server refuses an input + cap that exceeds the context length
+    with a "maximum context length" message instead. Some compatible servers
+    validate request fields with a 422 rather than a 400, so both are accepted.
+    Matched loosely on purpose: a false positive costs one uncapped retry of a
+    call that failed anyway.
+    """
+    if getattr(error, "param", None) in ("max_output_tokens", "max_tokens"):
+        return True
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in ("max_output_tokens", "max_tokens", "maximum context length")
+    )
+
+
+def _billed(raw: _RawParsed[object]) -> object:
+    """A stand-in carrying only `usage`, for a response the SDK failed to parse.
+
+    Read leniently, field by field, in the shape `_accumulate` reads: a strict
+    model validation would drop the whole count over one missing detail field.
+    """
+    try:
+        usage = raw.http_response.json().get("usage") or {}
+        details = usage.get("input_tokens_details") or {}
+        return SimpleNamespace(
+            usage=SimpleNamespace(
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                input_tokens_details=SimpleNamespace(
+                    cached_tokens=details.get("cached_tokens", 0)
+                ),
+            )
+        )
+    except Exception:  # noqa: BLE001 -- best-effort accounting, never the failure
+        return SimpleNamespace(usage=None)
 
 
 def _is_capacity_refusal(error: RateLimitError) -> bool:
@@ -311,26 +371,82 @@ class OpenAIProvider:
             f"elapsed={elapsed:.2f}s {tok} {status}"
         )
 
-    def _parsed_or_raise(
+    def _screen_model_cap(self, wanted: int) -> int:
+        """Clamp a screen-model output cap to the endpoint's limit, when known."""
+        ceiling = self.settings.screen_model_max_output_tokens
+        return min(wanted, ceiling) if ceiling > 0 else wanted
+
+    def _structured_call(
         self,
-        response: ParsedResponse[_T],
+        send: Callable[[_Tier | Omit, int | Omit], _RawParsed[_T]],
+        *,
+        cap: int | None,
+        retry_uncapped: bool,
         what: str,
         step: str,
         model: str,
+        function: str,
         in_chars: int,
-        elapsed: float,
-        delta: Usage,
     ) -> _T:
-        """Return the parsed object, or log the call as failed and raise.
+        """Issue one structured-output call and return its parsed object.
 
-        Unlike the chat-completions helper, the Responses parser raises nothing when
-        a call ends without a parsed object -- the model hit max_output_tokens before
-        emitting any text, or the response is otherwise unusable -- it just leaves
-        output_parsed None. So the failure is surfaced explicitly, and logged as a
-        failure rather than as the "ok" the usage delta alone would suggest. (A
-        cutoff mid-document is different: the SDK's parse raises ValidationError
-        before a response object ever reaches the caller.)
+        Shared by screen, score_links and extract, which differ only in the request
+        `send(tier, cap)` builds. Three things happen here so they can't drift apart:
+
+        - With `retry_uncapped`, an endpoint that refuses `cap` (a 400, or a 422)
+          gets the call once more without one, logged. That is for the screen-model caps,
+          which are on by default and grow with the input while nothing knows the
+          endpoint's own limit unless Settings.screen_model_max_output_tokens says
+          so; without the retry, turning the caps on would break calls that worked
+          uncapped. extract() passes False: its cap is one the caller set on
+          purpose as a runaway backstop, so a refusal surfaces rather than being
+          silently traded for an uncapped call. A non-positive cap is never sent.
+        - Usage is recorded whatever the outcome. A cap that cuts the JSON off
+          mid-string makes the SDK's parse raise before a response object exists,
+          so the request goes through `with_raw_response` and the billed tokens are
+          read off the raw body instead of vanishing from usage_by_function.
+        - A response with no parsed object (the Responses parser raises nothing
+          when the model hit the cap before emitting any text -- unlike the
+          chat-completions helper, it does not raise LengthFinishReasonError) is
+          logged as a failure and raised, not returned as None.
         """
+        t0 = time.monotonic()
+        if cap is not None and cap <= 0:
+            # e.g. a negative reasoning_output_tokens: the endpoint would refuse it
+            # on every call, so it means "no cap" like the per-call knobs' <= 0.
+            cap = None
+        sent: int | Omit = omit if cap is None else cap
+        try:
+            try:
+                raw = self._tiered(lambda tier: send(tier, sent))
+            except (BadRequestError, UnprocessableEntityError) as e:
+                if cap is None or not retry_uncapped or not _rejects_output_cap(e):
+                    raise
+                hint = (
+                    ""
+                    if self.settings.screen_model_max_output_tokens > 0
+                    else " (set AWE_SCREEN_MODEL_MAX_OUTPUT_TOKENS to the model's "
+                    "limit to keep one)"
+                )
+                logsink.emit(
+                    f"    [llm {step}] endpoint refused max_output_tokens={cap}; "
+                    f"retrying without a cap{hint}"
+                )
+                raw = self._tiered(lambda tier: send(tier, omit))
+        except BaseException as e:
+            self._log_call(step, model, in_chars, time.monotonic() - t0, None, e)
+            raise
+        try:
+            response = raw.parse()
+        except Exception as e:
+            delta = self._accumulate(_billed(raw), model, function)
+            self._log_call(step, model, in_chars, time.monotonic() - t0, delta, e)
+            raise
+        # Accumulated before the outcome is known: a truncated or refused response
+        # is billed like any other, and the capped case is exactly the one a caller
+        # re-rolls, making those tokens easy to lose track of.
+        delta = self._accumulate(response, model, function)
+        elapsed = time.monotonic() - t0
         parsed = response.output_parsed
         if parsed is None:
             reason = getattr(response.incomplete_details, "reason", None)
@@ -368,36 +484,30 @@ class OpenAIProvider:
                 f"ON_SEED_DOMAIN: {_yn(on_seed_domain)}\n\n"
             )
         payload = f"{domain_block}PAGE:\n{truncated}"
-        t0 = time.monotonic()
-        try:
-            response = self._tiered(
-                lambda tier: self._client.responses.parse(
-                    model=self.model_screen,
-                    instructions=instructions,
-                    input=payload,
-                    text_format=_ScreenSchema,
-                    service_tier=tier,
-                )
-            )
-        except BaseException as e:
-            self._log_call(
-                "screen",
-                self.model_screen,
-                len(payload),
-                time.monotonic() - t0,
-                None,
-                e,
-            )
-            raise
-        delta = self._accumulate(response, self.model_screen, "screen")
-        parsed = self._parsed_or_raise(
-            response,
-            "screening",
-            "screen",
-            self.model_screen,
-            len(payload),
-            time.monotonic() - t0,
-            delta,
+        # On by default: the answer is a bool and one sentence, so a runaway
+        # generation is the only way to need more. See Settings.screen_output_tokens.
+        answer = self.settings.screen_output_tokens
+        cap = (
+            self._screen_model_cap(self.settings.reasoning_output_tokens + answer)
+            if answer > 0
+            else None
+        )
+        parsed = self._structured_call(
+            lambda tier, max_out: self._client.responses.with_raw_response.parse(
+                model=self.model_screen,
+                instructions=instructions,
+                input=payload,
+                text_format=_ScreenSchema,
+                max_output_tokens=max_out,
+                service_tier=tier,
+            ),
+            cap=cap,
+            retry_uncapped=True,
+            what="screening",
+            step="screen",
+            model=self.model_screen,
+            function="screen",
+            in_chars=len(payload),
         )
         return ScreenVerdict(match=parsed.match, reason=parsed.reason)
 
@@ -439,41 +549,48 @@ class OpenAIProvider:
             f"SOURCE PAGE EXCERPT:\n{page_excerpt}\n\n"
             f"LINKS TO SCORE (one per line):\n{link_block}"
         )
-        step = f"score_links[{len(links)}]"
         # On by default, unlike extract()'s cap: the output is one url + score per
-        # link, so its size is known before the call. A runaway generation then
-        # fails in a minute or two instead of outlasting the read timeout and being
-        # re-sent by the SDK. See Settings.score_output_tokens_per_link.
+        # link, so its size is known before the call. The URLs are counted because
+        # the scorer echoes each one exactly. A runaway generation then fails in a
+        # minute or two instead of outlasting the read timeout and being re-sent by
+        # the SDK. See Settings.score_output_tokens_per_link.
         per_link = self.settings.score_output_tokens_per_link
-        cap = (
-            _SCORE_OUTPUT_BASE_TOKENS + per_link * len(links) if per_link > 0 else omit
-        )
-        t0 = time.monotonic()
-        try:
-            response = self._tiered(
-                lambda tier: self._client.responses.parse(
-                    model=self.model_screen,
-                    instructions=instructions,
-                    input=payload,
-                    text_format=_LinkScores,
-                    max_output_tokens=cap,
-                    service_tier=tier,
+        cap = None
+        if per_link > 0:
+            urls = "\n".join(url for _, url in links)
+            try:
+                url_tokens = count_tokens(
+                    urls, self.model_screen, self.settings.tiktoken_encoding
                 )
+            except Exception as e:  # noqa: BLE001 -- sizing must not cost the call
+                # tiktoken fetches its table on first use; if it can't, size on
+                # characters -- generous for URLs, which are almost all ASCII.
+                logsink.emit(
+                    f"    [llm score_links] token count unavailable "
+                    f"({type(e).__name__}); sizing the cap on characters"
+                )
+                url_tokens = len(urls)
+            cap = self._screen_model_cap(
+                self.settings.reasoning_output_tokens
+                + url_tokens
+                + per_link * len(links)
             )
-        except BaseException as e:
-            self._log_call(
-                step, self.model_screen, len(payload), time.monotonic() - t0, None, e
-            )
-            raise
-        delta = self._accumulate(response, self.model_screen, "score_links")
-        parsed = self._parsed_or_raise(
-            response,
-            "link scoring",
-            step,
-            self.model_screen,
-            len(payload),
-            time.monotonic() - t0,
-            delta,
+        parsed = self._structured_call(
+            lambda tier, max_out: self._client.responses.with_raw_response.parse(
+                model=self.model_screen,
+                instructions=instructions,
+                input=payload,
+                text_format=_LinkScores,
+                max_output_tokens=max_out,
+                service_tier=tier,
+            ),
+            cap=cap,
+            retry_uncapped=True,
+            what="link scoring",
+            step=f"score_links[{len(links)}]",
+            model=self.model_screen,
+            function="score_links",
+            in_chars=len(payload),
         )
         url_set = {url for _, url in links}
         scored: dict[str, float] = {}
@@ -541,36 +658,21 @@ class OpenAIProvider:
         # Unset (0) sends no cap, so the wire is unchanged from before this knob
         # existed. When set, it bounds a degenerate generation -- see
         # Settings.max_output_tokens for why schema-guided decoding needs the
-        # backstop and how to size it.
-        cap = self.settings.max_output_tokens or omit
-        t0 = time.monotonic()
-        try:
-            response = self._tiered(
-                lambda tier: self._client.responses.parse(
-                    model=self.model_extract,
-                    instructions=self.extract_prompt,
-                    input=payload,
-                    text_format=schema,
-                    max_output_tokens=cap,
-                    service_tier=tier,
-                )
-            )
-        except BaseException as e:
-            self._log_call(
-                step, self.model_extract, len(payload), time.monotonic() - t0, None, e
-            )
-            raise
-        # Accumulated before the outcome is known: a truncated or refused response
-        # is billed like any other, so leaving it out would under-report what a run
-        # actually cost -- and the capped case below is exactly the one a caller
-        # re-rolls, making those tokens easy to lose track of.
-        delta = self._accumulate(response, self.model_extract, usage_tag)
-        return self._parsed_or_raise(
-            response,
-            "extraction",
-            step,
-            self.model_extract,
-            len(payload),
-            time.monotonic() - t0,
-            delta,
+        # backstop and how to size it. (A non-positive cap is never sent.)
+        return self._structured_call(
+            lambda tier, max_out: self._client.responses.with_raw_response.parse(
+                model=self.model_extract,
+                instructions=self.extract_prompt,
+                input=payload,
+                text_format=schema,
+                max_output_tokens=max_out,
+                service_tier=tier,
+            ),
+            cap=self.settings.max_output_tokens,
+            retry_uncapped=False,
+            what="extraction",
+            step=step,
+            model=self.model_extract,
+            function=usage_tag,
+            in_chars=len(payload),
         )

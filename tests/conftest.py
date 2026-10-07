@@ -15,6 +15,7 @@ from agentic_web_extraction.config import Settings
 from agentic_web_extraction.extractor import Extractor
 from agentic_web_extraction.fallback import Recovered
 from agentic_web_extraction.fetch import FetchedPage
+from agentic_web_extraction.providers import openai_provider
 from agentic_web_extraction.result import ScreenVerdict, Usage
 
 
@@ -238,7 +239,8 @@ def fake_tokens(monkeypatch):
     """Count and split on whitespace words instead of loading a real encoding.
 
     `tiktoken` downloads its encoding table on first use, so anything that
-    exercises the fit-or-summarize path would otherwise need the network -- which
+    exercises the fit-or-summarize path (or sizes a score_links output cap)
+    would otherwise need the network -- which
     the rest of this suite is built to avoid. A word is a deterministic, obvious
     stand-in for a token: `fit_pages` only ever compares a count against a budget
     and slices text to fit one, and neither behaviour depends on which tokenizer
@@ -263,4 +265,6 @@ def fake_tokens(monkeypatch):
 
     monkeypatch.setattr(summarize, "count_tokens", count_tokens)
     monkeypatch.setattr(summarize, "split_by_tokens", split_by_tokens)
+    # The score_links output cap counts the links' URLs in tokens.
+    monkeypatch.setattr(openai_provider, "count_tokens", count_tokens)
     return count_tokens

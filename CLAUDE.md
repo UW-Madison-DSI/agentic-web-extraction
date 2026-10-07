@@ -27,7 +27,8 @@ supplies a `StubProvider` (screens everything in, scores every link 0.9) and a
 `StubWeb` (url → html, plus a redirect map and a fetch log), so a test asserts on
 *which pages the traversal chose to fetch*. Anything needing a real LLM or a real
 site doesn't belong here — including *indirectly*: `tiktoken` downloads its
-encoding table on first use, so anything touching the fit-or-summarize path takes
+encoding table on first use, so anything touching the fit-or-summarize path (or
+`OpenAIProvider.score_links`, whose output cap counts URL tokens) takes
 the `fake_tokens` fixture (whitespace words for tokens) rather than letting a real
 encoding load.
 
@@ -191,13 +192,27 @@ guard + transport-failure recovery + per-domain transport memo + UA),
   Deliberately not in any cache key and not a CLI flag: it is a per-deployment
   backstop, and a value below the largest legitimate extraction turns a working call
   into a failing one.
-  The link scorer has its own cap, `score_output_tokens_per_link` (env
-  `AWE_SCORE_OUTPUT_TOKENS_PER_LINK`, default `100`; cap = `4000 + N × links`, `0` =
-  none), and it is **on** by default because the scorer's output size is known in
-  advance (one url + score per link), which the extraction's is not. Not in any cache
-  key either. A capped cutoff with no parsed object raises from `score_links` just as
-  it does from `extract()`, and the worker's existing `stage_error` path keeps the page
-  out of the `PAGE` cache.
+  The screen model's two structured calls have their own caps, **on** by default
+  because their output size is known in advance, which the extraction's is not:
+  `score_links` = `reasoning_output_tokens` (4000) + the links' URLs in tokens +
+  `score_output_tokens_per_link` (100) × links — the URLs are counted because the
+  scorer echoes each one exactly — and `screen` = `reasoning_output_tokens` +
+  `screen_output_tokens` (1000); `<= 0` on either per-call knob sends no cap there.
+  Because a cap that grows with the input can exceed an endpoint's own limit (and
+  nothing knows that limit), `screen_model_max_output_tokens` (0 = unknown) clamps
+  both, and a 400/422 refusing the cap is retried **once** uncapped and logged — so
+  an endpoint limit below the cap can never break a call that worked without one.
+  That retry is for these two computed caps only: `extract()`'s cap is the caller's
+  deliberate backstop, so a refused one surfaces as an error. What the caps *can*
+  break is a screen-model call that legitimately reasons past
+  `reasoning_output_tokens`; a failed screen also skips that page's link scoring,
+  so the answer to that is a larger allowance, not removing the cap.
+  None of these is in any cache key. All three structured calls go through
+  `_structured_call`, which keeps those rules in one place: it sends via
+  `with_raw_response` so tokens billed for a mid-JSON cutoff (where the SDK's parse
+  raises before a response object exists) still reach `usage_by_function`, and it
+  raises on a response with no parsed object; the worker's existing `stage_error`
+  path keeps such a page out of the `PAGE` cache.
 - **Summarization is schema-aware, but must not become extraction.** It's the only lossy
   step (the extract model never sees the original text), so `fit_pages` threads the target
   schema into every `provider.summarize` call and the provider appends
@@ -427,15 +442,16 @@ guard + transport-failure recovery + per-domain transport memo + UA),
   else's), the extension filter (no outcome changes at all), `main_content_only`
   (chrome is most of the DOM and answers no criterion), `min_page_text_chars` (a
   client-rendered shell is otherwise a silent no-op), `use_sitemap` (its URLs are
-  scored like any other link), `score_output_tokens_per_link` (the scorer's
-  output size is known, and uncapped a runaway call burns 13–22 minutes). Off:
+  scored like any other link), `score_output_tokens_per_link`/
+  `screen_output_tokens` (the output size is known, and uncapped a runaway call
+  burns 13–22 minutes). Off:
   `max_links_per_page`, alone — truncation keeps document order, so a cap spends
   the allowance on the site-wide nav and drops the in-content links underneath
   it, which is not a thinner frontier but the wrong one. Four of the on defaults
   do cost the caller something (`main_content_only` is lossy;
   `min_page_text_chars` and `use_sitemap` spend requests;
-  `score_output_tokens_per_link` fails a scoring call that legitimately needs
-  more than the cap): that is the trade, so keep it stated at the setting and
+  the screen-model caps fail a call that legitimately needs more than the cap):
+  that is the trade, so keep it stated at the setting and
   keep the one flag that turns each off working.
 - **Logging: never a bare `print`.** All diagnostics go through `logsink.emit` → stderr
   (stdout is reserved for result JSON). A `log_file` path (env `AWE_LOG_FILE`, empty =

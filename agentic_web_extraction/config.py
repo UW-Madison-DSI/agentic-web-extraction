@@ -300,21 +300,43 @@ class Settings(BaseSettings):
     # Size it above the largest legitimate extraction for the schema in use; a cap
     # below that truncates good output, turning a working call into a failing one.
     max_output_tokens: int = 0
-    # Per-link output-token cap for the link-scoring call (env:
-    # AWE_SCORE_OUTPUT_TOKENS_PER_LINK). Each score_links call is capped at
-    # 4000 + this × len(links); 0 sends no cap. The 4000 base leaves room for
-    # reasoning tokens, which bill as output.
+    # Output-token caps for the screen model's two structured calls, screen and
+    # score_links. Both are prone to the same whitespace/repetition loop described
+    # at max_output_tokens above, but unlike extraction their output size is known
+    # in advance, so both caps are on by default. A capped runaway fails as it did
+    # before (that page goes unscreened or its links unscored, and nothing is
+    # cached), only in a minute or two rather than the 13-22 minutes it takes to
+    # outlast the read timeout and the SDK's retries. None of these is part of any
+    # cache key: they change cost and latency, not what a successful call returns.
     #
-    # The scorer is prone to the same whitespace/repetition loop described at
-    # max_output_tokens above, but unlike extraction its output size is known in
-    # advance -- one url and one score per link -- so the cap is on by default.
-    # Normal calls use roughly 1.8-2.3k output tokens for 28-77 links, so the
-    # default leaves 3-5x headroom. A capped runaway fails as it did before (the
-    # page's links stay unscored and nothing is cached), only in a minute or two
-    # rather than the 13-22 minutes it takes to outlast the read timeout and the
-    # SDK's retries. Not part of any cache key: it changes cost and latency, not
-    # what a successful call returns.
+    # score_links is capped at reasoning_output_tokens + the links' URLs counted
+    # in tokens + score_output_tokens_per_link × len(links). The URLs are counted
+    # because the scorer must echo each one exactly, so a page of long URLs needs
+    # more room than a page of short ones; the per-link term covers the JSON
+    # around each URL plus the score. Normal calls use roughly 1.8-2.3k output
+    # tokens for 28-77 links, far inside the default. <= 0 sends no cap on
+    # score_links (env: AWE_SCORE_OUTPUT_TOKENS_PER_LINK).
     score_output_tokens_per_link: int = 100
+    # screen is capped at reasoning_output_tokens + this: its answer is a bool and
+    # a one-sentence reason. <= 0 sends no cap on screen (env:
+    # AWE_SCREEN_OUTPUT_TOKENS).
+    screen_output_tokens: int = 1000
+    # The fixed allowance in both caps above for reasoning tokens, which bill as
+    # output and arrive before the answer (env: AWE_REASONING_OUTPUT_TOKENS). Raise
+    # it for a screen model that reasons at length.
+    reasoning_output_tokens: int = 4000
+    # The most output tokens the screen model's endpoint accepts (env:
+    # AWE_SCREEN_MODEL_MAX_OUTPUT_TOKENS); 0 = unknown. The score_links cap grows
+    # with the link count, so on a link-heavy page (or a 200-URL sitemap batch) it
+    # can exceed a model's output limit -- 16,384 for gpt-4o-mini -- or, on a
+    # vLLM-style endpoint, input + cap can exceed the context length. Either way
+    # the endpoint rejects the request with a 400. Set this and both caps are
+    # clamped to the output limit (which avoids the first refusal, not the
+    # second). Set or not, a 400 that names the cap is retried once without one
+    # (logged), so a call that worked before the caps existed still works -- it
+    # just loses the runaway protection for that one call. extract()'s
+    # max_output_tokens is never retried that way: the caller set it on purpose.
+    screen_model_max_output_tokens: int = 0
     # Wave concurrency / beam width (env: AWE_MAX_WORKERS). The traversal processes
     # the frontier in waves: it pops up to this many top-scored links at once and
     # fetches/screens/scores them concurrently in a thread pool, then folds the
