@@ -7,6 +7,18 @@ Release for the tag. An empty `## Unreleased` aborts the release.
 
 ## Unreleased
 
+- **Link-scorer output cap, on by default.** `AWE_SCORE_OUTPUT_TOKENS_PER_LINK`
+  (default `100`) caps each `score_links` call at `4000 + 100 × links` output
+  tokens. The scorer can fall into the same whitespace loop that
+  `AWE_MAX_OUTPUT_TOKENS` guards against on extraction. Uncapped, such a call ran to
+  the endpoint limit, outlasted the 600 s read timeout, was re-sent by the SDK, and
+  failed anyway as a `ValidationError` 13–22 minutes later. One crawl took 3 h 48 min
+  instead of about 80 min ([#6](https://github.com/UW-Madison-DSI/agentic-web-extraction/issues/6)).
+  The scorer's output size is known (one url and score per link), so the default
+  leaves 3–5× headroom over normal calls, and a capped runaway now fails in a minute
+  or two with the same result: that page's links stay unscored. A cutoff that yields
+  no parsed object now raises an explicit error instead of a bare `assert`. Set the
+  variable to `0` to send no cap.
 - **Per-domain pacing, on by default.** `AWE_REQUEST_DELAY` (default `0.5`) is
   the minimum gap between the *starts* of two fetches to one registrable domain;
   `AWE_MAX_PER_DOMAIN` (default `4`) caps how many are in flight there at once —

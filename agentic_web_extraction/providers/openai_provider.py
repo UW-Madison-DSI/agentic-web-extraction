@@ -6,6 +6,7 @@ from typing import Literal, TypeVar
 
 import httpx
 from openai import OpenAI, Omit, RateLimitError, omit
+from openai.types.responses import ParsedResponse
 from pydantic import BaseModel, Field
 
 from .. import logsink
@@ -98,6 +99,11 @@ _TIER_STANDARD: _Tier = "auto"
 # 600s that is ample for a large standard extraction is raised when flex is on.
 _TIMEOUT_STANDARD = 600.0
 _TIMEOUT_FLEX = 1800.0
+
+# Fixed part of the score_links output cap; the per-link part is
+# Settings.score_output_tokens_per_link. Sized for reasoning tokens, which bill as
+# output and arrive before the first scored link.
+_SCORE_OUTPUT_BASE_TOKENS = 4000
 
 _T = TypeVar("_T")
 
@@ -305,6 +311,38 @@ class OpenAIProvider:
             f"elapsed={elapsed:.2f}s {tok} {status}"
         )
 
+    def _parsed_or_raise(
+        self,
+        response: ParsedResponse[_T],
+        what: str,
+        step: str,
+        model: str,
+        in_chars: int,
+        elapsed: float,
+        delta: Usage,
+    ) -> _T:
+        """Return the parsed object, or log the call as failed and raise.
+
+        Unlike the chat-completions helper, the Responses parser raises nothing when
+        a call ends without a parsed object -- the model hit max_output_tokens before
+        emitting any text, or the response is otherwise unusable -- it just leaves
+        output_parsed None. So the failure is surfaced explicitly, and logged as a
+        failure rather than as the "ok" the usage delta alone would suggest. (A
+        cutoff mid-document is different: the SDK's parse raises ValidationError
+        before a response object ever reaches the caller.)
+        """
+        parsed = response.output_parsed
+        if parsed is None:
+            reason = getattr(response.incomplete_details, "reason", None)
+            detail = f"status={response.status}" + (
+                f" reason={reason}" if reason else ""
+            )
+            error = AssertionError(f"{what} returned no parsed object ({detail})")
+            self._log_call(step, model, in_chars, elapsed, delta, error)
+            raise error
+        self._log_call(step, model, in_chars, elapsed, delta)
+        return parsed
+
     def screen(
         self,
         page_md: str,
@@ -352,11 +390,15 @@ class OpenAIProvider:
             )
             raise
         delta = self._accumulate(response, self.model_screen, "screen")
-        self._log_call(
-            "screen", self.model_screen, len(payload), time.monotonic() - t0, delta
+        parsed = self._parsed_or_raise(
+            response,
+            "screening",
+            "screen",
+            self.model_screen,
+            len(payload),
+            time.monotonic() - t0,
+            delta,
         )
-        parsed = response.output_parsed
-        assert parsed is not None
         return ScreenVerdict(match=parsed.match, reason=parsed.reason)
 
     def score_links(
@@ -397,6 +439,15 @@ class OpenAIProvider:
             f"SOURCE PAGE EXCERPT:\n{page_excerpt}\n\n"
             f"LINKS TO SCORE (one per line):\n{link_block}"
         )
+        step = f"score_links[{len(links)}]"
+        # On by default, unlike extract()'s cap: the output is one url + score per
+        # link, so its size is known before the call. A runaway generation then
+        # fails in a minute or two instead of outlasting the read timeout and being
+        # re-sent by the SDK. See Settings.score_output_tokens_per_link.
+        per_link = self.settings.score_output_tokens_per_link
+        cap = (
+            _SCORE_OUTPUT_BASE_TOKENS + per_link * len(links) if per_link > 0 else omit
+        )
         t0 = time.monotonic()
         try:
             response = self._tiered(
@@ -405,29 +456,25 @@ class OpenAIProvider:
                     instructions=instructions,
                     input=payload,
                     text_format=_LinkScores,
+                    max_output_tokens=cap,
                     service_tier=tier,
                 )
             )
         except BaseException as e:
             self._log_call(
-                f"score_links[{len(links)}]",
-                self.model_screen,
-                len(payload),
-                time.monotonic() - t0,
-                None,
-                e,
+                step, self.model_screen, len(payload), time.monotonic() - t0, None, e
             )
             raise
         delta = self._accumulate(response, self.model_screen, "score_links")
-        self._log_call(
-            f"score_links[{len(links)}]",
+        parsed = self._parsed_or_raise(
+            response,
+            "link scoring",
+            step,
             self.model_screen,
             len(payload),
             time.monotonic() - t0,
             delta,
         )
-        parsed = response.output_parsed
-        assert parsed is not None
         url_set = {url for _, url in links}
         scored: dict[str, float] = {}
         for entry in parsed.scores:
@@ -518,22 +565,12 @@ class OpenAIProvider:
         # actually cost -- and the capped case below is exactly the one a caller
         # re-rolls, making those tokens easy to lose track of.
         delta = self._accumulate(response, self.model_extract, usage_tag)
-        elapsed = time.monotonic() - t0
-        parsed = response.output_parsed
-        if parsed is None:
-            # No parsed object: the model hit max_output_tokens mid-document, or the
-            # response is otherwise unusable. Unlike the chat-completions helper, the
-            # Responses parser raises nothing here -- it just leaves output_parsed
-            # None -- so the failure is surfaced explicitly, and logged as a failure
-            # rather than as the "ok" the usage delta alone would suggest.
-            reason = getattr(response.incomplete_details, "reason", None)
-            detail = f"status={response.status}" + (
-                f" reason={reason}" if reason else ""
-            )
-            error = AssertionError(f"extraction returned no parsed object ({detail})")
-            self._log_call(
-                step, self.model_extract, len(payload), elapsed, delta, error
-            )
-            raise error
-        self._log_call(step, self.model_extract, len(payload), elapsed, delta)
-        return parsed
+        return self._parsed_or_raise(
+            response,
+            "extraction",
+            step,
+            self.model_extract,
+            len(payload),
+            time.monotonic() - t0,
+            delta,
+        )

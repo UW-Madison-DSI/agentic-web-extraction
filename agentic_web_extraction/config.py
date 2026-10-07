@@ -300,6 +300,21 @@ class Settings(BaseSettings):
     # Size it above the largest legitimate extraction for the schema in use; a cap
     # below that truncates good output, turning a working call into a failing one.
     max_output_tokens: int = 0
+    # Per-link output-token cap for the link-scoring call (env:
+    # AWE_SCORE_OUTPUT_TOKENS_PER_LINK). Each score_links call is capped at
+    # 4000 + this × len(links); 0 sends no cap. The 4000 base leaves room for
+    # reasoning tokens, which bill as output.
+    #
+    # The scorer is prone to the same whitespace/repetition loop described at
+    # max_output_tokens above, but unlike extraction its output size is known in
+    # advance -- one url and one score per link -- so the cap is on by default.
+    # Normal calls use roughly 1.8-2.3k output tokens for 28-77 links, so the
+    # default leaves 3-5x headroom. A capped runaway fails as it did before (the
+    # page's links stay unscored and nothing is cached), only in a minute or two
+    # rather than the 13-22 minutes it takes to outlast the read timeout and the
+    # SDK's retries. Not part of any cache key: it changes cost and latency, not
+    # what a successful call returns.
+    score_output_tokens_per_link: int = 100
     # Wave concurrency / beam width (env: AWE_MAX_WORKERS). The traversal processes
     # the frontier in waves: it pops up to this many top-scored links at once and
     # fetches/screens/scores them concurrently in a thread pool, then folds the

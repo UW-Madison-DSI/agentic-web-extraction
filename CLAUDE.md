@@ -191,6 +191,13 @@ guard + transport-failure recovery + per-domain transport memo + UA),
   Deliberately not in any cache key and not a CLI flag: it is a per-deployment
   backstop, and a value below the largest legitimate extraction turns a working call
   into a failing one.
+  The link scorer has its own cap, `score_output_tokens_per_link` (env
+  `AWE_SCORE_OUTPUT_TOKENS_PER_LINK`, default `100`; cap = `4000 + N × links`, `0` =
+  none), and it is **on** by default because the scorer's output size is known in
+  advance (one url + score per link), which the extraction's is not. Not in any cache
+  key either. A capped cutoff with no parsed object raises from `score_links` just as
+  it does from `extract()`, and the worker's existing `stage_error` path keeps the page
+  out of the `PAGE` cache.
 - **Summarization is schema-aware, but must not become extraction.** It's the only lossy
   step (the extract model never sees the original text), so `fit_pages` threads the target
   schema into every `provider.summarize` call and the provider appends
@@ -420,13 +427,16 @@ guard + transport-failure recovery + per-domain transport memo + UA),
   else's), the extension filter (no outcome changes at all), `main_content_only`
   (chrome is most of the DOM and answers no criterion), `min_page_text_chars` (a
   client-rendered shell is otherwise a silent no-op), `use_sitemap` (its URLs are
-  scored like any other link). Off: `max_links_per_page`, alone — truncation
-  keeps document order, so a cap spends the allowance on the site-wide nav and
-  drops the in-content links underneath it, which is not a thinner frontier but
-  the wrong one. Three of the on defaults do cost the caller something
-  (`main_content_only` is lossy; `min_page_text_chars` and `use_sitemap` spend
-  requests): that is the trade, so keep it stated at the setting and keep the one
-  flag that turns each off working.
+  scored like any other link), `score_output_tokens_per_link` (the scorer's
+  output size is known, and uncapped a runaway call burns 13–22 minutes). Off:
+  `max_links_per_page`, alone — truncation keeps document order, so a cap spends
+  the allowance on the site-wide nav and drops the in-content links underneath
+  it, which is not a thinner frontier but the wrong one. Four of the on defaults
+  do cost the caller something (`main_content_only` is lossy;
+  `min_page_text_chars` and `use_sitemap` spend requests;
+  `score_output_tokens_per_link` fails a scoring call that legitimately needs
+  more than the cap): that is the trade, so keep it stated at the setting and
+  keep the one flag that turns each off working.
 - **Logging: never a bare `print`.** All diagnostics go through `logsink.emit` → stderr
   (stdout is reserved for result JSON). A `log_file` path (env `AWE_LOG_FILE`, empty =
   off) also appends timestamped lines, and `Extractor(on_event=...)` subscribes a
