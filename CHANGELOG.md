@@ -7,6 +7,8 @@ Release for the tag. An empty `## Unreleased` aborts the release.
 
 ## Unreleased
 
+## v0.2.4 — 2026-10-07
+
 - **Output caps on the screen model's calls, on by default.** `score_links` is
   capped at `4000 + the links' URLs in tokens + 100 × links` output tokens and
   `screen` at `4000 + 1000`. Both calls can fall into the same whitespace loop that
